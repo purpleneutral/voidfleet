@@ -1,3 +1,4 @@
+pub mod achievements;
 pub mod ship;
 pub mod fleet;
 pub mod combat;

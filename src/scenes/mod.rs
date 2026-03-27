@@ -1,8 +1,10 @@
+pub mod title;
 pub mod travel;
 pub mod battle;
 pub mod raid;
 pub mod loot;
 pub mod upgrades;
+pub mod stats;
 
 use ratatui::Frame;
 use crate::rendering::particles::ParticleSystem;

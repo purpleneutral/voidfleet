@@ -11,16 +11,25 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 
+use engine::achievements::check_achievements;
 use rendering::particles::ParticleSystem;
 use scenes::{Scene, SceneAction};
-use scenes::travel::TravelScene;
 use scenes::battle::BattleScene;
-use scenes::raid::RaidScene;
 use scenes::loot::LootScene;
+use scenes::raid::RaidScene;
+use scenes::stats::StatsScreen;
+use scenes::title::TitleScreen;
+use scenes::travel::TravelScene;
 use scenes::upgrades::UpgradeScreen;
 use state::{GamePhase, GameState};
 
 const TICK_RATE: Duration = Duration::from_millis(50); // 20 fps
+
+/// App mode — title screen vs playing
+enum AppMode {
+    Title,
+    Playing,
+}
 
 fn main() -> io::Result<()> {
     // Setup terminal
@@ -30,8 +39,15 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    let size = terminal.size()?;
+
     // Load or create game state
     let mut state = GameState::load();
+    let has_save = state.sector > 1 || state.scrap > 0 || state.total_battles > 0;
+
+    // Title screen
+    let mut title = TitleScreen::new(size.width, size.height);
+    let mut mode = AppMode::Title;
 
     // Create scenes
     let mut travel = TravelScene::new();
@@ -42,144 +58,201 @@ fn main() -> io::Result<()> {
     // Particle system (shared across scenes)
     let mut particles = ParticleSystem::new();
 
-    // Upgrade screen overlay
+    // Overlay screens
     let mut upgrades = UpgradeScreen::new();
+    let mut stats = StatsScreen::new();
 
-    // Enter initial scene
-    let size = terminal.size()?;
-    get_scene_mut(&mut travel, &mut battle, &mut raid, &mut loot, state.phase)
-        .enter(&state, size.width, size.height);
+    // Achievement popup display
+    let mut popup_text: Option<String> = None;
+    let mut popup_timer: u8 = 0;
 
+    // Time tracking
     let mut last_save = Instant::now();
+    let mut last_time_tick = Instant::now();
 
     // Main game loop
     loop {
         let tick_start = Instant::now();
 
+        // Track play time (1 second increments)
+        if last_time_tick.elapsed() >= Duration::from_secs(1) {
+            if matches!(mode, AppMode::Playing) {
+                state.time_played_secs += 1;
+            }
+            last_time_tick = Instant::now();
+        }
+
         // Handle input (non-blocking)
         if event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    match mode {
+                        AppMode::Title => {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Char('Q') => break,
+                                KeyCode::Esc => break,
+                                KeyCode::Enter | KeyCode::Char('c') | KeyCode::Char('C') => {
+                                    // Continue existing save
+                                    mode = AppMode::Playing;
+                                    let size = terminal.size()?;
+                                    get_scene_mut(
+                                        &mut travel, &mut battle, &mut raid, &mut loot,
+                                        state.phase,
+                                    )
+                                    .enter(&state, size.width, size.height);
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') => {
+                                    // New game
+                                    state = GameState::new();
+                                    mode = AppMode::Playing;
+                                    let size = terminal.size()?;
+                                    get_scene_mut(
+                                        &mut travel, &mut battle, &mut raid, &mut loot,
+                                        state.phase,
+                                    )
+                                    .enter(&state, size.width, size.height);
+                                }
+                                _ => {}
+                            }
+                        }
+                        AppMode::Playing => {
+                            if upgrades.open {
+                                match key.code {
+                                    KeyCode::Esc => upgrades.toggle(),
+                                    other => upgrades.handle_input(other, &mut state),
+                                }
+                            } else if stats.open {
+                                match key.code {
+                                    KeyCode::Esc | KeyCode::Tab => stats.toggle(),
+                                    _ => {}
+                                }
+                            } else if travel.has_active_event() {
+                                travel.handle_input(key.code, &mut state);
+                            } else {
+                                match key.code {
+                                    KeyCode::Char('q') | KeyCode::Char('Q') => break,
+                                    KeyCode::Esc => break,
+                                    KeyCode::Char('u') | KeyCode::Char('U') => upgrades.toggle(),
+                                    KeyCode::Tab => stats.toggle(),
+                                    KeyCode::Char(' ') => {
+                                        state.phase_timer = 0.1;
+                                    }
+                                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                                        state.save();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        match mode {
+            AppMode::Title => {
+                title.tick();
+                let state_ref = &state;
+                terminal.draw(|frame| {
+                    title.render(frame, has_save, state_ref);
+                })?;
+            }
+            AppMode::Playing => {
+                // Tick particles
+                particles.tick();
+
+                // Tick current scene
+                let action = get_scene_mut(
+                    &mut travel, &mut battle, &mut raid, &mut loot, state.phase,
+                )
+                .tick(&mut state, &mut particles);
+
+                // Handle scene transitions
+                if let SceneAction::TransitionTo(next_phase) = action {
+                    // Update highest sector
+                    if state.sector > state.highest_sector {
+                        state.highest_sector = state.sector;
+                    }
+
+                    state.phase = next_phase;
+                    match next_phase {
+                        GamePhase::Travel => state.phase_timer = 45.0,
+                        GamePhase::Battle => state.phase_timer = 20.0,
+                        GamePhase::Raid => state.phase_timer = 15.0,
+                        GamePhase::Loot => state.phase_timer = 4.0,
+                    }
+                    let size = terminal.size()?;
+                    particles.particles.clear();
+                    get_scene_mut(
+                        &mut travel, &mut battle, &mut raid, &mut loot, state.phase,
+                    )
+                    .enter(&state, size.width, size.height);
+                }
+
+                // Check achievements
+                let new_achievements = check_achievements(&state);
+                for ach in new_achievements {
+                    state.achievements_unlocked.push(ach.id.to_string());
+                    popup_text = Some(format!("{} Achievement: {} — {}", ach.icon, ach.name, ach.description));
+                    popup_timer = 60; // 3 seconds at 20fps
+                }
+
+                // Render
+                let phase = state.phase;
+                terminal.draw(|frame| {
+                    // Clear with black background
+                    let area = frame.area();
+                    let buf = frame.buffer_mut();
+                    for y in area.top()..area.bottom() {
+                        for x in area.left()..area.right() {
+                            let cell = &mut buf[(x, y)];
+                            cell.set_char(' ');
+                            cell.set_fg(Color::White);
+                            cell.set_bg(Color::Black);
+                        }
+                    }
+
+                    // Scene
+                    match phase {
+                        GamePhase::Travel => travel.render(frame, &state, &particles),
+                        GamePhase::Battle => battle.render(frame, &state, &particles),
+                        GamePhase::Raid => raid.render(frame, &state, &particles),
+                        GamePhase::Loot => loot.render(frame, &state, &particles),
+                    }
+
+                    // HUD bar
+                    render_hud(frame, &state, phase);
+
+                    // Achievement popup banner
+                    if let Some(ref text) = popup_text {
+                        if popup_timer > 0 {
+                            render_popup(frame, text, popup_timer);
+                        }
+                    }
+
+                    // Overlays
                     if upgrades.open {
-                        match key.code {
-                            KeyCode::Esc => upgrades.toggle(),
-                            other => upgrades.handle_input(other, &mut state),
-                        }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                            KeyCode::Esc => break,
-                            KeyCode::Char('u') | KeyCode::Char('U') => upgrades.toggle(),
-                            KeyCode::Char(' ') => {
-                                // Space: skip current phase (speed up)
-                                state.phase_timer = 0.1;
-                            }
-                            KeyCode::Char('s') | KeyCode::Char('S') => {
-                                state.save();
-                            }
-                            _ => {}
-                        }
+                        upgrades.render(frame, &state);
+                    }
+                    if stats.open {
+                        stats.render(frame, &state);
+                    }
+                })?;
+
+                // Tick popup timer
+                if popup_timer > 0 {
+                    popup_timer -= 1;
+                    if popup_timer == 0 {
+                        popup_text = None;
                     }
                 }
-            }
-        }
 
-        // Tick particles
-        particles.tick();
-
-        // Tick current scene
-        let action = get_scene_mut(&mut travel, &mut battle, &mut raid, &mut loot, state.phase)
-            .tick(&mut state, &mut particles);
-
-        // Handle scene transitions
-        if let SceneAction::TransitionTo(next_phase) = action {
-            state.phase = next_phase;
-            // Set phase timer for next phase
-            match next_phase {
-                GamePhase::Travel => state.phase_timer = 45.0,
-                GamePhase::Battle => state.phase_timer = 20.0,
-                GamePhase::Raid => state.phase_timer = 15.0,
-                GamePhase::Loot => state.phase_timer = 4.0,
-            }
-            let size = terminal.size()?;
-            particles.particles.clear();
-            get_scene_mut(&mut travel, &mut battle, &mut raid, &mut loot, state.phase)
-                .enter(&state, size.width, size.height);
-        }
-
-        // Render
-        let phase = state.phase;
-        terminal.draw(|frame| {
-            // Clear with black background
-            let area = frame.area();
-            let buf = frame.buffer_mut();
-            for y in area.top()..area.bottom() {
-                for x in area.left()..area.right() {
-                    let cell = &mut buf[(x, y)];
-                    cell.set_char(' ');
-                    cell.set_fg(Color::White);
-                    cell.set_bg(Color::Black);
+                // Auto-save every 60 seconds
+                if last_save.elapsed() > Duration::from_secs(60) {
+                    state.save();
+                    last_save = Instant::now();
                 }
             }
-
-            match phase {
-                GamePhase::Travel => travel.render(frame, &state, &particles),
-                GamePhase::Battle => battle.render(frame, &state, &particles),
-                GamePhase::Raid => raid.render(frame, &state, &particles),
-                GamePhase::Loot => loot.render(frame, &state, &particles),
-            }
-
-            // HUD bar at bottom
-            let area = frame.area();
-            let hud_y = area.height.saturating_sub(1);
-            let buf = frame.buffer_mut();
-
-            let phase_name = match phase {
-                GamePhase::Travel => "TRAVEL",
-                GamePhase::Battle => "BATTLE",
-                GamePhase::Raid => "RAID",
-                GamePhase::Loot => "LOOT",
-            };
-            let phase_color = match phase {
-                GamePhase::Travel => Color::Cyan,
-                GamePhase::Battle => Color::Red,
-                GamePhase::Raid => Color::Green,
-                GamePhase::Loot => Color::Yellow,
-            };
-            let hud = format!(
-                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [Space]Skip [Q]uit ",
-                phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
-            );
-            for (i, ch) in hud.chars().enumerate() {
-                let x = i as u16;
-                if x < area.width {
-                    let cell = &mut buf[(area.x + x, area.y + hud_y)];
-                    cell.set_char(ch);
-                    if i < phase_name.len() + 1 {
-                        cell.set_fg(phase_color);
-                    } else {
-                        cell.set_fg(Color::DarkGray);
-                    }
-                    cell.set_bg(Color::Rgb(20, 20, 30));
-                }
-            }
-            // Fill rest of HUD line
-            for x in hud.len() as u16..area.width {
-                let cell = &mut buf[(area.x + x, area.y + hud_y)];
-                cell.set_char(' ');
-                cell.set_bg(Color::Rgb(20, 20, 30));
-            }
-
-            // Upgrade overlay on top
-            if upgrades.open {
-                upgrades.render(frame, &state);
-            }
-        })?;
-
-        // Auto-save every 60 seconds
-        if last_save.elapsed() > Duration::from_secs(60) {
-            state.save();
-            last_save = Instant::now();
         }
 
         // Frame rate control
@@ -196,6 +269,88 @@ fn main() -> io::Result<()> {
     terminal::disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     Ok(())
+}
+
+fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase) {
+    let area = frame.area();
+    let hud_y = area.height.saturating_sub(1);
+    let buf = frame.buffer_mut();
+
+    let phase_name = match phase {
+        GamePhase::Travel => "TRAVEL",
+        GamePhase::Battle => "BATTLE",
+        GamePhase::Raid => "RAID",
+        GamePhase::Loot => "LOOT",
+    };
+    let phase_color = match phase {
+        GamePhase::Travel => Color::Cyan,
+        GamePhase::Battle => Color::Red,
+        GamePhase::Raid => Color::Green,
+        GamePhase::Loot => Color::Yellow,
+    };
+    let hud = format!(
+        " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [Tab]Stats [Space]Skip [Q]uit ",
+        phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
+    );
+    for (i, ch) in hud.chars().enumerate() {
+        let x = i as u16;
+        if x < area.width {
+            let cell = &mut buf[(area.x + x, area.y + hud_y)];
+            cell.set_char(ch);
+            if i < phase_name.len() + 1 {
+                cell.set_fg(phase_color);
+            } else {
+                cell.set_fg(Color::DarkGray);
+            }
+            cell.set_bg(Color::Rgb(20, 20, 30));
+        }
+    }
+    for x in hud.len() as u16..area.width {
+        let cell = &mut buf[(area.x + x, area.y + hud_y)];
+        cell.set_char(' ');
+        cell.set_bg(Color::Rgb(20, 20, 30));
+    }
+}
+
+fn render_popup(frame: &mut Frame, text: &str, timer: u8) {
+    let area = frame.area();
+    let buf = frame.buffer_mut();
+
+    // Banner at top of screen, centered
+    let y = 1_u16;
+    let pad = 2;
+    let text_len = text.len() as u16;
+    let box_width = text_len + pad * 2;
+    let x_start = area.width.saturating_sub(box_width) / 2;
+
+    // Fade: bright at start, dimmer near end
+    let fg = if timer > 40 {
+        Color::Yellow
+    } else if timer > 20 {
+        Color::DarkGray
+    } else {
+        Color::Rgb(60, 60, 60)
+    };
+
+    // Draw background
+    for x in x_start..x_start + box_width {
+        if x < area.width && y < area.height {
+            let cell = &mut buf[(area.x + x, area.y + y)];
+            cell.set_char(' ');
+            cell.set_bg(Color::Rgb(30, 30, 10));
+        }
+    }
+
+    // Draw text
+    for (i, ch) in text.chars().enumerate() {
+        let x = x_start + pad + i as u16;
+        if x < area.width && y < area.height {
+            let cell = &mut buf[(area.x + x, area.y + y)];
+            cell.set_char(ch);
+            cell.set_fg(fg);
+            cell.set_bg(Color::Rgb(30, 30, 10));
+        }
+    }
 }
 
 fn get_scene_mut<'a>(

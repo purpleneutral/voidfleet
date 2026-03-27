@@ -1,3 +1,4 @@
+use crossterm::event::KeyCode;
 use rand::Rng;
 use ratatui::Frame;
 use ratatui::style::{Color, Style};
@@ -176,6 +177,156 @@ struct ColoredStar {
     color: Color,
 }
 
+// ── Travel events ────────────────────────────────────────────
+
+enum EventOutcome {
+    GainScrap(u64),
+    GainCredits(u64),
+    GainShip(ShipType),
+    LoseScrap(u64),
+    DamageFleet(u32),
+    SkipSectors(u32),
+    Nothing,
+    StartBattle,
+    AddTravelTime(f32),
+    HealFleet,
+    GainBlueprint,
+    GainArtifact,
+}
+
+struct TravelEvent {
+    title: String,
+    description: String,
+    options: Vec<(String, EventOutcome)>,
+    selected: usize,
+    active: bool,
+    result_text: Option<String>,
+    result_timer: u8,
+}
+
+impl TravelEvent {
+    fn new(title: &str, description: &str, options: Vec<(String, EventOutcome)>) -> Self {
+        Self {
+            title: title.to_string(),
+            description: description.to_string(),
+            options,
+            selected: 0,
+            active: true,
+            result_text: None,
+            result_timer: 0,
+        }
+    }
+
+    fn showing_result(&self) -> bool {
+        self.result_text.is_some() && self.result_timer > 0
+    }
+}
+
+fn generate_random_event(state: &GameState) -> TravelEvent {
+    let mut rng = rand::thread_rng();
+    let roll = rng.gen_range(0..7);
+    match roll {
+        0 => {
+            // Distress Signal
+            TravelEvent::new(
+                "⚠ Distress Signal",
+                "A ship is sending an SOS. The signal is weak\nand could be a trap... or a survivor in need.",
+                vec![
+                    ("Help the ship".into(), if rng.gen_bool(0.55) {
+                        let ships = [ShipType::Scout, ShipType::Fighter, ShipType::Bomber];
+                        EventOutcome::GainShip(ships[rng.gen_range(0..ships.len())])
+                    } else {
+                        EventOutcome::DamageFleet(rng.gen_range(10..30))
+                    }),
+                    ("Ignore and continue".into(), EventOutcome::Nothing),
+                ],
+            )
+        }
+        1 => {
+            // Abandoned Wreck
+            let scrap_amount = rng.gen_range(50..201);
+            TravelEvent::new(
+                "🔧 Abandoned Wreck",
+                "You find a drifting hulk. Its hull is breached\nbut the cargo bay might still hold salvage.",
+                vec![
+                    (format!("Salvage quickly (+{}◇)", scrap_amount), EventOutcome::GainScrap(scrap_amount)),
+                    ("Careful search (30% blueprint)".into(), if rng.gen_bool(0.3) {
+                        EventOutcome::GainBlueprint
+                    } else {
+                        EventOutcome::GainScrap(rng.gen_range(20..80))
+                    }),
+                ],
+            )
+        }
+        2 => {
+            // Trading Post
+            TravelEvent::new(
+                "💰 Trading Post",
+                "A merchant vessel hails you on comms.\n\"Looking to trade, captain?\"",
+                vec![
+                    ("Buy supplies (-100₿, heal fleet)".into(),
+                        if state.credits >= 100 { EventOutcome::HealFleet } else { EventOutcome::Nothing }),
+                    ("Sell scrap (-50◇, +80₿)".into(),
+                        if state.scrap >= 50 { EventOutcome::GainCredits(80) } else { EventOutcome::Nothing }),
+                    ("Ignore".into(), EventOutcome::Nothing),
+                ],
+            )
+        }
+        3 => {
+            // Wormhole
+            let skip = rng.gen_range(2..6);
+            TravelEvent::new(
+                "🌀 Wormhole",
+                "A spatial anomaly tears open before your fleet.\nScanners can't determine where it leads.",
+                vec![
+                    (format!("Enter the wormhole (skip {} sectors)", skip), EventOutcome::SkipSectors(skip)),
+                    ("Navigate around it".into(), EventOutcome::Nothing),
+                ],
+            )
+        }
+        4 => {
+            // Pirate Ambush
+            let scrap_cost = (state.scrap as f64 * 0.3) as u64;
+            TravelEvent::new(
+                "☠ Pirate Ambush",
+                "Pirates emerge from an asteroid shadow!\n\"Hand over your cargo or we open fire!\"",
+                vec![
+                    (format!("Pay tribute (-{}◇)", scrap_cost), EventOutcome::LoseScrap(scrap_cost)),
+                    ("Fight them off!".into(), EventOutcome::StartBattle),
+                ],
+            )
+        }
+        5 => {
+            // Derelict Station
+            let credits = rng.gen_range(100..501);
+            TravelEvent::new(
+                "🏚 Derelict Station",
+                "An old station floats nearby, its lights\nflickering in the void. Power still runs.",
+                vec![
+                    (format!("Explore (+{}₿)", credits), if rng.gen_bool(0.15) {
+                        EventOutcome::GainArtifact
+                    } else {
+                        EventOutcome::GainCredits(credits)
+                    }),
+                    ("Pass by".into(), EventOutcome::Nothing),
+                ],
+            )
+        }
+        _ => {
+            // Cosmic Storm
+            let damage = rng.gen_range(15..40);
+            TravelEvent::new(
+                "⚡ Cosmic Storm",
+                "A radiation storm approaches! Your shields\nflare as charged particles bombard the fleet.",
+                vec![
+                    (format!("Brace for impact (-{}hp)", damage), EventOutcome::DamageFleet(damage)),
+                    ("Take a detour (+15s travel)".into(), EventOutcome::AddTravelTime(15.0)),
+                ],
+            )
+        }
+    }
+}
+
 // ── Sector name generation ───────────────────────────────────
 
 fn generate_sector_name(sector: u32) -> String {
@@ -231,6 +382,10 @@ pub struct TravelScene {
 
     // Colored star layer (parallax depth layer 4)
     colored_stars: Vec<ColoredStar>,
+
+    // Random travel events
+    event: Option<TravelEvent>,
+    event_checked: bool, // true once we've rolled for an event this travel phase
 }
 
 impl TravelScene {
@@ -251,6 +406,8 @@ impl TravelScene {
             sector_name: String::new(),
             sector_name_fade_tick: 0,
             colored_stars: Vec::new(),
+            event: None,
+            event_checked: false,
         }
     }
 
@@ -459,6 +616,48 @@ impl TravelScene {
         }
     }
 
+    /// Whether a travel event is currently active (blocking input).
+    pub fn has_active_event(&self) -> bool {
+        self.event.as_ref().map_or(false, |e| e.active || e.showing_result())
+    }
+
+    /// Handle input during an active event. Returns true if input was consumed.
+    pub fn handle_input(&mut self, key: KeyCode, state: &mut GameState) -> bool {
+        let event = match self.event.as_mut() {
+            Some(e) if e.active && !e.showing_result() => e,
+            _ => return false,
+        };
+
+        match key {
+            KeyCode::Up => {
+                if event.selected > 0 {
+                    event.selected -= 1;
+                }
+                true
+            }
+            KeyCode::Down => {
+                if event.selected + 1 < event.options.len() {
+                    event.selected += 1;
+                }
+                true
+            }
+            KeyCode::Enter => {
+                let idx = event.selected;
+                if idx < event.options.len() {
+                    // Take the option out to process it
+                    let (label, outcome) = event.options.remove(idx);
+                    let result = apply_event_outcome(outcome, state, &label);
+                    // Reconstruct — we just need the result text now
+                    let ev = self.event.as_mut().unwrap();
+                    ev.result_text = Some(result);
+                    ev.result_timer = 40;
+                }
+                true
+            }
+            _ => true, // consume all keys while event is active
+        }
+    }
+
     /// Begin warp transition.
     fn start_warp(&mut self, target: GamePhase) {
         self.warping = true;
@@ -496,6 +695,75 @@ fn ship_formation_priority(st: &ShipType) -> u8 {
     }
 }
 
+fn apply_event_outcome(outcome: EventOutcome, state: &mut GameState, _label: &str) -> String {
+    match outcome {
+        EventOutcome::GainScrap(amt) => {
+            state.scrap += amt;
+            state.total_scrap += amt;
+            format!("You salvaged {} scrap!", amt)
+        }
+        EventOutcome::GainCredits(amt) => {
+            state.credits += amt;
+            format!("You gained {} credits!", amt)
+        }
+        EventOutcome::GainShip(ship_type) => {
+            let name = ship_type.name().to_string();
+            state.fleet.push(Ship::new(ship_type));
+            format!("A {} joined your fleet!", name)
+        }
+        EventOutcome::LoseScrap(amt) => {
+            let lost = amt.min(state.scrap);
+            state.scrap -= lost;
+            format!("You lost {} scrap.", lost)
+        }
+        EventOutcome::DamageFleet(dmg) => {
+            let mut remaining = dmg;
+            for ship in state.fleet.iter_mut().rev() {
+                if remaining == 0 { break; }
+                let take = remaining.min(ship.current_hp);
+                ship.current_hp -= take;
+                remaining -= take;
+            }
+            state.fleet.retain(|s| s.current_hp > 0);
+            format!("Your fleet took {} damage!", dmg)
+        }
+        EventOutcome::SkipSectors(n) => {
+            state.sector += n;
+            format!("Warped through {} sectors!", n)
+        }
+        EventOutcome::Nothing => {
+            "You continue on your way.".to_string()
+        }
+        EventOutcome::StartBattle => {
+            // Will be handled by checking result_text in tick
+            "Pirates attack! Brace for combat!".to_string()
+        }
+        EventOutcome::AddTravelTime(secs) => {
+            state.phase_timer += secs;
+            format!("Detour adds {:.0} seconds to travel.", secs)
+        }
+        EventOutcome::HealFleet => {
+            if state.credits >= 100 {
+                state.credits -= 100;
+                for ship in &mut state.fleet {
+                    ship.heal_full();
+                }
+                "Fleet fully repaired!".to_string()
+            } else {
+                "Not enough credits!".to_string()
+            }
+        }
+        EventOutcome::GainBlueprint => {
+            state.blueprints += 1;
+            "You found a rare blueprint!".to_string()
+        }
+        EventOutcome::GainArtifact => {
+            state.artifacts += 1;
+            "You discovered an ancient artifact!".to_string()
+        }
+    }
+}
+
 // ── Scene impl ───────────────────────────────────────────────
 
 impl Scene for TravelScene {
@@ -513,6 +781,8 @@ impl Scene for TravelScene {
         self.warp_frame = 0;
         self.sector_name = generate_sector_name(state.sector);
         self.sector_name_fade_tick = 0;
+        self.event = None;
+        self.event_checked = false;
     }
 
     fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem) -> SceneAction {
@@ -536,6 +806,46 @@ impl Scene for TravelScene {
         }
 
         // ── Normal travel logic ──────────────────────────────
+
+        // ── Event result timer countdown ─────────────────────
+        if let Some(ref mut event) = self.event {
+            if event.showing_result() {
+                event.result_timer -= 1;
+                if event.result_timer == 0 {
+                    // Check if this was a battle trigger
+                    let start_battle = event.result_text.as_deref()
+                        == Some("Pirates attack! Brace for combat!");
+                    self.event = None;
+                    if start_battle {
+                        self.start_warp(GamePhase::Battle);
+                        return SceneAction::Continue;
+                    }
+                }
+            }
+        }
+
+        // ── Event pauses fleet movement ──────────────────────
+        if self.has_active_event() {
+            // Still animate starfield/particles but don't advance travel
+            self.starfield.tick();
+            return SceneAction::Continue;
+        }
+
+        // ── Random event check at ~50% through travel ────────
+        if !self.event_checked {
+            let half_duration = self.travel_duration / 2.0;
+            let elapsed = self.travel_duration - state.phase_timer;
+            if elapsed >= half_duration {
+                self.event_checked = true;
+                let mut rng = rand::thread_rng();
+                // 5-10% chance (scales slightly with sector)
+                let chance = 0.05 + (state.sector as f64 * 0.005).min(0.05);
+                if rng.gen_bool(chance.min(0.10)) {
+                    self.event = Some(generate_random_event(state));
+                    return SceneAction::Continue;
+                }
+            }
+        }
 
         // Update starfield
         self.starfield.tick();
@@ -813,6 +1123,158 @@ impl Scene for TravelScene {
                         let cell = &mut buf[(area.x + x, area.y + name_y)];
                         cell.set_char(ch);
                         cell.set_fg(Color::Rgb(grey, grey, grey));
+                    }
+                }
+            }
+        }
+
+        // ── UI: Travel event overlay ─────────────────────────
+        if let Some(ref event) = self.event {
+            if event.active {
+                // Box dimensions
+                let box_w: u16 = 46;
+                let desc_lines: Vec<&str> = event.description.lines().collect();
+                let option_count = event.options.len() as u16;
+                let result_lines = if event.showing_result() { 2 } else { 0 };
+                // title(1) + blank(1) + desc + blank(1) + options + result
+                let box_h: u16 = 3 + desc_lines.len() as u16
+                    + if event.showing_result() { result_lines } else { option_count }
+                    + 1; // bottom padding
+
+                let bx = area.width.saturating_sub(box_w) / 2;
+                let by = area.height.saturating_sub(box_h) / 2;
+
+                // Draw box background
+                for y in by..by + box_h {
+                    for x in bx..bx + box_w {
+                        if x < area.width && y < area.height {
+                            let cell = &mut buf[(area.x + x, area.y + y)];
+                            cell.set_char(' ');
+                            cell.set_bg(Color::Rgb(15, 15, 25));
+                        }
+                    }
+                }
+
+                // Draw border
+                let border_color = Color::Rgb(80, 80, 140);
+                for x in bx..bx + box_w {
+                    if x < area.width {
+                        if by < area.height {
+                            let cell = &mut buf[(area.x + x, area.y + by)];
+                            cell.set_char('─');
+                            cell.set_fg(border_color);
+                            cell.set_bg(Color::Rgb(15, 15, 25));
+                        }
+                        let bot = by + box_h - 1;
+                        if bot < area.height {
+                            let cell = &mut buf[(area.x + x, area.y + bot)];
+                            cell.set_char('─');
+                            cell.set_fg(border_color);
+                            cell.set_bg(Color::Rgb(15, 15, 25));
+                        }
+                    }
+                }
+                for y in by..by + box_h {
+                    if y < area.height {
+                        if bx < area.width {
+                            let cell = &mut buf[(area.x + bx, area.y + y)];
+                            cell.set_char('│');
+                            cell.set_fg(border_color);
+                            cell.set_bg(Color::Rgb(15, 15, 25));
+                        }
+                        let right = bx + box_w - 1;
+                        if right < area.width {
+                            let cell = &mut buf[(area.x + right, area.y + y)];
+                            cell.set_char('│');
+                            cell.set_fg(border_color);
+                            cell.set_bg(Color::Rgb(15, 15, 25));
+                        }
+                    }
+                }
+                // Corners
+                let corners = [(bx, by, '╭'), (bx + box_w - 1, by, '╮'),
+                               (bx, by + box_h - 1, '╰'), (bx + box_w - 1, by + box_h - 1, '╯')];
+                for (cx, cy, ch) in corners {
+                    if cx < area.width && cy < area.height {
+                        let cell = &mut buf[(area.x + cx, area.y + cy)];
+                        cell.set_char(ch);
+                        cell.set_fg(border_color);
+                        cell.set_bg(Color::Rgb(15, 15, 25));
+                    }
+                }
+
+                let mut row = by + 1;
+                let text_x = bx + 2;
+
+                // Title
+                if row < area.height {
+                    for (i, ch) in event.title.chars().enumerate() {
+                        let x = text_x + i as u16;
+                        if x < bx + box_w - 1 && x < area.width {
+                            let cell = &mut buf[(area.x + x, area.y + row)];
+                            cell.set_char(ch);
+                            cell.set_fg(Color::Yellow);
+                            cell.set_bg(Color::Rgb(15, 15, 25));
+                        }
+                    }
+                }
+                row += 2; // blank line
+
+                // Description
+                for line in &desc_lines {
+                    if row < area.height {
+                        for (i, ch) in line.chars().enumerate() {
+                            let x = text_x + i as u16;
+                            if x < bx + box_w - 1 && x < area.width {
+                                let cell = &mut buf[(area.x + x, area.y + row)];
+                                cell.set_char(ch);
+                                cell.set_fg(Color::Rgb(180, 180, 200));
+                                cell.set_bg(Color::Rgb(15, 15, 25));
+                            }
+                        }
+                    }
+                    row += 1;
+                }
+                row += 1; // blank line
+
+                if event.showing_result() {
+                    // Show result text
+                    if let Some(ref text) = event.result_text {
+                        if row < area.height {
+                            for (i, ch) in text.chars().enumerate() {
+                                let x = text_x + i as u16;
+                                if x < bx + box_w - 1 && x < area.width {
+                                    let cell = &mut buf[(area.x + x, area.y + row)];
+                                    cell.set_char(ch);
+                                    cell.set_fg(Color::Green);
+                                    cell.set_bg(Color::Rgb(15, 15, 25));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Show options
+                    for (i, (label, _)) in event.options.iter().enumerate() {
+                        if row < area.height {
+                            let selected = i == event.selected;
+                            let prefix = if selected { ">> " } else { "   " };
+                            let fg = if selected {
+                                Color::Cyan
+                            } else {
+                                Color::Rgb(120, 120, 140)
+                            };
+                            let text = format!("{}{}", prefix, label);
+                            for (j, ch) in text.chars().enumerate() {
+                                let x = text_x + j as u16;
+                                if x < bx + box_w - 1 && x < area.width {
+                                    let cell = &mut buf[(area.x + x, area.y + row)];
+                                    cell.set_char(ch);
+                                    cell.set_fg(fg);
+                                    cell.set_bg(Color::Rgb(15, 15, 25));
+                                }
+                            }
+                        }
+                        row += 1;
                     }
                 }
             }

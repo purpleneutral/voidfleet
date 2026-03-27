@@ -36,9 +36,17 @@ pub struct GameState {
     pub total_raids: u64,
     pub total_scrap: u64,
     pub enemies_destroyed: u64,
+    pub deaths: u64,
+    pub highest_sector: u32,
+    pub time_played_secs: u64,
+    pub achievements_unlocked: Vec<String>,
 
     // Timing
     pub phase_timer: f32, // seconds remaining in current phase
+
+    // Transient (not saved)
+    #[serde(skip)]
+    pub pending_popups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,7 +78,12 @@ impl GameState {
             total_raids: 0,
             total_scrap: 0,
             enemies_destroyed: 0,
+            deaths: 0,
+            highest_sector: 1,
+            time_played_secs: 0,
+            achievements_unlocked: Vec::new(),
             phase_timer: 45.0,
+            pending_popups: Vec::new(),
         }
     }
 
@@ -110,6 +123,52 @@ impl GameState {
 
     pub fn fleet_total_dps(&self) -> f32 {
         self.fleet.iter().map(|s| s.dps()).sum()
+    }
+
+    /// Called when fleet is destroyed in battle. Returns penalty description.
+    pub fn handle_fleet_death(&mut self) -> String {
+        self.deaths += 1;
+
+        // Lose 30% of scrap
+        let scrap_lost = self.scrap * 30 / 100;
+        self.scrap -= scrap_lost;
+
+        // Lose 20% of credits
+        let credits_lost = self.credits * 20 / 100;
+        self.credits -= credits_lost;
+
+        // Set sector back by 3 (minimum 1)
+        let sectors_lost = 3.min(self.sector - 1);
+        self.sector = self.sector.saturating_sub(sectors_lost).max(1);
+
+        // Respawn fleet at full HP (don't lose ships — that's too punishing)
+        for ship in &mut self.fleet {
+            ship.heal_full();
+        }
+
+        format!(
+            "Fleet destroyed! Lost {} scrap, {} credits. Pushed back {} sectors.",
+            scrap_lost, credits_lost, sectors_lost
+        )
+    }
+
+    /// Update highest_sector tracker when entering a new sector.
+    pub fn update_highest_sector(&mut self) {
+        if self.sector > self.highest_sector {
+            self.highest_sector = self.sector;
+        }
+    }
+
+    /// Check for new achievements and queue popup messages.
+    pub fn check_achievements(&mut self) {
+        let newly_unlocked = crate::engine::achievements::check_achievements(self);
+        for achievement in newly_unlocked {
+            self.achievements_unlocked.push(achievement.id.to_string());
+            self.pending_popups.push(format!(
+                "{} Achievement Unlocked: {} — {}",
+                achievement.icon, achievement.name, achievement.description
+            ));
+        }
     }
 
     pub fn add_xp(&mut self, amount: u64) {
