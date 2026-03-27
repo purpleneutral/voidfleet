@@ -20,6 +20,7 @@ use scenes::raid::RaidScene;
 use scenes::stats::StatsScreen;
 use scenes::title::TitleScreen;
 use scenes::travel::TravelScene;
+use scenes::bridge::BridgeScene;
 use scenes::upgrades::UpgradeScreen;
 use state::{GamePhase, GameState};
 
@@ -61,6 +62,7 @@ fn main() -> io::Result<()> {
     // Overlay screens
     let mut upgrades = UpgradeScreen::new();
     let mut stats = StatsScreen::new();
+    let mut bridge = BridgeScene::new();
 
     // Achievement popup display
     let mut popup_text: Option<String> = None;
@@ -126,6 +128,8 @@ fn main() -> io::Result<()> {
                                     KeyCode::Esc | KeyCode::Tab => stats.toggle(),
                                     _ => {}
                                 }
+                            } else if bridge.open {
+                                bridge.handle_input(key.code, &mut state);
                             } else if travel.has_active_event() {
                                 travel.handle_input(key.code, &mut state);
                             } else {
@@ -134,6 +138,7 @@ fn main() -> io::Result<()> {
                                     KeyCode::Esc => break,
                                     KeyCode::Char('u') | KeyCode::Char('U') => upgrades.toggle(),
                                     KeyCode::Tab => stats.toggle(),
+                                    KeyCode::Char('b') | KeyCode::Char('B') => bridge.toggle(),
                                     KeyCode::Char(' ') => {
                                         state.phase_timer = 0.1;
                                     }
@@ -174,6 +179,14 @@ fn main() -> io::Result<()> {
                         state.highest_sector = state.sector;
                     }
 
+                    // Notify Pip of transitions
+                    if state.phase == GamePhase::Battle && next_phase == GamePhase::Loot {
+                        bridge.notify_battle_win();
+                    }
+                    if next_phase == GamePhase::Loot {
+                        bridge.notify_loot();
+                    }
+
                     state.phase = next_phase;
                     match next_phase {
                         GamePhase::Travel => state.phase_timer = 45.0,
@@ -189,12 +202,16 @@ fn main() -> io::Result<()> {
                     .enter(&state, size.width, size.height);
                 }
 
+                // Tick Pip (always, even when bridge isn't open)
+                bridge.tick();
+
                 // Check achievements
                 let new_achievements = check_achievements(&state);
                 for ach in new_achievements {
                     state.achievements_unlocked.push(ach.id.to_string());
                     popup_text = Some(format!("{} Achievement: {} — {}", ach.icon, ach.name, ach.description));
                     popup_timer = 60; // 3 seconds at 20fps
+                    bridge.notify_achievement();
                 }
 
                 // Render
@@ -231,6 +248,9 @@ fn main() -> io::Result<()> {
                     }
 
                     // Overlays
+                    if bridge.open {
+                        bridge.render(frame, &state);
+                    }
                     if upgrades.open {
                         upgrades.render(frame, &state);
                     }
@@ -289,7 +309,7 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase) {
         GamePhase::Loot => Color::Yellow,
     };
     let hud = format!(
-        " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [Tab]Stats [Space]Skip [Q]uit ",
+        " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [B]ridge [Tab]Stats [Space]Skip [Q]uit ",
         phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
     );
     for (i, ch) in hud.chars().enumerate() {

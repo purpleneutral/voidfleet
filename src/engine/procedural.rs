@@ -1,4 +1,7 @@
 /// Procedural generation — sector-scaled enemy fleet generation with boss encounters.
+/// Includes adaptive difficulty (rubber banding) and fleet composition variety.
+
+use crate::state::GameState;
 
 /// Template for a generated enemy ship.
 #[derive(Debug, Clone)]
@@ -34,32 +37,122 @@ const SPRITE_BOSS_DREADNOUGHT: &[&str] = &[
     "    ╚════════╝",
 ];
 
+// -- Adaptive difficulty -----------------------------------------------------
+
+/// Calculate a difficulty modifier based on player state (rubber banding).
+/// Returns a multiplier around 1.0:
+/// - Over-leveled / strong fleet → >1.0 (enemies tougher)
+/// - Under-leveled / weak fleet / died recently → <1.0 (enemies easier)
+pub fn difficulty_modifier(state: &GameState) -> f32 {
+    let mut modifier = 1.0_f32;
+
+    // Level vs sector expectation
+    let expected_level = state.sector / 3 + 1;
+    if state.level > expected_level + 5 {
+        // Over-leveled: enemies get tougher (up to 1.3x)
+        let excess = (state.level - expected_level - 5) as f32;
+        modifier += (excess * 0.05).min(0.3);
+    } else if state.level + 3 < expected_level {
+        // Under-leveled: enemies get easier (down to 0.7x)
+        let deficit = (expected_level - state.level - 3) as f32;
+        modifier -= (deficit * 0.05).min(0.3);
+    }
+
+    // Fleet strength relative to sector
+    let expected_dps = 5.0 + state.sector as f32 * 2.5;
+    let actual_dps = state.fleet_total_dps();
+    if actual_dps > expected_dps * 1.5 {
+        modifier += 0.15; // Strong fleet → slightly harder
+    } else if actual_dps < expected_dps * 0.5 {
+        modifier -= 0.15; // Weak fleet → slightly easier
+    }
+
+    // Recent death mercy: if died and haven't recovered past death sector
+    if state.deaths > 0 && state.sector <= 10 {
+        modifier -= 0.2;
+    }
+
+    // Clamp to sane range
+    modifier.clamp(0.5, 1.5)
+}
+
+/// Post-death easing: returns an additional multiplier if the player just died.
+/// Call with `sectors_since_death` — if within 2 sectors of a death, reduce difficulty.
+pub fn post_death_modifier(state: &GameState) -> f32 {
+    // If player's current sector < highest sector, they died and are catching up
+    if state.deaths > 0 && state.sector < state.highest_sector {
+        let sectors_behind = state.highest_sector - state.sector;
+        if sectors_behind <= 2 {
+            return 0.7; // 30% easier for next 2 encounters after death
+        }
+    }
+    1.0
+}
+
+// -- Fleet composition variety -----------------------------------------------
+
+/// Variety enum for non-boss fleet compositions.
+#[derive(Debug, Clone, Copy)]
+enum FleetComposition {
+    Standard,     // Mixed fleet (original behavior)
+    FighterSwarm, // All small fast ships
+    HeavyEscort,  // 1 heavy + small escorts
+}
+
+/// Pick a fleet composition for variety.
+fn pick_composition(sector: u32) -> FleetComposition {
+    let roll = pseudo_random(sector, 99, 10);
+    match roll {
+        0..=5 => FleetComposition::Standard,
+        6..=7 => FleetComposition::FighterSwarm,
+        _ => FleetComposition::HeavyEscort,
+    }
+}
+
 // -- Fleet generation --------------------------------------------------------
 
-/// Generate an enemy fleet for a given sector.
-/// Scales difficulty with sector number; every 10th sector spawns a boss + escorts.
+/// Generate an enemy fleet for a given sector (original signature, no state needed).
+/// Uses base difficulty only (no adaptive rubber banding).
 pub fn generate_enemy_fleet(sector: u32) -> Vec<EnemyTemplate> {
+    generate_enemy_fleet_adaptive(sector, 1.0)
+}
+
+/// Generate an enemy fleet with adaptive difficulty applied.
+/// `modifier` is the combined difficulty_modifier * post_death_modifier.
+pub fn generate_enemy_fleet_adaptive(sector: u32, modifier: f32) -> Vec<EnemyTemplate> {
     let is_boss_sector = sector % 10 == 0 && sector > 0;
 
     let mut fleet = Vec::new();
 
     if is_boss_sector {
         fleet.push(generate_boss(sector));
-        // Boss gets escort ships
+        // Boss gets escort ships — composition varies
         let escort_count = (sector / 10).min(4) as usize;
-        for _ in 0..escort_count {
-            fleet.push(generate_escort(sector));
+        // Every other boss sector: add an extra mixed escort for variety
+        let extra = if sector % 20 == 0 { 1 } else { 0 };
+        for i in 0..(escort_count + extra) {
+            if i == escort_count {
+                // Extra escort is always a heavier type
+                fleet.push(generate_heavy_escort(sector));
+            } else {
+                fleet.push(generate_escort(sector));
+            }
         }
     } else {
-        let enemies = generate_standard_fleet(sector);
+        let composition = pick_composition(sector);
+        let enemies = match composition {
+            FleetComposition::Standard => generate_standard_fleet(sector),
+            FleetComposition::FighterSwarm => generate_fighter_swarm(sector),
+            FleetComposition::HeavyEscort => generate_heavy_escort_fleet(sector),
+        };
         fleet.extend(enemies);
     }
 
-    // Apply sector scaling to all enemies
-    let scale = sector_scale(sector);
+    // Apply sector scaling + adaptive difficulty to all enemies
+    let scale = sector_scale(sector) * modifier;
     for enemy in &mut fleet {
-        enemy.hp = (enemy.hp as f32 * scale) as u32;
-        enemy.damage = (enemy.damage as f32 * scale) as u32;
+        enemy.hp = ((enemy.hp as f32 * scale) as u32).max(1);
+        enemy.damage = ((enemy.damage as f32 * scale) as u32).max(1);
     }
 
     fleet
@@ -193,6 +286,85 @@ fn generate_standard_fleet(sector: u32) -> Vec<EnemyTemplate> {
     }
 }
 
+/// All-fighter swarm: many small fast ships.
+fn generate_fighter_swarm(sector: u32) -> Vec<EnemyTemplate> {
+    let count = match sector {
+        1..=5 => 2 + pseudo_random(sector, 10, 2) as usize,
+        6..=15 => 3 + pseudo_random(sector, 10, 3) as usize,
+        16..=25 => 5 + pseudo_random(sector, 10, 4) as usize,
+        _ => 6 + pseudo_random(sector, 10, 5) as usize,
+    };
+
+    let (name, hp, damage, speed, sprite) = if sector >= 16 {
+        ("Militia Fighter", 18, 6, 7.0, SPRITE_MILITIA_FIGHTER as &[&str])
+    } else {
+        ("Pirate Scout", 8, 2, 9.0, SPRITE_PIRATE_SCOUT as &[&str])
+    };
+
+    (0..count)
+        .map(|_| EnemyTemplate {
+            name,
+            hp,
+            damage,
+            speed,
+            sprite,
+            is_boss: false,
+        })
+        .collect()
+}
+
+/// Heavy escort fleet: 1 big ship + small escorts.
+fn generate_heavy_escort_fleet(sector: u32) -> Vec<EnemyTemplate> {
+    let mut fleet = Vec::new();
+
+    // The heavy
+    let heavy = if sector >= 26 {
+        EnemyTemplate {
+            name: "Military Destroyer",
+            hp: 140,
+            damage: 30,
+            speed: 3.0,
+            sprite: SPRITE_MILITARY_DESTROYER,
+            is_boss: false,
+        }
+    } else if sector >= 16 {
+        EnemyTemplate {
+            name: "Military Frigate",
+            hp: 70,
+            damage: 14,
+            speed: 4.5,
+            sprite: SPRITE_MILITARY_FRIGATE,
+            is_boss: false,
+        }
+    } else {
+        EnemyTemplate {
+            name: "Militia Gunship",
+            hp: 28,
+            damage: 10,
+            speed: 5.0,
+            sprite: SPRITE_MILITIA_GUNSHIP,
+            is_boss: false,
+        }
+    };
+
+    fleet.push(heavy);
+
+    // Escorts: 1-3 small ships
+    let escort_count = 1 + pseudo_random(sector, 20, 3) as usize;
+    for _ in 0..escort_count {
+        fleet.push(EnemyTemplate {
+            name: "Pirate Scout",
+            hp: 8,
+            damage: 2,
+            speed: 9.0,
+            sprite: SPRITE_PIRATE_SCOUT,
+            is_boss: false,
+        });
+    }
+
+    fleet
+}
+
 fn generate_boss(sector: u32) -> EnemyTemplate {
     // Boss tier increases every 10 sectors
     let tier = sector / 10;
@@ -229,6 +401,28 @@ fn generate_boss(sector: u32) -> EnemyTemplate {
             sprite: SPRITE_BOSS_DREADNOUGHT,
             is_boss: true,
         },
+    }
+}
+
+fn generate_heavy_escort(sector: u32) -> EnemyTemplate {
+    if sector >= 40 {
+        EnemyTemplate {
+            name: "Elite Cruiser",
+            hp: 100,
+            damage: 22,
+            speed: 3.5,
+            sprite: SPRITE_ELITE_CRUISER,
+            is_boss: false,
+        }
+    } else {
+        EnemyTemplate {
+            name: "Military Frigate",
+            hp: 70,
+            damage: 14,
+            speed: 4.5,
+            sprite: SPRITE_MILITARY_FRIGATE,
+            is_boss: false,
+        }
     }
 }
 

@@ -1,5 +1,7 @@
 use crossterm::event::KeyCode;
 use rand::Rng;
+use rand::distributions::WeightedIndex;
+use rand::prelude::Distribution;
 use ratatui::Frame;
 use ratatui::style::{Color, Style};
 
@@ -222,12 +224,128 @@ impl TravelEvent {
     }
 }
 
-fn generate_random_event(state: &GameState) -> TravelEvent {
+// ── Event type tracking for weighted selection ───────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventType {
+    DistressSignal,
+    AbandonedWreck,
+    TradingPost,
+    Wormhole,
+    PirateAmbush,
+    DerelictStation,
+    CosmicStorm,
+}
+
+impl EventType {
+    const ALL: [EventType; 7] = [
+        EventType::DistressSignal,
+        EventType::AbandonedWreck,
+        EventType::TradingPost,
+        EventType::Wormhole,
+        EventType::PirateAmbush,
+        EventType::DerelictStation,
+        EventType::CosmicStorm,
+    ];
+}
+
+/// Calculate utility-based weights for each event type given the current game state.
+fn event_weights(state: &GameState, last_event: Option<EventType>) -> Vec<(EventType, f32)> {
+    let hp_pct = if state.fleet_max_hp() > 0 {
+        state.fleet_total_hp() as f32 / state.fleet_max_hp() as f32
+    } else {
+        1.0
+    };
+
+    let mut weights: Vec<(EventType, f32)> = Vec::with_capacity(7);
+
+    for event_type in EventType::ALL {
+        // Zero weight if same as last event (no repeats)
+        if last_event == Some(event_type) {
+            weights.push((event_type, 0.0));
+            continue;
+        }
+
+        let w: f32 = match event_type {
+            EventType::DistressSignal => {
+                // Small fleet? More distress signals (recruit opportunity)
+                if state.fleet.len() <= 2 { 2.5 } else { 1.0 }
+            }
+            EventType::AbandonedWreck => {
+                // Low scrap? More salvage opportunities
+                if state.scrap < 100 { 3.0 }
+                else if state.scrap < 300 { 2.0 }
+                else { 1.0 }
+            }
+            EventType::TradingPost => {
+                // Fleet damaged? More trading posts for healing
+                // Died recently? Also helpful
+                let mut w = 1.0;
+                if hp_pct < 0.6 { w += 2.0; }
+                if state.deaths > 0 && state.sector < 10 { w += 1.0; }
+                w
+            }
+            EventType::Wormhole => {
+                // Under-leveled for sector? Wormholes less likely (don't skip ahead)
+                // Over-leveled? More wormholes to advance faster
+                let expected_level = state.sector / 3 + 1;
+                if state.level > expected_level + 3 { 2.0 }
+                else if state.level < expected_level { 0.5 }
+                else { 1.0 }
+            }
+            EventType::PirateAmbush => {
+                // High sector? More dangerous events
+                let mut w = 1.0;
+                if state.sector > 20 { w += 1.0; }
+                if state.sector > 40 { w += 0.5; }
+                // Recently died? Fewer ambushes
+                if state.deaths > 0 && state.sector < state.highest_sector { w *= 0.5; }
+                w
+            }
+            EventType::DerelictStation => {
+                // Low credits? More station exploration
+                if state.credits < 200 { 2.0 } else { 1.0 }
+            }
+            EventType::CosmicStorm => {
+                // Higher sectors = more storms
+                if state.sector > 15 { 1.5 } else { 1.0 }
+            }
+        };
+
+        weights.push((event_type, w.max(0.01))); // ensure minimum weight
+    }
+
+    weights
+}
+
+/// Pick an event type using weighted random selection.
+fn pick_event_type(state: &GameState, last_event: Option<EventType>) -> EventType {
+    let weights = event_weights(state, last_event);
+    let w_values: Vec<f32> = weights.iter().map(|(_, w)| *w).collect();
+
+    if let Ok(dist) = WeightedIndex::new(&w_values) {
+        let mut rng = rand::thread_rng();
+        let idx = dist.sample(&mut rng);
+        weights[idx].0
+    } else {
+        // Fallback: random pick if weights are all zero somehow
+        let mut rng = rand::thread_rng();
+        EventType::ALL[rng.gen_range(0..EventType::ALL.len())]
+    }
+}
+
+/// Sector-based reward scaling multiplier.
+fn sector_reward_scale(sector: u32) -> f32 {
+    1.0 + sector as f32 / 10.0
+}
+
+fn generate_random_event(state: &GameState, last_event: Option<EventType>) -> (TravelEvent, EventType) {
     let mut rng = rand::thread_rng();
-    let roll = rng.gen_range(0..7);
-    match roll {
-        0 => {
-            // Distress Signal
+    let event_type = pick_event_type(state, last_event);
+    let scale = sector_reward_scale(state.sector);
+
+    let event = match event_type {
+        EventType::DistressSignal => {
             TravelEvent::new(
                 "⚠ Distress Signal",
                 "A ship is sending an SOS. The signal is weak\nand could be a trap... or a survivor in need.",
@@ -236,15 +354,15 @@ fn generate_random_event(state: &GameState) -> TravelEvent {
                         let ships = [ShipType::Scout, ShipType::Fighter, ShipType::Bomber];
                         EventOutcome::GainShip(ships[rng.gen_range(0..ships.len())])
                     } else {
-                        EventOutcome::DamageFleet(rng.gen_range(10..30))
+                        let damage = ((rng.gen_range(10..30) as f32) * scale.min(2.0)) as u32;
+                        EventOutcome::DamageFleet(damage)
                     }),
                     ("Ignore and continue".into(), EventOutcome::Nothing),
                 ],
             )
         }
-        1 => {
-            // Abandoned Wreck
-            let scrap_amount = rng.gen_range(50..201);
+        EventType::AbandonedWreck => {
+            let scrap_amount = ((rng.gen_range(50..201) as f32) * scale) as u64;
             TravelEvent::new(
                 "🔧 Abandoned Wreck",
                 "You find a drifting hulk. Its hull is breached\nbut the cargo bay might still hold salvage.",
@@ -253,28 +371,34 @@ fn generate_random_event(state: &GameState) -> TravelEvent {
                     ("Careful search (30% blueprint)".into(), if rng.gen_bool(0.3) {
                         EventOutcome::GainBlueprint
                     } else {
-                        EventOutcome::GainScrap(rng.gen_range(20..80))
+                        let consolation = ((rng.gen_range(20..80) as f32) * scale) as u64;
+                        EventOutcome::GainScrap(consolation)
                     }),
                 ],
             )
         }
-        2 => {
-            // Trading Post
+        EventType::TradingPost => {
+            // Prices scale with sector
+            let heal_cost = (100.0 * (1.0 + state.sector as f32 / 30.0)) as u64;
+            let sell_scrap = (50.0 * (1.0 + state.sector as f32 / 40.0)) as u64;
+            let sell_credits = (80.0 * scale) as u64;
             TravelEvent::new(
                 "💰 Trading Post",
                 "A merchant vessel hails you on comms.\n\"Looking to trade, captain?\"",
                 vec![
-                    ("Buy supplies (-100₿, heal fleet)".into(),
-                        if state.credits >= 100 { EventOutcome::HealFleet } else { EventOutcome::Nothing }),
-                    ("Sell scrap (-50◇, +80₿)".into(),
-                        if state.scrap >= 50 { EventOutcome::GainCredits(80) } else { EventOutcome::Nothing }),
+                    (format!("Buy supplies (-{}₿, heal fleet)", heal_cost),
+                        if state.credits >= heal_cost { EventOutcome::HealFleet } else { EventOutcome::Nothing }),
+                    (format!("Sell scrap (-{}◇, +{}₿)", sell_scrap, sell_credits),
+                        if state.scrap >= sell_scrap { EventOutcome::GainCredits(sell_credits) } else { EventOutcome::Nothing }),
                     ("Ignore".into(), EventOutcome::Nothing),
                 ],
             )
         }
-        3 => {
-            // Wormhole
-            let skip = rng.gen_range(2..6);
+        EventType::Wormhole => {
+            // Wormhole skip scales: 2-5 early, 3-8 late
+            let min_skip = if state.sector > 20 { 3 } else { 2 };
+            let max_skip = if state.sector > 20 { 9 } else { 6 };
+            let skip = rng.gen_range(min_skip..max_skip);
             TravelEvent::new(
                 "🌀 Wormhole",
                 "A spatial anomaly tears open before your fleet.\nScanners can't determine where it leads.",
@@ -284,21 +408,21 @@ fn generate_random_event(state: &GameState) -> TravelEvent {
                 ],
             )
         }
-        4 => {
-            // Pirate Ambush
-            let scrap_cost = (state.scrap as f64 * 0.3) as u64;
+        EventType::PirateAmbush => {
+            // Tribute is percentage-based (15-35% of scrap)
+            let tribute_pct = rng.gen_range(15..36) as f64 / 100.0;
+            let scrap_cost = (state.scrap as f64 * tribute_pct) as u64;
             TravelEvent::new(
                 "☠ Pirate Ambush",
                 "Pirates emerge from an asteroid shadow!\n\"Hand over your cargo or we open fire!\"",
                 vec![
-                    (format!("Pay tribute (-{}◇)", scrap_cost), EventOutcome::LoseScrap(scrap_cost)),
+                    (format!("Pay tribute (-{}◇, {}%)", scrap_cost, (tribute_pct * 100.0) as u32), EventOutcome::LoseScrap(scrap_cost)),
                     ("Fight them off!".into(), EventOutcome::StartBattle),
                 ],
             )
         }
-        5 => {
-            // Derelict Station
-            let credits = rng.gen_range(100..501);
+        EventType::DerelictStation => {
+            let credits = ((rng.gen_range(100..501) as f32) * scale) as u64;
             TravelEvent::new(
                 "🏚 Derelict Station",
                 "An old station floats nearby, its lights\nflickering in the void. Power still runs.",
@@ -312,19 +436,21 @@ fn generate_random_event(state: &GameState) -> TravelEvent {
                 ],
             )
         }
-        _ => {
-            // Cosmic Storm
-            let damage = rng.gen_range(15..40);
+        EventType::CosmicStorm => {
+            let damage = ((rng.gen_range(15..40) as f32) * scale.min(2.5)) as u32;
+            let detour_time = 15.0 + (state.sector as f32 * 0.3).min(10.0);
             TravelEvent::new(
                 "⚡ Cosmic Storm",
                 "A radiation storm approaches! Your shields\nflare as charged particles bombard the fleet.",
                 vec![
                     (format!("Brace for impact (-{}hp)", damage), EventOutcome::DamageFleet(damage)),
-                    ("Take a detour (+15s travel)".into(), EventOutcome::AddTravelTime(15.0)),
+                    (format!("Take a detour (+{:.0}s travel)", detour_time), EventOutcome::AddTravelTime(detour_time)),
                 ],
             )
         }
-    }
+    };
+
+    (event, event_type)
 }
 
 // ── Sector name generation ───────────────────────────────────
@@ -386,6 +512,7 @@ pub struct TravelScene {
     // Random travel events
     event: Option<TravelEvent>,
     event_checked: bool, // true once we've rolled for an event this travel phase
+    last_event_type: Option<EventType>, // prevents same event twice in a row
 }
 
 impl TravelScene {
@@ -408,6 +535,7 @@ impl TravelScene {
             colored_stars: Vec::new(),
             event: None,
             event_checked: false,
+            last_event_type: None,
         }
     }
 
@@ -783,6 +911,7 @@ impl Scene for TravelScene {
         self.sector_name_fade_tick = 0;
         self.event = None;
         self.event_checked = false;
+        // Note: last_event_type is intentionally NOT reset — prevents repeats across sectors
     }
 
     fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem) -> SceneAction {
@@ -841,7 +970,9 @@ impl Scene for TravelScene {
                 // 5-10% chance (scales slightly with sector)
                 let chance = 0.05 + (state.sector as f64 * 0.005).min(0.05);
                 if rng.gen_bool(chance.min(0.10)) {
-                    self.event = Some(generate_random_event(state));
+                    let (event, event_type) = generate_random_event(state, self.last_event_type);
+                    self.last_event_type = Some(event_type);
+                    self.event = Some(event);
                     return SceneAction::Continue;
                 }
             }

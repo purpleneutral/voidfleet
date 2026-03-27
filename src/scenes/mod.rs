@@ -4,6 +4,7 @@ pub mod battle;
 pub mod raid;
 pub mod loot;
 pub mod upgrades;
+pub mod bridge;
 pub mod stats;
 
 use ratatui::Frame;

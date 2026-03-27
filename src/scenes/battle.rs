@@ -2,11 +2,69 @@ use rand::Rng;
 use ratatui::style::Color;
 use ratatui::Frame;
 
-use crate::engine::ship::ShipType;
+use crate::engine::ship::{Ship, ShipType};
 use crate::rendering::particles::{Particle, ParticleSystem};
 use crate::state::{GamePhase, GameState};
 
 use super::{Scene, SceneAction};
+
+// ---------------------------------------------------------------------------
+// AI Strategy — each enemy ship gets a tactical behavior
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AIStrategy {
+    FocusWeak,  // target lowest HP player ship
+    FocusDPS,   // target highest damage player ship
+    Aggressive, // charge forward, close distance, high fire rate
+    Flanker,    // move to top/bottom edges, attack from angles
+    Retreater,  // stay far right, pull back when HP < 30%
+    Bomber,     // slow approach, massive damage, suicide run
+}
+
+impl AIStrategy {
+    /// Assign strategy based on enemy tier and a random seed.
+    fn for_tier(tier: u32, rng: &mut impl Rng) -> Self {
+        match tier {
+            0 => {
+                // Small ships: flanker or aggressive
+                if rng.gen_bool(0.5) {
+                    AIStrategy::Flanker
+                } else {
+                    AIStrategy::Aggressive
+                }
+            }
+            1 => {
+                // Medium ships: mixed
+                let roll: f32 = rng.gen_range(0.0..1.0);
+                if roll < 0.3 {
+                    AIStrategy::Aggressive
+                } else if roll < 0.6 {
+                    AIStrategy::Flanker
+                } else {
+                    AIStrategy::FocusWeak
+                }
+            }
+            2 => {
+                // Big ships: focus or retreat
+                if rng.gen_bool(0.5) {
+                    AIStrategy::FocusDPS
+                } else {
+                    AIStrategy::Retreater
+                }
+            }
+            3 => {
+                // Warships: focus DPS or retreat
+                if rng.gen_bool(0.6) {
+                    AIStrategy::FocusDPS
+                } else {
+                    AIStrategy::Retreater
+                }
+            }
+            _ => AIStrategy::FocusDPS,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Enemy ship — local struct mirroring player Ship but simpler
@@ -15,6 +73,8 @@ use super::{Scene, SceneAction};
 struct EnemyShip {
     x: f32,
     y: f32,
+    /// Base y position for layout (before bob/tactical movement)
+    base_y: f32,
     hp: u32,
     max_hp: u32,
     damage: u32,
@@ -29,11 +89,35 @@ struct EnemyShip {
     tier: u32,
     /// Dodge offset applied when evading incoming projectiles.
     dodge_offset: f32,
+    /// AI strategy for this ship.
+    strategy: AIStrategy,
+    /// Current target index into player fleet (-1 = none).
+    target_idx: i32,
+    /// Ticks until next target recalculation.
+    retarget_cooldown: u32,
+    /// Tactical x offset from base position (for aggressive/retreater movement).
+    tactical_x_offset: f32,
+    /// Tactical y offset from base position (for flanker movement).
+    tactical_y_offset: f32,
+    /// Death animation frame (0 = alive, 1+ = dying).
+    death_frame: u8,
+    /// Whether this ship has already triggered its death explosion sequence.
+    death_exploded: bool,
 }
 
 impl EnemyShip {
     fn is_alive(&self) -> bool {
         self.hp > 0
+    }
+
+    /// Ship is in death animation (hp=0, death_frame still playing).
+    fn is_dying(&self) -> bool {
+        self.hp == 0 && self.death_frame > 0 && self.death_frame <= 15
+    }
+
+    /// Ship is fully dead and done animating.
+    fn is_done(&self) -> bool {
+        self.hp == 0 && self.death_frame > 15
     }
 
     /// Height of the sprite in rows.
@@ -43,6 +127,14 @@ impl EnemyShip {
 
     fn is_big(&self) -> bool {
         self.tier >= 2
+    }
+
+    fn hp_ratio(&self) -> f32 {
+        if self.max_hp == 0 {
+            0.0
+        } else {
+            self.hp as f32 / self.max_hp as f32
+        }
     }
 }
 
@@ -66,10 +158,12 @@ fn enemy_template(sector: u32, rng: &mut impl Rng) -> EnemyShip {
 
     let hp = (base_hp as f32 * scale) as u32;
     let fire_rate = fire_rate_ticks(base_speed, sector);
+    let strategy = AIStrategy::for_tier(tier, rng);
 
     EnemyShip {
         x: 0.0, // set by enter()
         y: 0.0,
+        base_y: 0.0,
         hp,
         max_hp: hp,
         damage: (base_dmg as f32 * scale) as u32,
@@ -80,80 +174,119 @@ fn enemy_template(sector: u32, rng: &mut impl Rng) -> EnemyShip {
         fire_rate,
         tier,
         dodge_offset: 0.0,
+        strategy,
+        target_idx: -1,
+        retarget_cooldown: 0,
+        tactical_x_offset: 0.0,
+        tactical_y_offset: 0.0,
+        death_frame: 0,
+        death_exploded: false,
     }
 }
 
 /// Convert speed stat → ticks between shots (faster = fewer ticks = higher fire‐rate).
 /// At higher sectors, fire rate increases across the board.
 fn fire_rate_ticks(speed: f32, sector: u32) -> u32 {
-    // Base: speed 10 → 8 ticks, speed 2 → 30 ticks
     let base = (40.0 / speed) as u32;
-    // Sector scaling: reduce cooldown at higher sectors (min 60% of base)
     let sector_mult = (1.0 - (sector as f32 - 1.0) * 0.02).max(0.6);
     ((base as f32 * sector_mult) as u32).max(3)
 }
 
 // ---------------------------------------------------------------------------
-// Projectile — enhanced with trailing visuals
+// Projectile — enhanced with trailing visuals and homing
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProjectileKind {
-    Laser,    // default: ━━─→ or ←─━━
-    Heavy,    // big ships: ══─→
-    Missile,  // bomber: ══►
+    ScoutLaser, // Scout/Fighter: ─→ cyan, fast, low damage
+    FrigateLaser, // Frigate: ──→ cyan, medium
+    CapitalBeam,  // Capital: ━━━━► bright cyan, slow, massive, leaves trail
+    BomberMissile, // Bomber: ══► yellow, slow, high damage, slight homing
+    EnemyLaser,   // Enemy standard: ◄── red
+    EnemyHeavy,   // Enemy big: ◄══ magenta
 }
 
 struct Projectile {
     x: f32,
     y: f32,
     vx: f32,
+    vy: f32, // vertical velocity for homing/spread
     damage: u32,
-    friendly: bool, // true = player's projectile
+    friendly: bool,
     kind: ProjectileKind,
+    /// Target y for homing missiles (-1.0 = no homing)
+    homing_target_y: f32,
 }
 
 impl Projectile {
-    /// Characters for the projectile trail (head first, then trailing chars).
     fn trail_chars(&self) -> &[char] {
-        match (&self.kind, self.friendly) {
-            (ProjectileKind::Laser, true) => &['→', '─', '━', '━'],
-            (ProjectileKind::Laser, false) => &['←', '─', '━', '━'],
-            (ProjectileKind::Heavy, true) => &['→', '─', '═', '═'],
-            (ProjectileKind::Heavy, false) => &['←', '─', '═', '═'],
-            (ProjectileKind::Missile, true) => &['►', '═', '═'],
-            (ProjectileKind::Missile, false) => &['◄', '═', '═'],
+        match self.kind {
+            ProjectileKind::ScoutLaser => &['→', '─'],
+            ProjectileKind::FrigateLaser => &['→', '─', '─'],
+            ProjectileKind::CapitalBeam => &['►', '━', '━', '━', '━'],
+            ProjectileKind::BomberMissile => &['►', '═', '═'],
+            ProjectileKind::EnemyLaser => &['◄', '─', '─'],
+            ProjectileKind::EnemyHeavy => &['◄', '═', '═', '─'],
         }
     }
 
     fn color(&self) -> Color {
-        match (&self.kind, self.friendly) {
-            (ProjectileKind::Missile, _) => Color::Yellow,
-            (_, true) => Color::Cyan,
-            (_, false) => Color::Red,
+        match self.kind {
+            ProjectileKind::ScoutLaser => Color::Cyan,
+            ProjectileKind::FrigateLaser => Color::Cyan,
+            ProjectileKind::CapitalBeam => Color::Rgb(100, 220, 255),
+            ProjectileKind::BomberMissile => Color::Yellow,
+            ProjectileKind::EnemyLaser => Color::Red,
+            ProjectileKind::EnemyHeavy => Color::Magenta,
         }
     }
 
     fn trail_color(&self) -> Color {
-        match (&self.kind, self.friendly) {
-            (ProjectileKind::Missile, _) => Color::Rgb(180, 140, 0),
-            (_, true) => Color::Rgb(0, 140, 180),
-            (_, false) => Color::Rgb(180, 60, 60),
+        match self.kind {
+            ProjectileKind::ScoutLaser => Color::Rgb(0, 140, 180),
+            ProjectileKind::FrigateLaser => Color::Rgb(0, 140, 180),
+            ProjectileKind::CapitalBeam => Color::Rgb(60, 160, 200),
+            ProjectileKind::BomberMissile => Color::Rgb(180, 140, 0),
+            ProjectileKind::EnemyLaser => Color::Rgb(180, 60, 60),
+            ProjectileKind::EnemyHeavy => Color::Rgb(140, 50, 100),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Battle phase enum
+// ---------------------------------------------------------------------------
+
+/// Phase of the battle sequence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BattlePhase {
+    /// Fleets sliding in from edges (first ~40 ticks / 2 seconds at 20 ticks/sec).
+    SlideIn,
+    /// Active combat.
+    Combat,
+    /// Victory formation before transition.
+    VictoryPose(u8),
+    /// End-of-battle freeze — counts down frames before transition.
+    Freeze(u8),
+}
+
+// ---------------------------------------------------------------------------
+// Death animation state for player ships
+// ---------------------------------------------------------------------------
+
+struct PlayerShipState {
+    fire_cooldown: u32,
+    flash: u8,
+    dodge: f32,
+    death_frame: u8,
+    death_exploded: bool,
+    /// Tactical y offset for formation behavior
+    formation_offset: f32,
 }
 
 // ---------------------------------------------------------------------------
 // BattleScene
 // ---------------------------------------------------------------------------
-
-/// End-of-battle state machine.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BattleEnd {
-    None,
-    /// Victory/defeat freeze — counts down frames before transition.
-    Freeze(u8),
-}
 
 pub struct BattleScene {
     enemies: Vec<EnemyShip>,
@@ -162,18 +295,18 @@ pub struct BattleScene {
     height: u16,
     tick_count: u64,
     sector: u32,
-    /// Per‐ship fire cooldowns for the player fleet (indexed same as state.fleet).
-    player_cooldowns: Vec<u32>,
-    /// Tracks whether battle was won (all enemies dead) or lost (all player ships dead).
+    /// Per-ship state for the player fleet (indexed same as state.fleet).
+    player_states: Vec<PlayerShipState>,
+    /// Tracks whether battle was won (all enemies dead) or lost.
     player_won: bool,
-    /// Flash timer per player ship (>0 means the ship was just hit — render inverted).
-    player_flash: Vec<u8>,
-    /// Flash timer per enemy ship.
-    enemy_flash: Vec<u8>,
-    /// Dodge offsets for player ships.
-    player_dodge: Vec<f32>,
-    /// End-of-battle state.
-    battle_end: BattleEnd,
+    /// Current battle phase.
+    phase: BattlePhase,
+    /// Slide-in progress (0.0 = offscreen, 1.0 = in position).
+    slide_progress: f32,
+    /// Coordinated focus target for enemies (-1 = no coordination).
+    focus_fire_target: i32,
+    /// Ticks until focus fire is re-evaluated.
+    focus_fire_cooldown: u32,
 }
 
 impl BattleScene {
@@ -185,12 +318,12 @@ impl BattleScene {
             height: 24,
             tick_count: 0,
             sector: 1,
-            player_cooldowns: Vec::new(),
+            player_states: Vec::new(),
             player_won: false,
-            player_flash: Vec::new(),
-            enemy_flash: Vec::new(),
-            player_dodge: Vec::new(),
-            battle_end: BattleEnd::None,
+            phase: BattlePhase::SlideIn,
+            slide_progress: 0.0,
+            focus_fire_target: -1,
+            focus_fire_cooldown: 0,
         }
     }
 
@@ -204,25 +337,49 @@ impl BattleScene {
         (self.width as f32 - 15.0).max(30.0)
     }
 
-    /// Lay out the player fleet vertically, centered, with dodge offsets.
-    fn player_positions(&self, fleet: &[crate::engine::ship::Ship]) -> Vec<(f32, f32)> {
-        let cx = self.player_x_start();
+    /// Lay out the player fleet vertically, centered, with dodge + formation offsets.
+    fn player_positions(&self, fleet: &[Ship]) -> Vec<(f32, f32)> {
+        let base_x = self.player_x_start();
         let cy = self.height as f32 / 2.0;
         let spacing = 3.0_f32;
         let total = fleet.len() as f32 * spacing;
+
+        // During slide-in, ships come from offscreen left
+        let slide_offset = if let BattlePhase::SlideIn = self.phase {
+            -(1.0 - self.slide_progress) * (base_x + 20.0)
+        } else {
+            0.0
+        };
+
+        // During victory pose, form a V-shape
+        let victory = matches!(self.phase, BattlePhase::VictoryPose(_));
 
         fleet
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                let y = cy - total / 2.0 + i as f32 * spacing;
+                let base_y = cy - total / 2.0 + i as f32 * spacing;
                 let bob = (self.tick_count as f32 * 0.06 + i as f32 * 1.1).sin() * 0.4;
-                let dodge = if i < self.player_dodge.len() {
-                    self.player_dodge[i]
+                let dodge = if i < self.player_states.len() {
+                    self.player_states[i].dodge
                 } else {
                     0.0
                 };
-                (cx, y + bob + dodge)
+                let formation = if i < self.player_states.len() {
+                    self.player_states[i].formation_offset
+                } else {
+                    0.0
+                };
+
+                if victory {
+                    // V-formation: center ship forward, others angled back
+                    let center = fleet.len() as f32 / 2.0;
+                    let dist_from_center = (i as f32 - center).abs();
+                    let vx = base_x + 10.0 - dist_from_center * 3.0 + slide_offset;
+                    (vx, base_y + bob)
+                } else {
+                    (base_x + slide_offset, base_y + bob + dodge + formation)
+                }
             })
             .collect()
     }
@@ -235,7 +392,9 @@ impl BattleScene {
 
         for (i, e) in self.enemies.iter_mut().enumerate() {
             e.x = cx;
-            e.y = cy - total / 2.0 + i as f32 * spacing;
+            let y = cy - total / 2.0 + i as f32 * spacing;
+            e.y = y;
+            e.base_y = y;
         }
     }
 
@@ -243,7 +402,7 @@ impl BattleScene {
         self.enemies.iter().filter(|e| e.is_alive()).count()
     }
 
-    fn player_alive_count(fleet: &[crate::engine::ship::Ship]) -> usize {
+    fn player_alive_count(fleet: &[Ship]) -> usize {
         fleet.iter().filter(|s| s.is_alive()).count()
     }
 
@@ -259,17 +418,19 @@ impl BattleScene {
 
     fn player_projectile_kind(ship_type: ShipType) -> ProjectileKind {
         match ship_type {
-            ShipType::Bomber => ProjectileKind::Missile,
-            ShipType::Destroyer | ShipType::Capital | ShipType::Carrier => ProjectileKind::Heavy,
-            _ => ProjectileKind::Laser,
+            ShipType::Scout => ProjectileKind::ScoutLaser,
+            ShipType::Fighter => ProjectileKind::ScoutLaser,
+            ShipType::Bomber => ProjectileKind::BomberMissile,
+            ShipType::Frigate => ProjectileKind::FrigateLaser,
+            ShipType::Destroyer | ShipType::Capital => ProjectileKind::CapitalBeam,
+            ShipType::Carrier => ProjectileKind::FrigateLaser,
         }
     }
 
     fn enemy_projectile_kind(tier: u32) -> ProjectileKind {
         match tier {
-            3 => ProjectileKind::Heavy,
-            2 => ProjectileKind::Heavy,
-            _ => ProjectileKind::Laser,
+            2 | 3 => ProjectileKind::EnemyHeavy,
+            _ => ProjectileKind::EnemyLaser,
         }
     }
 
@@ -293,6 +454,21 @@ impl BattleScene {
                 },
             ));
         }
+    }
+
+    // -- capital beam trail particles --
+
+    fn emit_beam_trail(particles: &mut ParticleSystem, x: f32, y: f32) {
+        let mut rng = rand::thread_rng();
+        particles.emit(Particle::new(
+            x,
+            y,
+            rng.gen_range(-0.1..0.1),
+            rng.gen_range(-0.15..0.15),
+            rng.gen_range(3..6),
+            if rng.gen_bool(0.5) { '·' } else { '∙' },
+            Color::Rgb(60, 160, 200),
+        ));
     }
 
     // -- chain explosion for destroyed ships --
@@ -323,7 +499,7 @@ impl BattleScene {
             let speed: f32 = rng.gen_range(0.5..1.8);
             let life: u8 = rng.gen_range(8..16);
             let color = if rng.gen_bool(0.5) {
-                Color::Rgb(255, 140, 0) // orange
+                Color::Rgb(255, 140, 0)
             } else {
                 Color::LightRed
             };
@@ -358,35 +534,121 @@ impl BattleScene {
         }
     }
 
+    /// Secondary explosion for big ships (chain explosions at offsets).
+    fn chain_explosion_sequence(
+        particles: &mut ParticleSystem,
+        x: f32,
+        y: f32,
+        frame: u8,
+    ) {
+        let mut rng = rand::thread_rng();
+        // Trigger sub-explosions at frames 4, 7, 10
+        match frame {
+            4 => Self::chain_explosion(
+                particles,
+                x + rng.gen_range(-2.0..2.0),
+                y + rng.gen_range(-1.0..1.0),
+                false,
+            ),
+            7 => Self::chain_explosion(
+                particles,
+                x + rng.gen_range(-3.0..3.0),
+                y + rng.gen_range(-1.5..1.5),
+                false,
+            ),
+            10 => Self::chain_explosion(
+                particles,
+                x + rng.gen_range(-2.0..2.0),
+                y + rng.gen_range(-1.0..1.0),
+                true,
+            ),
+            _ => {}
+        }
+    }
+
     // -- dodge logic: compute dodge offsets for each ship --
 
-    fn compute_dodge_offsets(
+    fn compute_player_dodge(
         projectiles: &[Projectile],
         positions: &[(f32, f32)],
-        ships_alive: &[bool],
-        current_dodge: &mut [f32],
-        dodge_toward_enemy: bool, // false = friendly ships dodge enemy projectiles
+        fleet: &[Ship],
+        states: &mut [PlayerShipState],
+    ) {
+        let dodge_x_range = 8.0_f32;
+        let dodge_y_range = 2.0_f32;
+        let base_dodge_strength = 0.3_f32;
+        let decay = 0.85_f32;
+
+        for (i, (px, py)) in positions.iter().enumerate() {
+            if i >= states.len() || i >= fleet.len() || !fleet[i].is_alive() {
+                continue;
+            }
+
+            // Speed-scaled dodge effectiveness
+            let speed_mult = fleet[i].speed() / 10.0;
+            let dodge_strength = base_dodge_strength * speed_mult;
+
+            // Find nearest threatening enemy projectile
+            let mut nearest_dy: Option<f32> = None;
+            let base_y = *py - states[i].dodge;
+            for p in projectiles.iter() {
+                if p.friendly {
+                    continue;
+                }
+                // Only dodge projectiles heading toward us (within x range)
+                let dx = p.x - *px;
+                if dx.abs() > dodge_x_range || dx > 0.0 {
+                    // Projectile must be to our right (heading left toward us) and close
+                    continue;
+                }
+                let dy = p.y - base_y;
+                if dy.abs() < dodge_y_range {
+                    match nearest_dy {
+                        None => nearest_dy = Some(dy),
+                        Some(prev) => {
+                            if dy.abs() < prev.abs() {
+                                nearest_dy = Some(dy);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(dy) = nearest_dy {
+                let dodge_dir = if dy > 0.0 {
+                    -dodge_strength
+                } else {
+                    dodge_strength
+                };
+                states[i].dodge = (states[i].dodge + dodge_dir).clamp(-2.0, 2.0);
+            } else {
+                states[i].dodge *= decay;
+                if states[i].dodge.abs() < 0.05 {
+                    states[i].dodge = 0.0;
+                }
+            }
+        }
+    }
+
+    fn compute_enemy_dodge(
+        projectiles: &[Projectile],
+        enemies: &mut [EnemyShip],
     ) {
         let dodge_range = 3.0_f32;
         let dodge_strength = 0.6_f32;
         let decay = 0.8_f32;
 
-        for (i, (_, sy)) in positions.iter().enumerate() {
-            if i >= current_dodge.len() || i >= ships_alive.len() || !ships_alive[i] {
+        for e in enemies.iter_mut() {
+            if !e.is_alive() {
                 continue;
             }
 
-            // Find nearest threatening projectile
             let mut nearest_dy: Option<f32> = None;
             for p in projectiles.iter() {
-                // Only dodge projectiles heading toward us
-                if dodge_toward_enemy && p.friendly {
+                if !p.friendly {
                     continue;
                 }
-                if !dodge_toward_enemy && !p.friendly {
-                    continue;
-                }
-                let dy = p.y - (*sy - current_dodge[i]); // compare against base position
+                let dy = p.y - (e.y - e.dodge_offset);
                 if dy.abs() < dodge_range {
                     match nearest_dy {
                         None => nearest_dy = Some(dy),
@@ -400,20 +662,317 @@ impl BattleScene {
             }
 
             if let Some(dy) = nearest_dy {
-                // Move away from the projectile
-                let dodge_dir = if dy > 0.0 { -dodge_strength } else { dodge_strength };
-                current_dodge[i] = (current_dodge[i] + dodge_dir).clamp(-2.0, 2.0);
+                let dodge_dir = if dy > 0.0 {
+                    -dodge_strength
+                } else {
+                    dodge_strength
+                };
+                e.dodge_offset = (e.dodge_offset + dodge_dir).clamp(-2.0, 2.0);
             } else {
-                // Decay back to center
-                current_dodge[i] *= decay;
-                if current_dodge[i].abs() < 0.05 {
-                    current_dodge[i] = 0.0;
+                e.dodge_offset *= decay;
+                if e.dodge_offset.abs() < 0.05 {
+                    e.dodge_offset = 0.0;
                 }
             }
         }
     }
 
-    // -- convert all remaining projectiles into particles (victory/defeat moment) --
+    // -----------------------------------------------------------------------
+    // AI: Utility-based target selection for enemies
+    // -----------------------------------------------------------------------
+
+    fn enemy_select_target(
+        strategy: AIStrategy,
+        enemy_y: f32,
+        fleet: &[Ship],
+        positions: &[(f32, f32)],
+        all_enemy_ys: &[f32],
+    ) -> i32 {
+        if fleet.is_empty() {
+            return -1;
+        }
+
+        let mut best_idx: i32 = -1;
+        let mut best_score: f32 = f32::NEG_INFINITY;
+
+        for (i, ship) in fleet.iter().enumerate() {
+            if !ship.is_alive() || i >= positions.len() {
+                continue;
+            }
+
+            let score = match strategy {
+                AIStrategy::FocusWeak => {
+                    if ship.current_hp == 0 {
+                        f32::NEG_INFINITY
+                    } else {
+                        1.0 / ship.current_hp as f32
+                    }
+                }
+                AIStrategy::FocusDPS => ship.damage() as f32,
+                AIStrategy::Aggressive => {
+                    let (px, py) = positions[i];
+                    let dist =
+                        ((enemy_y - py).powi(2) + (px - 30.0).powi(2)).sqrt();
+                    if dist < 0.01 {
+                        1000.0
+                    } else {
+                        1.0 / dist
+                    }
+                }
+                AIStrategy::Flanker => {
+                    // Prefer targets far from other enemies' y positions
+                    let (_, py) = positions[i];
+                    let min_enemy_dist = all_enemy_ys
+                        .iter()
+                        .filter(|&&ey| (ey - enemy_y).abs() > 1.0) // exclude self
+                        .map(|&ey| (ey - py).abs())
+                        .fold(f32::INFINITY, f32::min);
+                    // Higher score = farther from other enemies
+                    if min_enemy_dist.is_infinite() {
+                        1.0 // only enemy, pick anyone
+                    } else {
+                        min_enemy_dist
+                    }
+                }
+                AIStrategy::Retreater => {
+                    // Prefer closest (minimize waste on retreating shots)
+                    let (_, py) = positions[i];
+                    let dist = (enemy_y - py).abs();
+                    if dist < 0.01 {
+                        1000.0
+                    } else {
+                        1.0 / dist
+                    }
+                }
+                AIStrategy::Bomber => {
+                    // Target highest HP (most value from suicide)
+                    ship.current_hp as f32
+                }
+            };
+
+            if score > best_score {
+                best_score = score;
+                best_idx = i as i32;
+            }
+        }
+
+        best_idx
+    }
+
+    // -----------------------------------------------------------------------
+    // AI: Player smart targeting
+    // -----------------------------------------------------------------------
+
+    fn player_select_target(
+        ship: &Ship,
+        enemies: &[EnemyShip],
+    ) -> i32 {
+        let mut best_idx: i32 = -1;
+        let mut best_score: f32 = f32::NEG_INFINITY;
+
+        let is_capital = matches!(
+            ship.ship_type,
+            ShipType::Capital | ShipType::Destroyer | ShipType::Carrier
+        );
+
+        for (i, enemy) in enemies.iter().enumerate() {
+            if !enemy.is_alive() {
+                continue;
+            }
+
+            let mut score: f32 = 0.0;
+
+            // Threat priority: aggressive and bomber enemies are highest priority
+            match enemy.strategy {
+                AIStrategy::Bomber => score += 50.0,
+                AIStrategy::Aggressive => score += 30.0,
+                _ => {}
+            }
+
+            // Capital ships prefer enemy big ships
+            if is_capital && enemy.is_big() {
+                score += 20.0;
+            }
+
+            // Secondary: lowest HP enemy (finish kills)
+            if enemy.max_hp > 0 {
+                let hp_ratio = enemy.hp as f32 / enemy.max_hp as f32;
+                score += (1.0 - hp_ratio) * 15.0;
+            }
+
+            if score > best_score {
+                best_score = score;
+                best_idx = i as i32;
+            }
+        }
+
+        best_idx
+    }
+
+    // -----------------------------------------------------------------------
+    // AI: Focus fire coordination
+    // -----------------------------------------------------------------------
+
+    fn update_focus_fire(&mut self, fleet: &[Ship]) {
+        if self.focus_fire_cooldown > 0 {
+            self.focus_fire_cooldown -= 1;
+            return;
+        }
+
+        self.focus_fire_cooldown = 20; // re-evaluate every 20 ticks
+        let alive_enemies = self.enemy_alive_count();
+
+        if alive_enemies < 3 {
+            self.focus_fire_target = -1;
+            return;
+        }
+
+        let mut rng = rand::thread_rng();
+
+        // 60% chance enemies coordinate on same target
+        if !rng.gen_bool(0.6) {
+            self.focus_fire_target = -1;
+            return;
+        }
+
+        // Check if any player ship is below 25% HP — all switch to finish it
+        for (i, ship) in fleet.iter().enumerate() {
+            if !ship.is_alive() {
+                continue;
+            }
+            let ratio = ship.current_hp as f32 / ship.max_hp() as f32;
+            if ratio < 0.25 {
+                self.focus_fire_target = i as i32;
+                return;
+            }
+        }
+
+        // Otherwise pick the weakest alive ship
+        let mut weakest_idx: i32 = -1;
+        let mut weakest_hp = u32::MAX;
+        for (i, ship) in fleet.iter().enumerate() {
+            if ship.is_alive() && ship.current_hp < weakest_hp {
+                weakest_hp = ship.current_hp;
+                weakest_idx = i as i32;
+            }
+        }
+        self.focus_fire_target = weakest_idx;
+    }
+
+    // -----------------------------------------------------------------------
+    // AI: Enemy tactical movement
+    // -----------------------------------------------------------------------
+
+    fn update_enemy_movement(&mut self) {
+        let height = self.height as f32;
+        let quarter = height / 4.0;
+
+        for e in self.enemies.iter_mut() {
+            if !e.is_alive() {
+                continue;
+            }
+
+            match e.strategy {
+                AIStrategy::Flanker => {
+                    // Move to top or bottom quarter of screen
+                    let target_y = if e.base_y < height / 2.0 {
+                        quarter // top quarter
+                    } else {
+                        height - quarter // bottom quarter
+                    };
+                    let dy = target_y - (e.base_y + e.tactical_y_offset);
+                    e.tactical_y_offset += dy.clamp(-0.15, 0.15);
+                    e.tactical_y_offset = e.tactical_y_offset.clamp(-height / 3.0, height / 3.0);
+                }
+                AIStrategy::Aggressive => {
+                    // Drift left toward player fleet
+                    e.tactical_x_offset -= 0.1;
+                    // Clamp so they don't go past midscreen
+                    let max_advance = e.x - 15.0;
+                    if e.tactical_x_offset < -max_advance {
+                        e.tactical_x_offset = -max_advance;
+                    }
+                }
+                AIStrategy::Retreater => {
+                    if e.hp_ratio() < 0.3 {
+                        // Retreat: drift right
+                        e.tactical_x_offset += 0.15;
+                        let max_retreat = (self.width as f32 - e.x - 2.0).max(0.0);
+                        if e.tactical_x_offset > max_retreat {
+                            e.tactical_x_offset = max_retreat;
+                        }
+                    }
+                }
+                AIStrategy::Bomber => {
+                    // Charge forward at 0.3/tick
+                    e.tactical_x_offset -= 0.3;
+                    // If reached player fleet x range, it will "explode" in tick
+                    let max_advance = e.x - 8.0;
+                    if e.tactical_x_offset < -max_advance {
+                        e.tactical_x_offset = -max_advance;
+                    }
+                }
+                _ => {
+                    // FocusWeak, FocusDPS: gentle drift toward target y
+                    // (handled by gentle oscillation only)
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // AI: Player fleet formation behavior
+    // -----------------------------------------------------------------------
+
+    fn update_player_formation(
+        fleet: &[Ship],
+        enemies: &[EnemyShip],
+        states: &mut [PlayerShipState],
+    ) {
+        for (i, ship) in fleet.iter().enumerate() {
+            if !ship.is_alive() || i >= states.len() {
+                continue;
+            }
+
+            let is_fighter = matches!(
+                ship.ship_type,
+                ShipType::Scout | ShipType::Fighter
+            );
+
+            if is_fighter {
+                // Fighters drift toward nearest alive enemy's y position
+                let mut nearest_enemy_y: Option<f32> = None;
+                let mut nearest_dist = f32::INFINITY;
+                for e in enemies.iter() {
+                    if !e.is_alive() {
+                        continue;
+                    }
+                    let ey = e.y + e.tactical_y_offset;
+                    // We don't have exact player y here, but formation offset pulls toward enemy
+                    let dist = ey.abs(); // rough proxy
+                    if dist < nearest_dist {
+                        nearest_dist = dist;
+                        nearest_enemy_y = Some(ey);
+                    }
+                }
+
+                if let Some(ey) = nearest_enemy_y {
+                    // Pull formation offset toward enemy y (relative to base position)
+                    let target_offset = (ey - 12.0).clamp(-4.0, 4.0) * 0.3;
+                    let diff = target_offset - states[i].formation_offset;
+                    states[i].formation_offset += diff.clamp(-0.1, 0.1);
+                }
+            } else {
+                // Capital/heavy ships: stay center, decay formation offset
+                states[i].formation_offset *= 0.95;
+                if states[i].formation_offset.abs() < 0.05 {
+                    states[i].formation_offset = 0.0;
+                }
+            }
+        }
+    }
+
+    // -- convert all remaining projectiles into particles --
 
     fn projectiles_to_particles(
         projectiles: &mut Vec<Projectile>,
@@ -437,6 +996,58 @@ impl BattleScene {
             ));
         }
     }
+
+    // -- bomber suicide explosion --
+
+    fn bomber_explode(
+        particles: &mut ParticleSystem,
+        x: f32,
+        y: f32,
+        damage: u32,
+        fleet: &mut [Ship],
+        positions: &[(f32, f32)],
+        states: &mut [PlayerShipState],
+    ) -> u64 {
+        // Area damage to all player ships within range
+        let blast_radius = 6.0_f32;
+        let mut destroyed = 0u64;
+
+        for (i, ship) in fleet.iter_mut().enumerate() {
+            if !ship.is_alive() || i >= positions.len() {
+                continue;
+            }
+            let (sx, sy) = positions[i];
+            let dist = ((x - sx).powi(2) + (y - sy).powi(2)).sqrt();
+            if dist < blast_radius {
+                let falloff = 1.0 - (dist / blast_radius);
+                let dmg = (damage as f32 * falloff) as u32;
+                let actual = dmg.min(ship.current_hp);
+                ship.current_hp -= actual;
+
+                if i < states.len() {
+                    states[i].flash = 4;
+                }
+
+                if !ship.is_alive() {
+                    let is_big = matches!(
+                        ship.ship_type,
+                        ShipType::Destroyer
+                            | ShipType::Capital
+                            | ShipType::Carrier
+                            | ShipType::Frigate
+                    );
+                    let sprite_w = ship.ship_type.sprite()[0].chars().count() as f32;
+                    Self::chain_explosion(particles, sx + sprite_w / 2.0, sy, is_big);
+                    destroyed += 1;
+                }
+            }
+        }
+
+        // Big explosion at bomber location
+        Self::chain_explosion(particles, x, y, true);
+
+        destroyed
+    }
 }
 
 impl Scene for BattleScene {
@@ -447,7 +1058,10 @@ impl Scene for BattleScene {
         self.sector = state.sector;
         self.projectiles.clear();
         self.player_won = false;
-        self.battle_end = BattleEnd::None;
+        self.phase = BattlePhase::SlideIn;
+        self.slide_progress = 0.0;
+        self.focus_fire_target = -1;
+        self.focus_fire_cooldown = 0;
 
         // Generate enemy fleet based on sector
         let mut rng = rand::thread_rng();
@@ -458,148 +1072,317 @@ impl Scene for BattleScene {
         }
         self.layout_enemies();
 
-        // Fire cooldowns for player ships (sector-scaled)
-        self.player_cooldowns = state
+        // Player ship states
+        self.player_states = state
             .fleet
             .iter()
             .map(|s| {
                 let rate = fire_rate_ticks(s.speed(), state.sector);
-                rng.gen_range(0..rate) // stagger
+                PlayerShipState {
+                    fire_cooldown: rng.gen_range(0..rate),
+                    flash: 0,
+                    dodge: 0.0,
+                    death_frame: 0,
+                    death_exploded: false,
+                    formation_offset: 0.0,
+                }
             })
             .collect();
-
-        self.player_flash = vec![0u8; state.fleet.len()];
-        self.enemy_flash = vec![0u8; self.enemies.len()];
-        self.player_dodge = vec![0.0f32; state.fleet.len()];
     }
 
     fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem) -> SceneAction {
         self.tick_count += 1;
 
+        // ── Slide-in phase ─────────────────────────────────────────────
+        if let BattlePhase::SlideIn = self.phase {
+            self.slide_progress += 0.025; // ~40 ticks to complete
+            if self.slide_progress >= 1.0 {
+                self.slide_progress = 1.0;
+                self.phase = BattlePhase::Combat;
+            }
+            // During slide-in, enemies also slide from right
+            let slide = self.slide_progress;
+            let base_x = self.enemy_x_start();
+            let offscreen_x = self.width as f32 + 10.0;
+            for e in self.enemies.iter_mut() {
+                e.x = offscreen_x + (base_x - offscreen_x) * slide;
+            }
+            return SceneAction::Continue;
+        }
+
+        // ── Victory pose ───────────────────────────────────────────────
+        if let BattlePhase::VictoryPose(ref mut frames) = self.phase {
+            if *frames == 0 {
+                self.phase = BattlePhase::Freeze(10);
+                return SceneAction::Continue;
+            }
+            *frames -= 1;
+            return SceneAction::Continue;
+        }
+
         // ── Handle end-of-battle freeze ────────────────────────────────
-        if let BattleEnd::Freeze(ref mut frames) = self.battle_end {
+        if let BattlePhase::Freeze(ref mut frames) = self.phase {
             if *frames == 0 {
                 state.total_battles += 1;
                 return SceneAction::TransitionTo(GamePhase::Loot);
             }
             *frames -= 1;
-            // During freeze, only tick particles (no new firing/movement)
             return SceneAction::Continue;
         }
 
-        // ── Enemy bobbing + dodge ──────────────────────────────────────
-        let cx = self.enemy_x_start();
-        let cy = self.height as f32 / 2.0;
-        let spacing = 3.0_f32;
-        let total = self.enemies.len() as f32 * spacing;
+        // ══════════════════════════════════════════════════════════════
+        // COMBAT PHASE
+        // ══════════════════════════════════════════════════════════════
 
-        // Compute enemy dodge offsets against friendly projectiles
+        // ── Update death animations ────────────────────────────────────
+        for e in self.enemies.iter_mut() {
+            if e.hp == 0 && e.death_frame > 0 && e.death_frame <= 15 {
+                e.death_frame += 1;
+                if e.is_big() {
+                    let sprite_w = e.sprite[0].chars().count() as f32;
+                    Self::chain_explosion_sequence(
+                        particles,
+                        e.x + sprite_w / 2.0,
+                        e.y,
+                        e.death_frame,
+                    );
+                }
+            }
+        }
         {
-            let enemy_positions: Vec<(f32, f32)> = self
-                .enemies
-                .iter()
-                .map(|e| (e.x, e.y))
-                .collect();
-            let alive: Vec<bool> = self.enemies.iter().map(|e| e.is_alive()).collect();
-            let mut dodge_offsets: Vec<f32> =
-                self.enemies.iter().map(|e| e.dodge_offset).collect();
-            Self::compute_dodge_offsets(
-                &self.projectiles,
-                &enemy_positions,
-                &alive,
-                &mut dodge_offsets,
-                true, // dodge friendly (player) projectiles
-            );
-            for (i, e) in self.enemies.iter_mut().enumerate() {
-                if i < dodge_offsets.len() {
-                    e.dodge_offset = dodge_offsets[i];
+            let player_pos = self.player_positions(&state.fleet);
+            for (i, ps) in self.player_states.iter_mut().enumerate() {
+                if i < state.fleet.len() && !state.fleet[i].is_alive() && ps.death_frame > 0 && ps.death_frame <= 15 {
+                    ps.death_frame += 1;
+                    let is_big = matches!(
+                        state.fleet[i].ship_type,
+                        ShipType::Destroyer | ShipType::Capital | ShipType::Carrier | ShipType::Frigate
+                    );
+                    if is_big && i < player_pos.len() {
+                        let sprite = state.fleet[i].ship_type.sprite();
+                        let sprite_w = sprite[0].chars().count() as f32;
+                        let (px, py) = player_pos[i];
+                        Self::chain_explosion_sequence(
+                            particles,
+                            px + sprite_w / 2.0,
+                            py,
+                            ps.death_frame,
+                        );
+                    }
                 }
             }
         }
 
-        for (i, e) in self.enemies.iter_mut().enumerate() {
-            if e.is_alive() {
-                let base_y = cy - total / 2.0 + i as f32 * spacing;
-                let bob = (self.tick_count as f32 * 0.05 + i as f32 * 1.3).sin() * 0.4;
-                e.x = cx;
-                e.y = base_y + bob + e.dodge_offset;
+        // ── Focus fire coordination ────────────────────────────────────
+        self.update_focus_fire(&state.fleet);
+
+        // ── Enemy AI: target selection (every 30 ticks) ────────────────
+        let positions = self.player_positions(&state.fleet);
+        let all_enemy_ys: Vec<f32> = self
+            .enemies
+            .iter()
+            .filter(|e| e.is_alive())
+            .map(|e| e.y + e.tactical_y_offset)
+            .collect();
+
+        for e in self.enemies.iter_mut() {
+            if !e.is_alive() {
+                continue;
+            }
+            if e.retarget_cooldown == 0 {
+                e.retarget_cooldown = 30;
+
+                // If focus fire is active and this enemy is eligible, use it
+                if self.focus_fire_target >= 0
+                    && (self.focus_fire_target as usize) < state.fleet.len()
+                    && state.fleet[self.focus_fire_target as usize].is_alive()
+                {
+                    e.target_idx = self.focus_fire_target;
+                } else {
+                    e.target_idx = Self::enemy_select_target(
+                        e.strategy,
+                        e.y + e.tactical_y_offset,
+                        &state.fleet,
+                        &positions,
+                        &all_enemy_ys,
+                    );
+                }
+            } else {
+                e.retarget_cooldown -= 1;
             }
         }
+
+        // ── Enemy tactical movement ────────────────────────────────────
+        self.update_enemy_movement();
+
+        // ── Enemy bobbing + positioning ────────────────────────────────
+        let base_x = self.enemy_x_start();
+        for (i, e) in self.enemies.iter_mut().enumerate() {
+            if !e.is_alive() {
+                continue;
+            }
+            let bob = (self.tick_count as f32 * 0.05 + i as f32 * 1.3).sin() * 0.4;
+            e.x = base_x + e.tactical_x_offset;
+            e.y = e.base_y + bob + e.dodge_offset + e.tactical_y_offset;
+            // Clamp to screen
+            e.y = e.y.clamp(1.0, self.height as f32 - 3.0);
+            e.x = e.x.clamp(10.0, self.width as f32 - 2.0);
+        }
+
+        // ── Compute enemy dodge offsets ────────────────────────────────
+        Self::compute_enemy_dodge(&self.projectiles, &mut self.enemies);
 
         // ── Compute player dodge offsets ───────────────────────────────
         {
             let positions = self.player_positions(&state.fleet);
-            let alive: Vec<bool> = state.fleet.iter().map(|s| s.is_alive()).collect();
-            Self::compute_dodge_offsets(
+            Self::compute_player_dodge(
                 &self.projectiles,
                 &positions,
-                &alive,
-                &mut self.player_dodge,
-                false, // dodge enemy projectiles
+                &state.fleet,
+                &mut self.player_states,
             );
         }
+
+        // ── Player fleet formation AI ──────────────────────────────────
+        Self::update_player_formation(&state.fleet, &self.enemies, &mut self.player_states);
 
         // ── Player fleet fires ─────────────────────────────────────────
         let positions = self.player_positions(&state.fleet);
         for (i, ship) in state.fleet.iter().enumerate() {
-            if !ship.is_alive() {
+            if !ship.is_alive() || i >= self.player_states.len() {
                 continue;
             }
-            if i >= self.player_cooldowns.len() {
-                continue;
-            }
-            if self.player_cooldowns[i] == 0 {
+            if self.player_states[i].fire_cooldown == 0 {
                 let (px, py) = positions[i];
                 let sprite_w = ship.ship_type.sprite()[0].chars().count() as f32;
                 let muzzle_x = px + sprite_w + 1.0;
                 let kind = Self::player_projectile_kind(ship.ship_type);
                 let speed = match kind {
-                    ProjectileKind::Missile => 0.8 + ship.speed() * 0.05,
+                    ProjectileKind::BomberMissile => 0.8 + ship.speed() * 0.05,
+                    ProjectileKind::CapitalBeam => 0.6 + ship.speed() * 0.04,
                     _ => 1.2 + ship.speed() * 0.08,
                 };
+
+                // Smart targeting: aim toward selected enemy
+                let target_idx = Self::player_select_target(ship, &self.enemies);
+                let vy = if target_idx >= 0 {
+                    let tidx = target_idx as usize;
+                    if tidx < self.enemies.len() && self.enemies[tidx].is_alive() {
+                        let ey = self.enemies[tidx].y;
+                        let dy = ey - py;
+                        // Slight vertical aim, more for homing missiles
+                        match kind {
+                            ProjectileKind::BomberMissile => dy.clamp(-0.3, 0.3),
+                            _ => dy.clamp(-0.1, 0.1),
+                        }
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+
+                // Homing target for bomber missiles
+                let homing_y = if kind == ProjectileKind::BomberMissile && target_idx >= 0 {
+                    let tidx = target_idx as usize;
+                    if tidx < self.enemies.len() {
+                        self.enemies[tidx].y
+                    } else {
+                        -1.0
+                    }
+                } else {
+                    -1.0
+                };
+
                 self.projectiles.push(Projectile {
                     x: muzzle_x,
                     y: py,
                     vx: speed,
+                    vy,
                     damage: ship.damage(),
                     friendly: true,
                     kind,
+                    homing_target_y: homing_y,
                 });
 
-                // Muzzle flash
                 Self::emit_muzzle_flash(particles, muzzle_x, py, true);
-
-                self.player_cooldowns[i] = fire_rate_ticks(ship.speed(), self.sector);
+                self.player_states[i].fire_cooldown = fire_rate_ticks(ship.speed(), self.sector);
             } else {
-                self.player_cooldowns[i] -= 1;
+                self.player_states[i].fire_cooldown -= 1;
             }
         }
 
         // ── Enemy fleet fires ──────────────────────────────────────────
+        let positions = self.player_positions(&state.fleet);
+        let player_x = self.player_x_start();
         for e in self.enemies.iter_mut() {
             if !e.is_alive() {
                 continue;
             }
+
+            // Bomber suicide check: if reached player fleet x range
+            if e.strategy == AIStrategy::Bomber && e.x <= player_x + 12.0 {
+                let damage = e.damage * 3; // triple damage on suicide
+                e.hp = 0;
+                e.death_frame = 1;
+                // Explode with area damage
+                let bomber_x = e.x;
+                let bomber_y = e.y;
+                let destroyed = Self::bomber_explode(
+                    particles,
+                    bomber_x,
+                    bomber_y,
+                    damage,
+                    &mut state.fleet,
+                    &positions,
+                    &mut self.player_states,
+                );
+                state.enemies_destroyed += 1 + destroyed;
+                continue;
+            }
+
             if e.fire_cooldown == 0 {
                 let kind = Self::enemy_projectile_kind(e.tier);
                 let speed = match kind {
-                    ProjectileKind::Heavy => 0.6 + e.speed * 0.04,
+                    ProjectileKind::EnemyHeavy => 0.6 + e.speed * 0.04,
                     _ => 0.8 + e.speed * 0.06,
                 };
                 let muzzle_x = e.x - 1.0;
+
+                // Aim at target
+                let vy = if e.target_idx >= 0 {
+                    let tidx = e.target_idx as usize;
+                    if tidx < positions.len() && tidx < state.fleet.len() && state.fleet[tidx].is_alive() {
+                        let (_, ty) = positions[tidx];
+                        let dy = ty - e.y;
+                        dy.clamp(-0.15, 0.15)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+
                 self.projectiles.push(Projectile {
                     x: muzzle_x,
                     y: e.y,
                     vx: -speed,
+                    vy,
                     damage: e.damage,
                     friendly: false,
                     kind,
+                    homing_target_y: -1.0,
                 });
 
-                // Muzzle flash
                 Self::emit_muzzle_flash(particles, muzzle_x, e.y, false);
 
-                e.fire_cooldown = e.fire_rate;
+                // Aggressive enemies fire faster
+                let rate_mult = if e.strategy == AIStrategy::Aggressive {
+                    0.7
+                } else {
+                    1.0
+                };
+                e.fire_cooldown = ((e.fire_rate as f32 * rate_mult) as u32).max(2);
             } else {
                 e.fire_cooldown -= 1;
             }
@@ -608,11 +1391,26 @@ impl Scene for BattleScene {
         // ── Move projectiles ───────────────────────────────────────────
         for p in self.projectiles.iter_mut() {
             p.x += p.vx;
+            p.y += p.vy;
+
+            // Homing: bomber missiles adjust vy toward target
+            if p.kind == ProjectileKind::BomberMissile && p.homing_target_y >= 0.0 {
+                let dy = p.homing_target_y - p.y;
+                p.vy += dy.clamp(-0.02, 0.02);
+                p.vy = p.vy.clamp(-0.4, 0.4);
+            }
+
+            // Capital beam trail particles
+            if p.kind == ProjectileKind::CapitalBeam && self.tick_count % 2 == 0 {
+                Self::emit_beam_trail(particles, p.x - 2.0, p.y);
+            }
         }
 
         // Remove off-screen
         let w = self.width as f32;
-        self.projectiles.retain(|p| p.x >= -4.0 && p.x <= w + 4.0);
+        let h = self.height as f32;
+        self.projectiles
+            .retain(|p| p.x >= -4.0 && p.x <= w + 4.0 && p.y >= -2.0 && p.y <= h + 2.0);
 
         // ── Hit detection: friendly projectiles → enemies ──────────────
         let mut to_remove_proj: Vec<usize> = Vec::new();
@@ -620,7 +1418,7 @@ impl Scene for BattleScene {
             if !proj.friendly {
                 continue;
             }
-            for (ei, enemy) in self.enemies.iter_mut().enumerate() {
+            for (_ei, enemy) in self.enemies.iter_mut().enumerate() {
                 if !enemy.is_alive() {
                     continue;
                 }
@@ -631,11 +1429,6 @@ impl Scene for BattleScene {
                     let dmg = proj.damage.min(enemy.hp);
                     enemy.hp -= dmg;
                     to_remove_proj.push(pi);
-
-                    // Flash
-                    if ei < self.enemy_flash.len() {
-                        self.enemy_flash[ei] = 3;
-                    }
 
                     // Hit spark
                     particles.emit(Particle::new(
@@ -648,10 +1441,15 @@ impl Scene for BattleScene {
                         Color::White,
                     ));
 
-                    // Death?
+                    // Death? Start death animation
                     if !enemy.is_alive() {
-                        let center_x = enemy.x + sprite_w / 2.0;
-                        Self::chain_explosion(particles, center_x, enemy.y, enemy.is_big());
+                        enemy.death_frame = 1;
+                        if !enemy.is_big() {
+                            // Small ships: immediate full explosion
+                            let center_x = enemy.x + sprite_w / 2.0;
+                            Self::chain_explosion(particles, center_x, enemy.y, false);
+                            enemy.death_exploded = true;
+                        }
                         state.enemies_destroyed += 1;
                     }
                     break;
@@ -666,10 +1464,7 @@ impl Scene for BattleScene {
                 continue;
             }
             for (si, ship) in state.fleet.iter_mut().enumerate() {
-                if !ship.is_alive() {
-                    continue;
-                }
-                if si >= positions.len() {
+                if !ship.is_alive() || si >= positions.len() {
                     continue;
                 }
                 let (sx, sy) = positions[si];
@@ -686,8 +1481,8 @@ impl Scene for BattleScene {
                     }
 
                     // Flash
-                    if si < self.player_flash.len() {
-                        self.player_flash[si] = 3;
+                    if si < self.player_states.len() {
+                        self.player_states[si].flash = 3;
                     }
 
                     // Hit spark
@@ -701,18 +1496,25 @@ impl Scene for BattleScene {
                         Color::White,
                     ));
 
-                    // Death?
-                    if !ship.is_alive() {
+                    // Death? Start death animation
+                    if !ship.is_alive() && si < self.player_states.len() {
+                        self.player_states[si].death_frame = 1;
                         let is_big = matches!(
                             ship.ship_type,
-                            ShipType::Destroyer | ShipType::Capital | ShipType::Carrier | ShipType::Frigate
+                            ShipType::Destroyer
+                                | ShipType::Capital
+                                | ShipType::Carrier
+                                | ShipType::Frigate
                         );
-                        Self::chain_explosion(
-                            particles,
-                            sx + sprite_w / 2.0,
-                            sy,
-                            is_big,
-                        );
+                        if !is_big {
+                            Self::chain_explosion(
+                                particles,
+                                sx + sprite_w / 2.0,
+                                sy,
+                                false,
+                            );
+                            self.player_states[si].death_exploded = true;
+                        }
                     }
                     break;
                 }
@@ -729,29 +1531,36 @@ impl Scene for BattleScene {
         }
 
         // ── Decrement flash timers ─────────────────────────────────────
-        for f in self.player_flash.iter_mut() {
-            *f = f.saturating_sub(1);
-        }
-        for f in self.enemy_flash.iter_mut() {
-            *f = f.saturating_sub(1);
+        for ps in self.player_states.iter_mut() {
+            ps.flash = ps.flash.saturating_sub(1);
         }
 
-        // ── Win / lose check — enter freeze instead of instant transition
-        if self.enemy_alive_count() == 0 {
+        // ── Win / lose check ───────────────────────────────────────────
+        // All enemies must be fully dead (done animating)
+        let all_enemies_dead = self.enemies.iter().all(|e| e.hp == 0);
+        let all_enemies_done = self.enemies.iter().all(|e| e.is_done() || (e.hp == 0 && e.death_frame == 0));
+
+        if all_enemies_dead && (all_enemies_done || self.enemies.iter().all(|e| e.hp == 0)) {
+            // Mark all as done if they haven't started death anim
+            for e in self.enemies.iter_mut() {
+                if e.death_frame == 0 && e.hp == 0 {
+                    e.death_frame = 16; // skip animation
+                }
+            }
             self.player_won = true;
-            // Convert remaining projectiles to particles for victory moment
             Self::projectiles_to_particles(&mut self.projectiles, particles);
-            self.battle_end = BattleEnd::Freeze(10);
+            self.phase = BattlePhase::VictoryPose(20); // ~1 second victory formation
             return SceneAction::Continue;
         }
+
         if Self::player_alive_count(&state.fleet) == 0 {
             self.player_won = false;
             Self::projectiles_to_particles(&mut self.projectiles, particles);
-            self.battle_end = BattleEnd::Freeze(10);
+            self.phase = BattlePhase::Freeze(10);
             return SceneAction::Continue;
         }
 
-        // Fallback timeout — force end after phase_timer expires
+        // Fallback timeout
         state.phase_timer -= 0.05;
         if state.phase_timer <= 0.0 {
             self.player_won = true;
@@ -769,19 +1578,47 @@ impl Scene for BattleScene {
         // ── Player ships (left side) ───────────────────────────────────
         let positions = self.player_positions(&state.fleet);
         for (i, ship) in state.fleet.iter().enumerate() {
-            if !ship.is_alive() || i >= positions.len() {
+            if i >= positions.len() {
                 continue;
             }
+            if i < self.player_states.len() {
+                let ps = &self.player_states[i];
+
+                // Death animation rendering
+                if !ship.is_alive() {
+                    if ps.death_frame > 0 && ps.death_frame <= 3 {
+                        // Frame 1-3: bright white block
+                        let (fx, fy) = positions[i];
+                        let sprite = ship.ship_type.sprite();
+                        for (row, line) in sprite.iter().enumerate() {
+                            let sy = (fy + row as f32) as u16;
+                            for (col, _) in line.chars().enumerate() {
+                                let sx = (fx + col as f32) as u16;
+                                if sx < area.width && sy < area.height {
+                                    let cell = &mut buf[(area.x + sx, area.y + sy)];
+                                    cell.set_char('█');
+                                    cell.set_fg(Color::White);
+                                    cell.set_bg(Color::Reset);
+                                }
+                            }
+                        }
+                    }
+                    // Frame 4+: handled by particles
+                    continue;
+                }
+            } else if !ship.is_alive() {
+                continue;
+            }
+
             let (fx, fy) = positions[i];
             let sprite = ship.ship_type.sprite();
-            let flashing = i < self.player_flash.len() && self.player_flash[i] > 0;
+            let flashing = i < self.player_states.len() && self.player_states[i].flash > 0;
             let damaged = ship.current_hp < ship.max_hp();
 
-            // Color coding: cyan base, flash white on hit, dim when damaged
             let fg = if flashing {
                 Color::White
             } else if damaged && self.tick_count % 6 < 2 {
-                Color::DarkGray // damaged flash
+                Color::DarkGray
             } else {
                 Color::Cyan
             };
@@ -806,25 +1643,41 @@ impl Scene for BattleScene {
         }
 
         // ── Enemy ships (right side) ──────────────────────────────────
-        for (i, enemy) in self.enemies.iter().enumerate() {
+        for (_i, enemy) in self.enemies.iter().enumerate() {
+            // Death animation rendering
             if !enemy.is_alive() {
+                if enemy.death_frame > 0 && enemy.death_frame <= 3 {
+                    // Frame 1-3: bright white block
+                    for (row, line) in enemy.sprite.iter().enumerate() {
+                        let sy = (enemy.y + row as f32) as u16;
+                        for (col, _) in line.chars().enumerate() {
+                            let sx = (enemy.x + col as f32) as u16;
+                            if sx < area.width && sy < area.height {
+                                let cell = &mut buf[(area.x + sx, area.y + sy)];
+                                cell.set_char('█');
+                                cell.set_fg(Color::White);
+                                cell.set_bg(Color::Reset);
+                            }
+                        }
+                    }
+                }
                 continue;
             }
-            let flashing = i < self.enemy_flash.len() && self.enemy_flash[i] > 0;
+
             let damaged = enemy.hp < enemy.max_hp;
 
-            // Color coding: red base, flash white on hit, dim when damaged
-            let fg = if flashing {
-                Color::White
-            } else if damaged && self.tick_count % 6 < 2 {
+            // Color based on strategy for visual variety
+            let base_fg = match enemy.strategy {
+                AIStrategy::Bomber => Color::Yellow,
+                AIStrategy::Aggressive => Color::Rgb(255, 100, 100),
+                AIStrategy::Flanker => Color::Rgb(255, 130, 180),
+                _ => Color::LightRed,
+            };
+
+            let fg = if damaged && self.tick_count % 6 < 2 {
                 Color::DarkGray
             } else {
-                Color::LightRed
-            };
-            let bg = if flashing {
-                Color::Yellow
-            } else {
-                Color::Reset
+                base_fg
             };
 
             for (row, line) in enemy.sprite.iter().enumerate() {
@@ -835,7 +1688,7 @@ impl Scene for BattleScene {
                         let cell = &mut buf[(area.x + sx, area.y + sy)];
                         cell.set_char(ch);
                         cell.set_fg(fg);
-                        cell.set_bg(bg);
+                        cell.set_bg(Color::Reset);
                     }
                 }
             }
@@ -854,10 +1707,8 @@ impl Scene for BattleScene {
 
             for (idx, &ch) in trail.iter().enumerate() {
                 let offset = if p.vx > 0.0 {
-                    // Moving right: head is rightmost, trail extends left
                     -(idx as f32)
                 } else {
-                    // Moving left: head is leftmost, trail extends right
                     idx as f32
                 };
                 let tx = (p.x + offset) as i32;
@@ -880,6 +1731,21 @@ impl Scene for BattleScene {
             }
         }
 
+        // ── Focus fire indicator ──────────────────────────────────────
+        if self.focus_fire_target >= 0 {
+            let tidx = self.focus_fire_target as usize;
+            if tidx < positions.len() && tidx < state.fleet.len() && state.fleet[tidx].is_alive() {
+                let (_tx, ty) = positions[tidx];
+                let indicator_x = 1u16;
+                let indicator_y = ty as u16;
+                if indicator_x < area.width && indicator_y < area.height {
+                    let cell = &mut buf[(area.x + indicator_x, area.y + indicator_y)];
+                    cell.set_char('⚠');
+                    cell.set_fg(Color::Red);
+                }
+            }
+        }
+
         // ── Health bars at bottom ──────────────────────────────────────
         let bar_y = area.height.saturating_sub(2);
         let bar_width = (area.width / 2).saturating_sub(4) as usize;
@@ -894,7 +1760,6 @@ impl Scene for BattleScene {
         };
         let player_filled = (player_ratio * bar_width as f32) as usize;
 
-        // Label
         let label = "FLEET ";
         for (i, ch) in label.chars().enumerate() {
             let x = 1 + i as u16;
@@ -904,7 +1769,6 @@ impl Scene for BattleScene {
                 cell.set_fg(Color::Green);
             }
         }
-        // Bar
         let bar_start = 1 + label.len() as u16;
         for i in 0..bar_width {
             let x = bar_start + i as u16;
@@ -919,7 +1783,6 @@ impl Scene for BattleScene {
                 }
             }
         }
-        // HP text
         let hp_text = format!(" {}/{}", player_hp, player_max);
         let hp_x = bar_start + bar_width as u16;
         for (i, ch) in hp_text.chars().enumerate() {
@@ -977,9 +1840,21 @@ impl Scene for BattleScene {
         }
 
         // ── Battle header ──────────────────────────────────────────────
+        let phase_label = match self.phase {
+            BattlePhase::SlideIn => " — Engaging...",
+            BattlePhase::VictoryPose(_) => " — VICTORY!",
+            BattlePhase::Freeze(_) => {
+                if self.player_won {
+                    " — VICTORY!"
+                } else {
+                    " — DEFEATED"
+                }
+            }
+            BattlePhase::Combat => "",
+        };
         let header = format!(
-            "⚔ BATTLE — Sector {} — {:.0}s",
-            state.sector, state.phase_timer
+            "⚔ BATTLE — Sector {} — {:.0}s{}",
+            state.sector, state.phase_timer, phase_label
         );
         let hx = (area.width / 2).saturating_sub(header.len() as u16 / 2);
         for (i, ch) in header.chars().enumerate() {
