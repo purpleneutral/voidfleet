@@ -17,6 +17,7 @@ use scenes::travel::TravelScene;
 use scenes::battle::BattleScene;
 use scenes::raid::RaidScene;
 use scenes::loot::LootScene;
+use scenes::upgrades::UpgradeScreen;
 use state::{GamePhase, GameState};
 
 const TICK_RATE: Duration = Duration::from_millis(50); // 20 fps
@@ -41,6 +42,9 @@ fn main() -> io::Result<()> {
     // Particle system (shared across scenes)
     let mut particles = ParticleSystem::new();
 
+    // Upgrade screen overlay
+    let mut upgrades = UpgradeScreen::new();
+
     // Enter initial scene
     let size = terminal.size()?;
     get_scene_mut(&mut travel, &mut battle, &mut raid, &mut loot, state.phase)
@@ -56,10 +60,18 @@ fn main() -> io::Result<()> {
         if event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => break,
-                        // TODO: 'u' for upgrade screen
-                        _ => {}
+                    if upgrades.open {
+                        match key.code {
+                            KeyCode::Esc => upgrades.toggle(),
+                            other => upgrades.handle_input(other, &mut state),
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Char('Q') => break,
+                            KeyCode::Esc => break,
+                            KeyCode::Char('u') | KeyCode::Char('U') => upgrades.toggle(),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -108,6 +120,11 @@ fn main() -> io::Result<()> {
                 GamePhase::Battle => battle.render(frame, &state, &particles),
                 GamePhase::Raid => raid.render(frame, &state, &particles),
                 GamePhase::Loot => loot.render(frame, &state, &particles),
+            }
+
+            // Upgrade overlay on top
+            if upgrades.open {
+                upgrades.render(frame, &state);
             }
         })?;
 
