@@ -639,11 +639,32 @@ impl Scene for RaidScene {
             return SceneAction::Continue;
         }
 
-        // ── Bob ships gently ────────────────────────────────────────────
+        // ── Ship movement: patrol + bob ────────────────────────────────
         let t = self.tick_count as f32 * 0.08;
-        for ship in &mut self.ships {
+        let w = self.width as f32;
+        for (i, ship) in self.ships.iter_mut().enumerate() {
+            // Vertical bob
             let bob = (t + ship.bob_offset).sin() * 0.5;
             ship.current_y = ship.base_y + bob;
+
+            // Horizontal patrol — each ship drifts along a sine wave
+            // with different frequency so they spread out and weave
+            let freq = 0.02 + (i as f32 * 0.007);
+            let amp = (w * 0.3).min(15.0);
+            let center = w / 2.0;
+            let patrol_x = center + (t * freq + ship.bob_offset).sin() * amp;
+            // Smoothly drift toward patrol target
+            let dx = patrol_x - ship.x;
+            ship.x += dx * 0.03;
+            // Clamp to screen bounds
+            ship.x = ship.x.clamp(3.0, w - 6.0);
+
+            // Slight y dip when moving fast horizontally (swooping feel)
+            let speed = dx.abs();
+            if speed > 2.0 {
+                ship.current_y += 0.15;
+            }
+
             if ship.flash_frames > 0 {
                 ship.flash_frames -= 1;
             }
