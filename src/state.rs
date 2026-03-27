@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 use crate::engine::ship::{Ship, ShipType};
 
+fn default_route_modifier() -> f32 {
+    1.0
+}
+
 /// Top-level game state — everything that persists between sessions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameState {
@@ -41,13 +45,52 @@ pub struct GameState {
     pub time_played_secs: u64,
     pub achievements_unlocked: Vec<String>,
 
+    // Prestige
+    #[serde(default)]
+    pub prestige_level: u32,
+    #[serde(default)]
+    pub prestige_bonus_xp: f32,
+    #[serde(default)]
+    pub prestige_bonus_credits: f32,
+    #[serde(default)]
+    pub prestige_bonus_scrap: f32,
+    #[serde(default)]
+    pub lifetime_sectors: u64,
+    #[serde(default)]
+    pub lifetime_credits: u64,
+
+    // Sector map route
+    #[serde(default = "default_route_modifier")]
+    pub current_route_modifier: f32,
+
     // Timing
     pub phase_timer: f32, // seconds remaining in current phase
+
+    // Pip companion state
+    #[serde(default = "default_pip_hunger")]
+    pub pip_hunger: u8,
+    #[serde(default = "default_pip_energy")]
+    pub pip_energy: u8,
+    #[serde(default = "default_pip_happiness")]
+    pub pip_happiness: u8,
+    #[serde(default)]
+    pub pip_bond: u16,
+    #[serde(default = "default_pip_level")]
+    pub pip_level: u8,
+    #[serde(default)]
+    pub pip_xp: u64,
+    #[serde(default)]
+    pub pip_appearance: u8,
 
     // Transient (not saved)
     #[serde(skip)]
     pub pending_popups: Vec<String>,
 }
+
+fn default_pip_hunger() -> u8 { 80 }
+fn default_pip_energy() -> u8 { 80 }
+fn default_pip_happiness() -> u8 { 70 }
+fn default_pip_level() -> u8 { 1 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GamePhase {
@@ -74,6 +117,13 @@ impl GameState {
             tech_engines: 1,
             tech_beams: 0,
             phase: GamePhase::Travel,
+            prestige_level: 0,
+            prestige_bonus_xp: 0.0,
+            prestige_bonus_credits: 0.0,
+            prestige_bonus_scrap: 0.0,
+            lifetime_sectors: 0,
+            lifetime_credits: 0,
+            current_route_modifier: 1.0,
             total_battles: 0,
             total_raids: 0,
             total_scrap: 0,
@@ -83,6 +133,13 @@ impl GameState {
             time_played_secs: 0,
             achievements_unlocked: Vec::new(),
             phase_timer: 45.0,
+            pip_hunger: 80,
+            pip_energy: 80,
+            pip_happiness: 70,
+            pip_bond: 0,
+            pip_level: 1,
+            pip_xp: 0,
+            pip_appearance: 0,
             pending_popups: Vec::new(),
         }
     }
@@ -169,6 +226,77 @@ impl GameState {
                 achievement.icon, achievement.name, achievement.description
             ));
         }
+    }
+
+    // ── Pip companion methods ──────────────────────────────────────────
+
+    pub fn pip_xp_to_next(&self) -> u64 {
+        50 * (self.pip_level as u64 + 1).pow(2)
+    }
+
+    pub fn add_pip_xp(&mut self, amount: u64) {
+        self.pip_xp += amount;
+        while self.pip_level < 10 && self.pip_xp >= self.pip_xp_to_next() {
+            self.pip_xp -= self.pip_xp_to_next();
+            self.pip_level = (self.pip_level + 1).min(10);
+        }
+    }
+
+    /// Returns damage/loot multiplier from Pip happiness + level + appearance
+    pub fn pip_combat_bonus(&self) -> f32 {
+        let happiness_bonus = if self.pip_happiness > 80 { 0.05 } else { 0.0 };
+        let level_bonus = self.pip_level as f32 * 0.01;
+        let appearance_bonus = match self.pip_appearance {
+            2 => 0.05,  // visor: +5% loot
+            4 => 0.15,  // crown: +15%
+            _ => 0.0,
+        };
+        1.0 + happiness_bonus + level_bonus + appearance_bonus
+    }
+
+    /// Returns travel speed multiplier (lower = faster)
+    pub fn pip_travel_bonus(&self) -> f32 {
+        match self.pip_appearance {
+            3 => 0.90,  // wings: 10% faster
+            4 => 0.85,  // crown: 15% faster
+            _ => 1.0,
+        }
+    }
+
+    /// Reset progression and gain permanent prestige bonuses.
+    /// Requires sector 30+ to activate.
+    pub fn prestige(&mut self) -> bool {
+        if self.sector < 30 {
+            return false;
+        }
+
+        self.prestige_level += 1;
+        self.prestige_bonus_xp = self.prestige_level as f32 * 0.10;
+        self.prestige_bonus_credits = self.prestige_level as f32 * 0.05;
+        self.prestige_bonus_scrap = self.prestige_level as f32 * 0.05;
+
+        // Track lifetime stats
+        self.lifetime_sectors += self.sector as u64;
+        self.lifetime_credits += self.credits;
+
+        // Reset progression but keep prestige bonuses
+        self.scrap = 0;
+        self.credits = 0;
+        self.blueprints = 0;
+        self.sector = 1;
+        self.level = 1;
+        self.xp = 0;
+        self.xp_to_next = 100;
+        self.fleet = vec![Ship::new(ShipType::Scout)];
+        self.tech_lasers = 1;
+        self.tech_shields = 0;
+        self.tech_engines = 1;
+        self.tech_beams = 0;
+        self.current_route_modifier = 1.0;
+        self.phase = GamePhase::Travel;
+        self.phase_timer = 45.0;
+        // Keep: achievements, deaths, highest_sector, prestige_level, totals, time_played
+        true
     }
 
     pub fn add_xp(&mut self, amount: u64) {

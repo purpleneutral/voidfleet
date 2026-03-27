@@ -1174,6 +1174,15 @@ impl Scene for TravelScene {
             }
         }
 
+        // ── Layer 1.75: Shooting stars ─────────────────────────
+        for (sx, sy, ch, color) in self.starfield.shooting_star_cells() {
+            if sx < area.width && sy < area.height {
+                let cell = &mut buf[(area.x + sx, area.y + sy)];
+                cell.set_char(ch);
+                cell.set_fg(color);
+            }
+        }
+
         // ── Layer 2: Asteroid fields ─────────────────────────
         for field in &self.asteroid_fields {
             for a in &field.asteroids {

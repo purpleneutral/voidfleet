@@ -22,6 +22,7 @@ use scenes::title::TitleScreen;
 use scenes::travel::TravelScene;
 use scenes::bridge::BridgeScene;
 use scenes::upgrades::UpgradeScreen;
+use scenes::map::MapScreen;
 use state::{GamePhase, GameState};
 
 const TICK_RATE: Duration = Duration::from_millis(50); // 20 fps
@@ -63,6 +64,7 @@ fn main() -> io::Result<()> {
     let mut upgrades = UpgradeScreen::new();
     let mut stats = StatsScreen::new();
     let mut bridge = BridgeScene::new();
+    let mut map_screen = MapScreen::new();
 
     // Achievement popup display
     let mut popup_text: Option<String> = None;
@@ -123,6 +125,8 @@ fn main() -> io::Result<()> {
                                     KeyCode::Esc => upgrades.toggle(),
                                     other => upgrades.handle_input(other, &mut state),
                                 }
+                            } else if map_screen.open {
+                                map_screen.handle_input(key.code, &mut state);
                             } else if stats.open {
                                 match key.code {
                                     KeyCode::Esc | KeyCode::Tab => stats.toggle(),
@@ -138,7 +142,29 @@ fn main() -> io::Result<()> {
                                     KeyCode::Esc => break,
                                     KeyCode::Char('u') | KeyCode::Char('U') => upgrades.toggle(),
                                     KeyCode::Tab => stats.toggle(),
-                                    KeyCode::Char('b') | KeyCode::Char('B') => bridge.toggle(),
+                                    KeyCode::Char('b') | KeyCode::Char('B') => bridge.toggle(&mut state),
+                                    KeyCode::Char('m') | KeyCode::Char('M') => map_screen.toggle(&state),
+                                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                                        if state.prestige() {
+                                            // Prestige resets state, re-enter travel scene
+                                            let size = terminal.size()?;
+                                            particles.particles.clear();
+                                            get_scene_mut(
+                                                &mut travel, &mut battle, &mut raid, &mut loot,
+                                                state.phase,
+                                            )
+                                            .enter(&state, size.width, size.height);
+                                            popup_text = Some(format!(
+                                                "★ PRESTIGE {} ★ — XP +{}% Credits +{}% Scrap +{}%",
+                                                state.prestige_level,
+                                                (state.prestige_bonus_xp * 100.0) as u32,
+                                                (state.prestige_bonus_credits * 100.0) as u32,
+                                                (state.prestige_bonus_scrap * 100.0) as u32,
+                                            ));
+                                            popup_timer = 80;
+                                            state.save();
+                                        }
+                                    }
                                     KeyCode::Char(' ') => {
                                         state.phase_timer = 0.1;
                                     }
@@ -181,7 +207,7 @@ fn main() -> io::Result<()> {
 
                     // Notify Pip of transitions
                     if state.phase == GamePhase::Battle && next_phase == GamePhase::Loot {
-                        bridge.notify_battle_win();
+                        bridge.notify_battle_win(&mut state);
                     }
                     if next_phase == GamePhase::Loot {
                         bridge.notify_loot();
@@ -203,7 +229,7 @@ fn main() -> io::Result<()> {
                 }
 
                 // Tick Pip (always, even when bridge isn't open)
-                bridge.tick();
+                bridge.tick(&mut state);
 
                 // Check achievements
                 let new_achievements = check_achievements(&state);
@@ -211,7 +237,7 @@ fn main() -> io::Result<()> {
                     state.achievements_unlocked.push(ach.id.to_string());
                     popup_text = Some(format!("{} Achievement: {} — {}", ach.icon, ach.name, ach.description));
                     popup_timer = 60; // 3 seconds at 20fps
-                    bridge.notify_achievement();
+                    bridge.notify_achievement(&mut state);
                 }
 
                 // Render
@@ -250,6 +276,9 @@ fn main() -> io::Result<()> {
                     // Overlays
                     if bridge.open {
                         bridge.render(frame, &state);
+                    }
+                    if map_screen.open {
+                        map_screen.render(frame, &state);
                     }
                     if upgrades.open {
                         upgrades.render(frame, &state);
@@ -309,7 +338,7 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase) {
         GamePhase::Loot => Color::Yellow,
     };
     let hud = format!(
-        " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [B]ridge [Tab]Stats [Space]Skip [Q]uit ",
+        " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [B]ridge [M]ap [Tab]Stats [Space]Skip [Q]uit ",
         phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
     );
     for (i, ch) in hud.chars().enumerate() {

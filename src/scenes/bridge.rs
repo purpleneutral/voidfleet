@@ -93,18 +93,14 @@ const BRIDGE_OBJECTS: &[BridgeObject] = &[
 
 pub struct BridgeScene {
     pub open: bool,
+    pub gift_shop_open: bool,
+    gift_shop_cursor: u8,
 
-    // Pip state
+    // Pip state (animation only — stats live in GameState)
     pip_x: f32,
     pip_target_x: f32,
     pip_mood: Mood,
     pip_mood_timer: u16,
-
-    // Tamagotchi stats (0-100)
-    hunger: u8,
-    energy: u8,
-    happiness: u8,
-    bond: u16, // 0-1000, long-term relationship
 
     // Animation
     tick_count: u64,
@@ -129,14 +125,12 @@ impl BridgeScene {
     pub fn new() -> Self {
         Self {
             open: false,
+            gift_shop_open: false,
+            gift_shop_cursor: 0,
             pip_x: 20.0,
             pip_target_x: 20.0,
             pip_mood: Mood::Idle,
             pip_mood_timer: 0,
-            hunger: 80,
-            energy: 80,
-            happiness: 70,
-            bond: 0,
             tick_count: 0,
             blink_timer: 0,
             bounce_frame: 0,
@@ -146,16 +140,16 @@ impl BridgeScene {
             speech_timer: 0,
             width: 60,
             height: 20,
-        idle_ticks: 0,
+            idle_ticks: 0,
         }
     }
 
-    pub fn toggle(&mut self) {
+    pub fn toggle(&mut self, state: &mut GameState) {
         self.open = !self.open;
+        self.gift_shop_open = false;
         if self.open {
             // Pip reacts to being visited
             if self.idle_ticks > 2000 {
-                // Haven't visited in a while
                 self.pip_mood = Mood::Lonely;
                 self.pip_mood_timer = 40;
                 self.say("...you came back!");
@@ -165,7 +159,7 @@ impl BridgeScene {
                 self.say("Hi!");
             }
             self.idle_ticks = 0;
-            self.bond = self.bond.saturating_add(1).min(1000);
+            state.pip_bond = state.pip_bond.saturating_add(1).min(1000);
         }
     }
 
@@ -175,14 +169,15 @@ impl BridgeScene {
     }
 
     /// Notify Pip of game events (called from main loop)
-    pub fn notify_battle_win(&mut self) {
-        self.happiness = self.happiness.saturating_add(10).min(100);
+    pub fn notify_battle_win(&mut self, state: &mut GameState) {
+        state.pip_happiness = state.pip_happiness.saturating_add(10).min(100);
+        state.add_pip_xp(10);
         self.pip_mood = Mood::Excited;
         self.pip_mood_timer = 40;
     }
 
-    pub fn notify_battle_loss(&mut self) {
-        self.happiness = self.happiness.saturating_sub(15);
+    pub fn notify_battle_loss(&mut self, state: &mut GameState) {
+        state.pip_happiness = state.pip_happiness.saturating_sub(15);
         self.pip_mood = Mood::Sad;
         self.pip_mood_timer = 60;
     }
@@ -194,24 +189,46 @@ impl BridgeScene {
         }
     }
 
-    pub fn notify_achievement(&mut self) {
+    pub fn notify_achievement(&mut self, state: &mut GameState) {
+        state.add_pip_xp(20);
         self.pip_mood = Mood::Dancing;
         self.pip_mood_timer = 60;
     }
 
     pub fn handle_input(&mut self, key: KeyCode, state: &mut GameState) {
+        // Gift shop sub-menu
+        if self.gift_shop_open {
+            match key {
+                KeyCode::Up => {
+                    self.gift_shop_cursor = self.gift_shop_cursor.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.gift_shop_cursor = (self.gift_shop_cursor + 1).min(3);
+                }
+                KeyCode::Enter => {
+                    self.try_buy_gift(state);
+                }
+                KeyCode::Esc | KeyCode::Char('g') | KeyCode::Char('G') => {
+                    self.gift_shop_open = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key {
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 // Feed Pip — costs 10 scrap
-                if state.scrap >= 10 && self.hunger < 90 {
+                if state.scrap >= 10 && state.pip_hunger < 90 {
                     state.scrap -= 10;
-                    self.hunger = self.hunger.saturating_add(25).min(100);
-                    self.happiness = self.happiness.saturating_add(5).min(100);
+                    state.pip_hunger = state.pip_hunger.saturating_add(25).min(100);
+                    state.pip_happiness = state.pip_happiness.saturating_add(5).min(100);
+                    state.pip_bond = state.pip_bond.saturating_add(2).min(1000);
+                    state.add_pip_xp(5);
                     self.pip_mood = Mood::Eating;
                     self.pip_mood_timer = 30;
                     self.say("Yum!");
-                    self.bond = self.bond.saturating_add(2).min(1000);
-                } else if self.hunger >= 90 {
+                } else if state.pip_hunger >= 90 {
                     self.say("I'm full!");
                 } else {
                     self.say("No scrap...");
@@ -221,26 +238,61 @@ impl BridgeScene {
             }
             KeyCode::Char('p') | KeyCode::Char('P') => {
                 // Pet/play with Pip
-                self.happiness = self.happiness.saturating_add(10).min(100);
+                state.pip_happiness = state.pip_happiness.saturating_add(10).min(100);
+                state.pip_bond = state.pip_bond.saturating_add(3).min(1000);
+                state.add_pip_xp(3);
                 self.pip_mood = Mood::Happy;
                 self.pip_mood_timer = 40;
-                self.bond = self.bond.saturating_add(3).min(1000);
                 let reactions = ["Hehe!", ":D", "Wheee!", "♥", "Yay!"];
                 let idx = (self.tick_count as usize) % reactions.len();
                 self.say(reactions[idx]);
             }
-            KeyCode::Esc => self.toggle(),
+            KeyCode::Char('g') | KeyCode::Char('G') => {
+                self.gift_shop_open = true;
+                self.gift_shop_cursor = 0;
+            }
+            KeyCode::Esc => self.toggle(state),
             _ => {}
         }
     }
 
-    pub fn tick(&mut self) {
+    fn try_buy_gift(&mut self, state: &mut GameState) {
+        let (required_level, cost, appearance, name): (u8, u64, u8, &str) =
+            match self.gift_shop_cursor {
+                0 => (3, 200, 1, "Antenna"),
+                1 => (5, 500, 2, "Visor"),
+                2 => (7, 1000, 3, "Wings"),
+                3 => (9, 2500, 4, "Crown"),
+                _ => return,
+            };
+
+        if state.pip_appearance >= appearance {
+            self.say("Already have that!");
+            return;
+        }
+        if state.pip_level < required_level {
+            self.say(&format!("Need Lv.{}!", required_level));
+            return;
+        }
+        if state.credits < cost {
+            self.say("Not enough ₿!");
+            return;
+        }
+
+        state.credits -= cost;
+        state.pip_appearance = appearance;
+        self.pip_mood = Mood::Excited;
+        self.pip_mood_timer = 60;
+        self.say(&format!("{} equipped!", name));
+    }
+
+    pub fn tick(&mut self, state: &mut GameState) {
         if !self.open {
             self.idle_ticks += 1;
             // Pip's needs still decay even when not viewing
             if self.tick_count % 200 == 0 {
-                self.hunger = self.hunger.saturating_sub(1);
-                self.energy = self.energy.saturating_sub(1);
+                state.pip_hunger = state.pip_hunger.saturating_sub(1);
+                state.pip_energy = state.pip_energy.saturating_sub(1);
             }
             self.tick_count += 1;
             return;
@@ -248,18 +300,23 @@ impl BridgeScene {
 
         self.tick_count += 1;
 
+        // Passive XP: 1 XP per 100 ticks when happy
+        if self.tick_count % 100 == 0 && state.pip_happiness > 50 {
+            state.add_pip_xp(1);
+        }
+
         // Stat decay
         if self.tick_count % 100 == 0 {
-            self.hunger = self.hunger.saturating_sub(1);
+            state.pip_hunger = state.pip_hunger.saturating_sub(1);
         }
         if self.tick_count % 150 == 0 {
-            self.energy = self.energy.saturating_sub(1);
+            state.pip_energy = state.pip_energy.saturating_sub(1);
         }
 
         // Energy recovery when sleeping
         if self.pip_mood == Mood::Sleeping {
             if self.tick_count % 20 == 0 {
-                self.energy = self.energy.saturating_add(2).min(100);
+                state.pip_energy = state.pip_energy.saturating_add(2).min(100);
             }
         }
 
@@ -267,12 +324,11 @@ impl BridgeScene {
         if self.pip_mood_timer > 0 {
             self.pip_mood_timer -= 1;
         } else {
-            // Determine mood from stats
-            self.pip_mood = if self.energy < 20 {
+            self.pip_mood = if state.pip_energy < 20 {
                 Mood::Sleeping
-            } else if self.hunger < 20 {
+            } else if state.pip_hunger < 20 {
                 Mood::Sad
-            } else if self.happiness > 80 {
+            } else if state.pip_happiness > 80 {
                 Mood::Happy
             } else {
                 Mood::Idle
@@ -317,6 +373,37 @@ impl BridgeScene {
             self.speech_timer -= 1;
             if self.speech_timer == 0 {
                 self.speech = None;
+            }
+        }
+    }
+
+    /// Get Pip's face based on level evolution and current mood
+    fn evolved_face(&self, state: &GameState, blink: bool) -> String {
+        if blink {
+            return match state.pip_level {
+                1..=2 => "(- -)".into(),
+                3..=4 => "(- -)^".into(),
+                5..=6 => "[- -]".into(),
+                7..=8 => "{- -}~".into(),
+                _ => "{- -}♛".into(),
+            };
+        }
+        let base = self.pip_mood.face(false);
+        match state.pip_level {
+            1..=2 => base.into(),
+            3..=4 => format!("{}^", base),
+            5..=6 => {
+                // Replace parens with square brackets
+                let inner = base.trim_start_matches('(').trim_end_matches(')');
+                format!("[{}]", inner)
+            }
+            7..=8 => {
+                let inner = base.trim_start_matches('(').trim_end_matches(')');
+                format!("{{{}}}~", inner)
+            }
+            _ => {
+                let inner = base.trim_start_matches('(').trim_end_matches(')');
+                format!("{{{}}}♛", inner)
             }
         }
     }
@@ -422,7 +509,7 @@ impl BridgeScene {
         // Feeding bowl
         let bowl_x = bx + 8;
         let bowl_y = floor_y - 1;
-        let bowl = if self.hunger < 50 { "◇·" } else { "◇◇" };
+        let bowl = if _state.pip_hunger < 50 { "◇·" } else { "◇◇" };
         for (i, ch) in bowl.chars().enumerate() {
             let x = bowl_x + i as u16;
             if x < bx + bw - 1 && bowl_y < area.height && bowl_y > by {
@@ -436,7 +523,7 @@ impl BridgeScene {
         let py = floor_y - 1 - self.bounce_frame as u16;
 
         let is_blinking = self.blink_timer > 0;
-        let face = self.pip_mood.face(is_blinking);
+        let face = self.evolved_face(_state, is_blinking);
         let deco = self.pip_mood.decoration();
         let color = self.pip_mood.color();
 
@@ -498,14 +585,26 @@ impl BridgeScene {
             }
         }
 
+        // Pip level indicator
+        let level_str = format!("Lv.{} ({}/{}XP)", _state.pip_level, _state.pip_xp, _state.pip_xp_to_next());
+        let level_x = bx + bw - 2 - level_str.len() as u16;
+        let level_y = by + 1;
+        for (i, ch) in level_str.chars().enumerate() {
+            let x = level_x + i as u16;
+            if x < bx + bw - 1 && level_y < area.height {
+                buf[(x, level_y)].set_char(ch);
+                buf[(x, level_y)].set_fg(Color::Magenta);
+            }
+        }
+
         // Stat bars at bottom
         let stat_y = by + bh - 2;
         let stats_str = format!(
-            " Mood: {}  │  Hunger: {}  │  Energy: {}  │  Bond: {}  │  [F]eed [P]et [Esc]Close ",
+            " {}  │  Hunger: {}  │  Energy: {}  │  Bond: {}  │  [F]eed [P]et [G]ifts [Esc] ",
             self.mood_label(),
-            Self::bar(self.hunger),
-            Self::bar(self.energy),
-            self.bond_label(),
+            Self::bar(_state.pip_hunger),
+            Self::bar(_state.pip_energy),
+            Self::bond_label(_state.pip_bond),
         );
         for (i, ch) in stats_str.chars().enumerate() {
             let x = bx + 1 + i as u16;
@@ -514,6 +613,11 @@ impl BridgeScene {
                 buf[(x, stat_y)].set_fg(Color::DarkGray);
                 buf[(x, stat_y)].set_bg(Color::Rgb(20, 20, 30));
             }
+        }
+
+        // Gift shop overlay
+        if self.gift_shop_open {
+            self.render_gift_shop(frame, _state, bx, by, bw, bh);
         }
     }
 
@@ -530,8 +634,8 @@ impl BridgeScene {
         }
     }
 
-    fn bond_label(&self) -> &'static str {
-        match self.bond {
+    fn bond_label(bond: u16) -> &'static str {
+        match bond {
             0..=50 => "Stranger",
             51..=150 => "Acquaintance",
             151..=350 => "Friend",
@@ -552,5 +656,117 @@ impl BridgeScene {
             "░"
         };
         format!("{}{}", color.repeat(filled), "·".repeat(empty))
+    }
+
+    fn render_gift_shop(&self, frame: &mut Frame, state: &GameState, bx: u16, by: u16, bw: u16, bh: u16) {
+        let buf = frame.buffer_mut();
+        let area = ratatui::layout::Rect::new(0, 0, buf.area.width, buf.area.height);
+
+        // Gift shop panel (centered overlay)
+        let sw: u16 = 30;
+        let sh: u16 = 14;
+        let sx = bx + (bw.saturating_sub(sw)) / 2;
+        let sy = by + (bh.saturating_sub(sh)) / 2;
+
+        // Clear shop area
+        for y in sy..sy + sh {
+            for x in sx..sx + sw {
+                if x < area.width && y < area.height {
+                    let cell = &mut buf[(x, y)];
+                    cell.set_char(' ');
+                    cell.set_bg(Color::Rgb(10, 10, 20));
+                    cell.set_fg(Color::White);
+                }
+            }
+        }
+
+        // Border
+        let border_fg = Color::Rgb(120, 80, 200);
+        for x in sx..sx + sw {
+            if sy < area.height { buf[(x, sy)].set_char('═'); buf[(x, sy)].set_fg(border_fg); }
+            if sy + sh - 1 < area.height { buf[(x, sy + sh - 1)].set_char('═'); buf[(x, sy + sh - 1)].set_fg(border_fg); }
+        }
+        for y in sy..sy + sh {
+            if sx < area.width { buf[(sx, y)].set_char('║'); buf[(sx, y)].set_fg(border_fg); }
+            if sx + sw - 1 < area.width { buf[(sx + sw - 1, y)].set_char('║'); buf[(sx + sw - 1, y)].set_fg(border_fg); }
+        }
+        if sx < area.width && sy < area.height { buf[(sx, sy)].set_char('╔'); buf[(sx, sy)].set_fg(border_fg); }
+        if sx + sw - 1 < area.width && sy < area.height { buf[(sx + sw - 1, sy)].set_char('╗'); buf[(sx + sw - 1, sy)].set_fg(border_fg); }
+        if sx < area.width && sy + sh - 1 < area.height { buf[(sx, sy + sh - 1)].set_char('╚'); buf[(sx, sy + sh - 1)].set_fg(border_fg); }
+        if sx + sw - 1 < area.width && sy + sh - 1 < area.height { buf[(sx + sw - 1, sy + sh - 1)].set_char('╝'); buf[(sx + sw - 1, sy + sh - 1)].set_fg(border_fg); }
+
+        // Title
+        let title = "═══ PIP GIFTS ═══";
+        let tx = sx + (sw - title.len() as u16) / 2;
+        for (i, ch) in title.chars().enumerate() {
+            let x = tx + i as u16;
+            if x < area.width && sy < area.height {
+                buf[(x, sy)].set_char(ch);
+                buf[(x, sy)].set_fg(Color::Magenta);
+            }
+        }
+
+        // Gift items
+        struct GiftItem {
+            name: &'static str,
+            level: u8,
+            cost: u64,
+            bonus: &'static str,
+            appearance: u8,
+        }
+        let gifts = [
+            GiftItem { name: "Antenna", level: 3, cost: 200, bonus: "Ambush warnings", appearance: 1 },
+            GiftItem { name: "Visor", level: 5, cost: 500, bonus: "+5% battle loot", appearance: 2 },
+            GiftItem { name: "Wings", level: 7, cost: 1000, bonus: "+10% travel speed", appearance: 3 },
+            GiftItem { name: "Crown", level: 9, cost: 2500, bonus: "+15% all bonuses", appearance: 4 },
+        ];
+
+        for (i, gift) in gifts.iter().enumerate() {
+            let row_y = sy + 2 + (i as u16 * 3);
+            let selected = i as u8 == self.gift_shop_cursor;
+            let owned = state.pip_appearance >= gift.appearance;
+            let can_buy = state.pip_level >= gift.level && state.credits >= gift.cost && !owned;
+
+            let prefix = if selected { "▸ " } else { "  " };
+            let status = if owned {
+                " ✓".to_string()
+            } else if state.pip_level < gift.level {
+                format!(" (Lv.{})", gift.level)
+            } else {
+                String::new()
+            };
+            let line1 = format!("{}{}{}", prefix, gift.name, status);
+            let line2 = format!("{}  {}₿ — {}", prefix, gift.cost, gift.bonus);
+
+            let fg1 = if owned {
+                Color::DarkGray
+            } else if selected {
+                Color::White
+            } else {
+                Color::Gray
+            };
+            let fg2 = if can_buy && selected {
+                Color::Green
+            } else {
+                Color::Rgb(80, 80, 100)
+            };
+
+            for (ci, ch) in line1.chars().enumerate() {
+                let x = sx + 2 + ci as u16;
+                if x < sx + sw - 1 && row_y < area.height {
+                    buf[(x, row_y)].set_char(ch);
+                    buf[(x, row_y)].set_fg(fg1);
+                }
+            }
+            if row_y + 1 < area.height {
+                for (ci, ch) in line2.chars().enumerate() {
+                    let x = sx + 2 + ci as u16;
+                    if x < sx + sw - 1 && row_y + 1 < area.height {
+                        buf[(x, row_y + 1)].set_char(ch);
+                        buf[(x, row_y + 1)].set_fg(fg2);
+                    }
+                }
+            }
+        }
     }
 }

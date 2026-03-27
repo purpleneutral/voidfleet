@@ -6,6 +6,7 @@ pub mod loot;
 pub mod upgrades;
 pub mod bridge;
 pub mod stats;
+pub mod map;
 
 use ratatui::Frame;
 use crate::rendering::particles::ParticleSystem;

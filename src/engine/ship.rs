@@ -1,5 +1,33 @@
 use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// Ship special abilities
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShipAbility {
+    Scan,           // passive: all enemies show HP
+    HeavyPayload,   // active: big AOE explosion
+    Shield,         // active: 50% damage reduction for 5 seconds
+    Broadside,      // active: burst of 5 projectiles
+    BeamWeapon,     // active: charge 3 seconds, then devastating line damage
+    LaunchFighters, // active: spawn temporary fighter allies
+}
+
+impl ShipAbility {
+    /// Cooldown in ticks before the ability fires.
+    pub fn cooldown_ticks(&self) -> u32 {
+        match self {
+            Self::Scan => 0,           // passive, no cooldown
+            Self::HeavyPayload => 200,
+            Self::Shield => 300,
+            Self::Broadside => 150,
+            Self::BeamWeapon => 400,
+            Self::LaunchFighters => 350,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShipType {
     Scout,
@@ -69,6 +97,18 @@ impl ShipType {
             Self::Destroyer => 18,
             Self::Capital => 30,
             Self::Carrier => 25,
+        }
+    }
+
+    pub fn ability(&self) -> Option<ShipAbility> {
+        match self {
+            Self::Scout => Some(ShipAbility::Scan),           // reveals enemy HP bars
+            Self::Fighter => None,                             // fast fire is its ability
+            Self::Bomber => Some(ShipAbility::HeavyPayload),   // AOE damage blast
+            Self::Frigate => Some(ShipAbility::Shield),        // temporary damage reduction
+            Self::Destroyer => Some(ShipAbility::Broadside),   // fires 5 projectiles at once
+            Self::Capital => Some(ShipAbility::BeamWeapon),    // charge-up devastating beam
+            Self::Carrier => Some(ShipAbility::LaunchFighters), // spawn 2 temp fighter allies
         }
     }
 

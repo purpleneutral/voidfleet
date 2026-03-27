@@ -2,7 +2,7 @@ use rand::Rng;
 use ratatui::style::Color;
 use ratatui::Frame;
 
-use crate::engine::ship::{Ship, ShipType};
+use crate::engine::ship::{Ship, ShipAbility, ShipType};
 use crate::rendering::particles::{Particle, ParticleSystem};
 use crate::state::{GamePhase, GameState};
 
@@ -198,12 +198,16 @@ fn fire_rate_ticks(speed: f32, sector: u32) -> u32 {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProjectileKind {
-    ScoutLaser, // Scout/Fighter: ─→ cyan, fast, low damage
-    FrigateLaser, // Frigate: ──→ cyan, medium
-    CapitalBeam,  // Capital: ━━━━► bright cyan, slow, massive, leaves trail
+    ScoutLaser,    // Scout/Fighter: ─→ cyan, fast, low damage
+    FrigateLaser,  // Frigate: ──→ cyan, medium
+    CapitalBeam,   // Capital: ━━━━► bright cyan, slow, massive, leaves trail
     BomberMissile, // Bomber: ══► yellow, slow, high damage, slight homing
-    EnemyLaser,   // Enemy standard: ◄── red
-    EnemyHeavy,   // Enemy big: ◄══ magenta
+    EnemyLaser,    // Enemy standard: ◄── red
+    EnemyHeavy,    // Enemy big: ◄══ magenta
+    // -- Ability projectiles --
+    HeavyPayload,    // Bomber ability: ◉ slow, big AOE on hit
+    BroadsideShot,   // Destroyer ability: spread projectile
+    TempFighterShot, // Temp fighter laser
 }
 
 struct Projectile {
@@ -227,6 +231,9 @@ impl Projectile {
             ProjectileKind::BomberMissile => &['►', '═', '═'],
             ProjectileKind::EnemyLaser => &['◄', '─', '─'],
             ProjectileKind::EnemyHeavy => &['◄', '═', '═', '─'],
+            ProjectileKind::HeavyPayload => &['◉', '○', '·'],
+            ProjectileKind::BroadsideShot => &['»', '─'],
+            ProjectileKind::TempFighterShot => &['→', '·'],
         }
     }
 
@@ -238,6 +245,9 @@ impl Projectile {
             ProjectileKind::BomberMissile => Color::Yellow,
             ProjectileKind::EnemyLaser => Color::Red,
             ProjectileKind::EnemyHeavy => Color::Magenta,
+            ProjectileKind::HeavyPayload => Color::Rgb(255, 200, 50),
+            ProjectileKind::BroadsideShot => Color::Rgb(180, 220, 255),
+            ProjectileKind::TempFighterShot => Color::Rgb(100, 255, 180),
         }
     }
 
@@ -249,6 +259,9 @@ impl Projectile {
             ProjectileKind::BomberMissile => Color::Rgb(180, 140, 0),
             ProjectileKind::EnemyLaser => Color::Rgb(180, 60, 60),
             ProjectileKind::EnemyHeavy => Color::Rgb(140, 50, 100),
+            ProjectileKind::HeavyPayload => Color::Rgb(200, 140, 30),
+            ProjectileKind::BroadsideShot => Color::Rgb(120, 160, 200),
+            ProjectileKind::TempFighterShot => Color::Rgb(60, 180, 120),
         }
     }
 }
@@ -282,6 +295,50 @@ struct PlayerShipState {
     death_exploded: bool,
     /// Tactical y offset for formation behavior
     formation_offset: f32,
+    /// Ability cooldown counter — fires when it reaches the trigger threshold.
+    ability_cooldown: u32,
+    /// Shield active timer (ticks remaining, 0 = inactive). Halves incoming damage.
+    shield_timer: u32,
+    /// Beam weapon charge counter (0 = not charging). Counts up to 60, then fires.
+    beam_charge: u32,
+    /// Beam weapon active timer (ticks remaining, 0 = inactive). Renders beam across screen.
+    beam_active: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Temporary fighter spawned by Carrier's LaunchFighters ability
+// ---------------------------------------------------------------------------
+
+struct TempFighter {
+    x: f32,
+    y: f32,
+    hp: u32,
+    damage: u32,
+    fire_cooldown: u32,
+    lifetime: u32, // ticks remaining
+    target_idx: i32,
+}
+
+impl TempFighter {
+    fn is_alive(&self) -> bool {
+        self.hp > 0 && self.lifetime > 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Active beam weapon visual state (for rendering)
+// ---------------------------------------------------------------------------
+
+struct ActiveBeam {
+    /// Player ship index that owns this beam
+    #[allow(dead_code)]
+    ship_idx: usize,
+    /// Y position of the beam
+    y: f32,
+    /// Starting x position (muzzle)
+    start_x: f32,
+    /// Ticks remaining
+    ticks_left: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +364,12 @@ pub struct BattleScene {
     focus_fire_target: i32,
     /// Ticks until focus fire is re-evaluated.
     focus_fire_cooldown: u32,
+    /// Temporary fighters spawned by Carrier ability.
+    temp_fighters: Vec<TempFighter>,
+    /// Active beam weapons being rendered.
+    active_beams: Vec<ActiveBeam>,
+    /// Whether any player ship has Scan ability (show all enemy HP).
+    has_scan: bool,
 }
 
 impl BattleScene {
@@ -324,6 +387,9 @@ impl BattleScene {
             slide_progress: 0.0,
             focus_fire_target: -1,
             focus_fire_cooldown: 0,
+            temp_fighters: Vec::new(),
+            active_beams: Vec::new(),
+            has_scan: false,
         }
     }
 
@@ -1062,6 +1128,11 @@ impl Scene for BattleScene {
         self.slide_progress = 0.0;
         self.focus_fire_target = -1;
         self.focus_fire_cooldown = 0;
+        self.temp_fighters.clear();
+        self.active_beams.clear();
+        self.has_scan = state.fleet.iter().any(|s| {
+            s.is_alive() && s.ship_type.ability() == Some(ShipAbility::Scan)
+        });
 
         // Generate enemy fleet based on sector
         let mut rng = rand::thread_rng();
@@ -1078,6 +1149,11 @@ impl Scene for BattleScene {
             .iter()
             .map(|s| {
                 let rate = fire_rate_ticks(s.speed(), state.sector);
+                // Stagger ability cooldowns so they don't all fire at once
+                let ability_start = match s.ship_type.ability() {
+                    Some(a) => rng.gen_range(0..a.cooldown_ticks().max(1)),
+                    None => 0,
+                };
                 PlayerShipState {
                     fire_cooldown: rng.gen_range(0..rate),
                     flash: 0,
@@ -1085,6 +1161,10 @@ impl Scene for BattleScene {
                     death_frame: 0,
                     death_exploded: false,
                     formation_offset: 0.0,
+                    ability_cooldown: ability_start,
+                    shield_timer: 0,
+                    beam_charge: 0,
+                    beam_active: 0,
                 }
             })
             .collect();
@@ -1245,6 +1325,259 @@ impl Scene for BattleScene {
 
         // ── Player fleet formation AI ──────────────────────────────────
         Self::update_player_formation(&state.fleet, &self.enemies, &mut self.player_states);
+
+        // ── Ship special abilities ─────────────────────────────────────
+        {
+            let positions = self.player_positions(&state.fleet);
+            let mut new_projectiles: Vec<Projectile> = Vec::new();
+            let mut new_temp_fighters: Vec<TempFighter> = Vec::new();
+
+            for (i, ship) in state.fleet.iter().enumerate() {
+                if !ship.is_alive() || i >= self.player_states.len() || i >= positions.len() {
+                    continue;
+                }
+                let ability = match ship.ship_type.ability() {
+                    Some(a) => a,
+                    None => continue,
+                };
+                // Scan is passive — no cooldown logic needed
+                if ability == ShipAbility::Scan {
+                    continue;
+                }
+
+                let ps = &mut self.player_states[i];
+                let (px, py) = positions[i];
+                let sprite_w = ship.ship_type.sprite()[0].chars().count() as f32;
+                let muzzle_x = px + sprite_w + 1.0;
+
+                // BeamWeapon has a charge phase before firing
+                if ability == ShipAbility::BeamWeapon {
+                    if ps.beam_active > 0 {
+                        // Beam is currently firing — damage enemies along the line
+                        ps.beam_active -= 1;
+                        // Damage all enemies at roughly the same y
+                        for enemy in self.enemies.iter_mut() {
+                            if !enemy.is_alive() {
+                                continue;
+                            }
+                            let ey = enemy.y;
+                            if (ey - py).abs() < 1.5 && enemy.x > px {
+                                let beam_dmg = (ship.damage() / 3).max(1);
+                                let actual = beam_dmg.min(enemy.hp);
+                                enemy.hp -= actual;
+                                if !enemy.is_alive() {
+                                    enemy.death_frame = 1;
+                                    if !enemy.is_big() {
+                                        let cx = enemy.x + enemy.sprite[0].chars().count() as f32 / 2.0;
+                                        Self::chain_explosion(particles, cx, ey, false);
+                                        enemy.death_exploded = true;
+                                    }
+                                    state.enemies_destroyed += 1;
+                                }
+                            }
+                        }
+                        if ps.beam_active == 0 {
+                            ps.ability_cooldown = 0; // reset to count back up
+                        }
+                        continue;
+                    }
+
+                    if ps.beam_charge > 0 {
+                        ps.beam_charge += 1;
+                        if ps.beam_charge >= 60 {
+                            // Fire the beam!
+                            ps.beam_charge = 0;
+                            ps.beam_active = 10;
+                            self.active_beams.push(ActiveBeam {
+                                ship_idx: i,
+                                y: py,
+                                start_x: muzzle_x,
+                                ticks_left: 10,
+                            });
+                            // Big flash at muzzle
+                            particles.explode(muzzle_x, py, 12, Color::White);
+                        }
+                        continue;
+                    }
+
+                    // Count up toward ability trigger
+                    ps.ability_cooldown += 1;
+                    if ps.ability_cooldown >= ability.cooldown_ticks() {
+                        // Start charging
+                        ps.beam_charge = 1;
+                        ps.ability_cooldown = 0;
+                    }
+                    continue;
+                }
+
+                // All other active abilities: count up cooldown
+                ps.ability_cooldown += 1;
+                if ps.ability_cooldown < ability.cooldown_ticks() {
+                    continue;
+                }
+                // Ability fires! Reset cooldown.
+                ps.ability_cooldown = 0;
+
+                match ability {
+                    ShipAbility::HeavyPayload => {
+                        // Fire a slow, large AOE projectile
+                        new_projectiles.push(Projectile {
+                            x: muzzle_x,
+                            y: py,
+                            vx: 0.5,
+                            vy: 0.0,
+                            damage: ship.damage() * 2,
+                            friendly: true,
+                            kind: ProjectileKind::HeavyPayload,
+                            homing_target_y: -1.0,
+                        });
+                        Self::emit_muzzle_flash(particles, muzzle_x, py, true);
+                        // Extra muzzle particles for drama
+                        particles.explode(muzzle_x, py, 6, Color::Rgb(255, 200, 50));
+                    }
+                    ShipAbility::Shield => {
+                        // Activate shield: 50% damage reduction for 100 ticks
+                        ps.shield_timer = 100;
+                        // Shield activation flash
+                        particles.explode(px + sprite_w / 2.0, py, 8, Color::Rgb(80, 180, 255));
+                    }
+                    ShipAbility::Broadside => {
+                        // Fire 5 projectiles in a vertical spread
+                        let offsets: [f32; 5] = [-2.0, -1.0, 0.0, 1.0, 2.0];
+                        for &y_off in &offsets {
+                            new_projectiles.push(Projectile {
+                                x: muzzle_x,
+                                y: py + y_off,
+                                vx: 1.5,
+                                vy: y_off * 0.05, // slight spread
+                                damage: ship.damage(),
+                                friendly: true,
+                                kind: ProjectileKind::BroadsideShot,
+                                homing_target_y: -1.0,
+                            });
+                        }
+                        // Big muzzle flash
+                        Self::emit_muzzle_flash(particles, muzzle_x, py, true);
+                        particles.explode(muzzle_x, py, 10, Color::Rgb(180, 220, 255));
+                    }
+                    ShipAbility::LaunchFighters => {
+                        // Spawn 2 temporary fighter allies
+                        for offset in [-2.0_f32, 2.0] {
+                            new_temp_fighters.push(TempFighter {
+                                x: px + sprite_w / 2.0,
+                                y: py + offset,
+                                hp: 15,
+                                damage: 6,
+                                fire_cooldown: 5,
+                                lifetime: 200,
+                                target_idx: -1,
+                            });
+                        }
+                        // Launch particles
+                        particles.explode(px + sprite_w, py, 8, Color::Rgb(100, 255, 180));
+                    }
+                    // Scan and BeamWeapon handled above
+                    _ => {}
+                }
+            }
+
+            self.projectiles.extend(new_projectiles);
+            self.temp_fighters.extend(new_temp_fighters);
+        }
+
+        // ── Update shield timers ───────────────────────────────────────
+        for ps in self.player_states.iter_mut() {
+            if ps.shield_timer > 0 {
+                ps.shield_timer -= 1;
+            }
+        }
+
+        // ── Update active beams ────────────────────────────────────────
+        self.active_beams.retain_mut(|beam| {
+            if beam.ticks_left == 0 {
+                return false;
+            }
+            beam.ticks_left -= 1;
+            true
+        });
+
+        // ── Temp fighter AI: move, target, fire ────────────────────────
+        {
+            let mut temp_projectiles: Vec<Projectile> = Vec::new();
+            for tf in self.temp_fighters.iter_mut() {
+                if !tf.is_alive() {
+                    continue;
+                }
+                tf.lifetime -= 1;
+
+                // Pick target (nearest alive enemy)
+                if tf.target_idx < 0 || self.tick_count % 30 == 0 {
+                    let mut best = -1i32;
+                    let mut best_dist = f32::INFINITY;
+                    for (ei, enemy) in self.enemies.iter().enumerate() {
+                        if !enemy.is_alive() {
+                            continue;
+                        }
+                        let dx = enemy.x - tf.x;
+                        let dy = enemy.y - tf.y;
+                        let dist = dx * dx + dy * dy;
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best = ei as i32;
+                        }
+                    }
+                    tf.target_idx = best;
+                }
+
+                // Move toward target
+                if tf.target_idx >= 0 {
+                    let tidx = tf.target_idx as usize;
+                    if tidx < self.enemies.len() && self.enemies[tidx].is_alive() {
+                        let target = &self.enemies[tidx];
+                        let dx = target.x - tf.x;
+                        let dy = target.y - tf.y;
+                        let dist = (dx * dx + dy * dy).sqrt().max(0.01);
+                        // Move at fighter speed but stay behind enemy
+                        let desired_x = target.x - 10.0;
+                        let move_dx = (desired_x - tf.x).clamp(-0.8, 0.8);
+                        let move_dy = (dy / dist * 0.5).clamp(-0.4, 0.4);
+                        tf.x += move_dx;
+                        tf.y += move_dy;
+                    }
+                }
+
+                // Clamp to screen
+                tf.x = tf.x.clamp(2.0, self.width as f32 - 5.0);
+                tf.y = tf.y.clamp(1.0, self.height as f32 - 2.0);
+
+                // Fire
+                if tf.fire_cooldown == 0 {
+                    temp_projectiles.push(Projectile {
+                        x: tf.x + 2.0,
+                        y: tf.y,
+                        vx: 1.5,
+                        vy: 0.0,
+                        damage: tf.damage,
+                        friendly: true,
+                        kind: ProjectileKind::TempFighterShot,
+                        homing_target_y: -1.0,
+                    });
+                    tf.fire_cooldown = 8; // fast fire rate
+                } else {
+                    tf.fire_cooldown -= 1;
+                }
+            }
+            self.projectiles.extend(temp_projectiles);
+
+            // Remove expired temp fighters with particle poof
+            self.temp_fighters.retain(|tf| {
+                if !tf.is_alive() {
+                    // Note: can't access particles here, handled separately
+                    return false;
+                }
+                true
+            });
+        }
 
         // ── Player fleet fires ─────────────────────────────────────────
         let positions = self.player_positions(&state.fleet);
@@ -1414,6 +1747,8 @@ impl Scene for BattleScene {
 
         // ── Hit detection: friendly projectiles → enemies ──────────────
         let mut to_remove_proj: Vec<usize> = Vec::new();
+        // Collect AOE hits to process after the loop (avoids borrow issues)
+        let mut aoe_hits: Vec<(f32, f32, u32)> = Vec::new(); // (x, y, damage)
         for (pi, proj) in self.projectiles.iter().enumerate() {
             if !proj.friendly {
                 continue;
@@ -1430,16 +1765,24 @@ impl Scene for BattleScene {
                     enemy.hp -= dmg;
                     to_remove_proj.push(pi);
 
-                    // Hit spark
-                    particles.emit(Particle::new(
-                        proj.x,
-                        proj.y,
-                        0.0,
-                        0.0,
-                        2,
-                        '✦',
-                        Color::White,
-                    ));
+                    // HeavyPayload: AOE explosion on hit
+                    if proj.kind == ProjectileKind::HeavyPayload {
+                        aoe_hits.push((proj.x, proj.y, proj.damage));
+                        // Big dramatic explosion
+                        particles.explode(proj.x, proj.y, 20, Color::Rgb(255, 200, 50));
+                        Self::chain_explosion(particles, proj.x, proj.y, true);
+                    } else {
+                        // Normal hit spark
+                        particles.emit(Particle::new(
+                            proj.x,
+                            proj.y,
+                            0.0,
+                            0.0,
+                            2,
+                            '✦',
+                            Color::White,
+                        ));
+                    }
 
                     // Death? Start death animation
                     if !enemy.is_alive() {
@@ -1453,6 +1796,33 @@ impl Scene for BattleScene {
                         state.enemies_destroyed += 1;
                     }
                     break;
+                }
+            }
+        }
+
+        // ── Process HeavyPayload AOE damage ────────────────────────────
+        for (aoe_x, aoe_y, aoe_dmg) in aoe_hits {
+            for enemy in self.enemies.iter_mut() {
+                if !enemy.is_alive() {
+                    continue;
+                }
+                // Damage all enemies within 3 y-units of the impact
+                let dy = (enemy.y - aoe_y).abs();
+                if dy <= 3.0 && (enemy.x - aoe_x).abs() < 10.0 {
+                    let falloff = 1.0 - (dy / 3.0);
+                    let splash = ((aoe_dmg as f32 * 0.6 * falloff) as u32).max(1);
+                    let actual = splash.min(enemy.hp);
+                    enemy.hp -= actual;
+                    if !enemy.is_alive() {
+                        enemy.death_frame = 1;
+                        let sprite_w = enemy.sprite[0].chars().count() as f32;
+                        if !enemy.is_big() {
+                            let cx = enemy.x + sprite_w / 2.0;
+                            Self::chain_explosion(particles, cx, enemy.y, false);
+                            enemy.death_exploded = true;
+                        }
+                        state.enemies_destroyed += 1;
+                    }
                 }
             }
         }
@@ -1474,13 +1844,22 @@ impl Scene for BattleScene {
                 let hit_x = proj.x >= sx && proj.x <= sx + sprite_w;
                 let hit_y = (proj.y - sy).abs() < (sprite_h * 0.5 + 0.5);
                 if hit_x && hit_y {
-                    let dmg = proj.damage.min(ship.current_hp);
+                    // Shield damage reduction
+                    let raw_dmg = proj.damage;
+                    let effective_dmg = if si < self.player_states.len()
+                        && self.player_states[si].shield_timer > 0
+                    {
+                        raw_dmg / 2 // 50% reduction
+                    } else {
+                        raw_dmg
+                    };
+                    let dmg = effective_dmg.min(ship.current_hp);
                     ship.current_hp -= dmg;
                     if !to_remove_proj.contains(&pi) {
                         to_remove_proj.push(pi);
                     }
 
-                    // Flash
+                    // Flash (blue if shielded, red if not)
                     if si < self.player_states.len() {
                         self.player_states[si].flash = 3;
                     }
@@ -1716,6 +2095,138 @@ impl Scene for BattleScene {
                     let cell = &mut buf[(area.x + tx as u16, area.y + py)];
                     cell.set_char(ch);
                     cell.set_fg(if idx == 0 { head_color } else { trail_color });
+                }
+            }
+        }
+
+        // ── Shield visuals ─────────────────────────────────────────────
+        let positions = self.player_positions(&state.fleet);
+        for (i, ship) in state.fleet.iter().enumerate() {
+            if !ship.is_alive() || i >= self.player_states.len() || i >= positions.len() {
+                continue;
+            }
+            let ps = &self.player_states[i];
+            if ps.shield_timer > 0 {
+                let (fx, fy) = positions[i];
+                let sprite = ship.ship_type.sprite();
+                let sprite_h = sprite.len();
+                // Render `[` shield char in front of ship for each row
+                let shield_x = (fx - 1.0) as u16;
+                let pulse = if self.tick_count % 6 < 3 {
+                    Color::Rgb(80, 180, 255)
+                } else {
+                    Color::Rgb(40, 120, 200)
+                };
+                for row in 0..sprite_h {
+                    let sy = (fy + row as f32) as u16;
+                    if shield_x < area.width && sy < area.height {
+                        let cell = &mut buf[(area.x + shield_x, area.y + sy)];
+                        cell.set_char('[');
+                        cell.set_fg(pulse);
+                    }
+                }
+            }
+
+            // ── Beam charge visual ─────────────────────────────────────
+            if ps.beam_charge > 0 {
+                let (fx, fy) = positions[i];
+                let sprite_w = ship.ship_type.sprite()[0].chars().count() as f32;
+                let muzzle_x = (fx + sprite_w + 1.0) as u16;
+                let charge_y = fy as u16;
+                // Growing ▸▸▸ based on charge progress
+                let num_arrows = ((ps.beam_charge as f32 / 60.0) * 6.0).ceil() as usize;
+                let charge_color = if self.tick_count % 4 < 2 {
+                    Color::Rgb(100, 220, 255)
+                } else {
+                    Color::White
+                };
+                for c in 0..num_arrows.min(6) {
+                    let cx = muzzle_x + c as u16;
+                    if cx < area.width && charge_y < area.height {
+                        let cell = &mut buf[(area.x + cx, area.y + charge_y)];
+                        cell.set_char('▸');
+                        cell.set_fg(charge_color);
+                    }
+                }
+            }
+        }
+
+        // ── Active beam weapons ────────────────────────────────────────
+        for beam in &self.active_beams {
+            let by = beam.y as u16;
+            if by >= area.height {
+                continue;
+            }
+            // Beam flickers between white and cyan
+            let beam_color = if self.tick_count % 3 == 0 {
+                Color::White
+            } else {
+                Color::Rgb(100, 220, 255)
+            };
+            let start = beam.start_x as u16;
+            for bx in start..area.width {
+                let cell = &mut buf[(area.x + bx, area.y + by)];
+                cell.set_char('━');
+                cell.set_fg(beam_color);
+            }
+        }
+
+        // ── Temp fighters ──────────────────────────────────────────────
+        for tf in &self.temp_fighters {
+            if !tf.is_alive() {
+                continue;
+            }
+            let tx = tf.x as u16;
+            let ty = tf.y as u16;
+            // Render as `=>`
+            let fg = if tf.lifetime < 30 && self.tick_count % 4 < 2 {
+                Color::DarkGray // flicker when about to expire
+            } else {
+                Color::Rgb(100, 255, 180)
+            };
+            if tx < area.width.saturating_sub(1) && ty < area.height {
+                let cell = &mut buf[(area.x + tx, area.y + ty)];
+                cell.set_char('=');
+                cell.set_fg(fg);
+                let cell2 = &mut buf[(area.x + tx + 1, area.y + ty)];
+                cell2.set_char('>');
+                cell2.set_fg(fg);
+            }
+        }
+
+        // ── Enemy HP bars (when Scan ability active) ───────────────────
+        if self.has_scan {
+            for enemy in &self.enemies {
+                if !enemy.is_alive() {
+                    continue;
+                }
+                let bar_x = enemy.x as u16;
+                let bar_y = (enemy.y - 1.0) as u16;
+                if bar_y == 0 || bar_y >= area.height || bar_x >= area.width {
+                    continue;
+                }
+                let hp_ratio = enemy.hp_ratio();
+                let bar_len = 6usize.min((area.width - bar_x) as usize);
+                let filled = (hp_ratio * bar_len as f32) as usize;
+                let hp_color = if hp_ratio > 0.5 {
+                    Color::Red
+                } else if hp_ratio > 0.25 {
+                    Color::Rgb(255, 140, 0)
+                } else {
+                    Color::Rgb(255, 60, 60)
+                };
+                for bi in 0..bar_len {
+                    let bx = bar_x + bi as u16;
+                    if bx < area.width {
+                        let cell = &mut buf[(area.x + bx, area.y + bar_y)];
+                        if bi < filled {
+                            cell.set_char('▬');
+                            cell.set_fg(hp_color);
+                        } else {
+                            cell.set_char('▬');
+                            cell.set_fg(Color::DarkGray);
+                        }
+                    }
                 }
             }
         }
