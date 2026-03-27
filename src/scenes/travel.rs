@@ -191,7 +191,7 @@ enum EventOutcome {
     Nothing,
     StartBattle,
     AddTravelTime(f32),
-    HealFleet,
+    HealFleet(u64),
     GainBlueprint,
     GainArtifact,
 }
@@ -387,7 +387,7 @@ fn generate_random_event(state: &GameState, last_event: Option<EventType>) -> (T
                 "A merchant vessel hails you on comms.\n\"Looking to trade, captain?\"",
                 vec![
                     (format!("Buy supplies (-{}₿, heal fleet)", heal_cost),
-                        if state.credits >= heal_cost { EventOutcome::HealFleet } else { EventOutcome::Nothing }),
+                        if state.credits >= heal_cost { EventOutcome::HealFleet(heal_cost) } else { EventOutcome::Nothing }),
                     (format!("Sell scrap (-{}◇, +{}₿)", sell_scrap, sell_credits),
                         if state.scrap >= sell_scrap { EventOutcome::GainCredits(sell_credits) } else { EventOutcome::Nothing }),
                     ("Ignore".into(), EventOutcome::Nothing),
@@ -870,13 +870,13 @@ fn apply_event_outcome(outcome: EventOutcome, state: &mut GameState, _label: &st
             state.phase_timer += secs;
             format!("Detour adds {:.0} seconds to travel.", secs)
         }
-        EventOutcome::HealFleet => {
-            if state.credits >= 100 {
-                state.credits -= 100;
+        EventOutcome::HealFleet(cost) => {
+            if state.credits >= cost {
+                state.credits -= cost;
                 for ship in &mut state.fleet {
                     ship.heal_full();
                 }
-                "Fleet fully repaired!".to_string()
+                format!("Fleet fully repaired! (-{}₿)", cost)
             } else {
                 "Not enough credits!".to_string()
             }
@@ -904,7 +904,7 @@ impl Scene for TravelScene {
         self.asteroid_fields.clear();
         self.colored_stars.clear();
         self.tick_count = 0;
-        self.travel_duration = 45.0 + (state.sector as f32 * 2.0).min(30.0);
+        self.travel_duration = (45.0 + (state.sector as f32 * 2.0).min(30.0)) * state.pip_travel_bonus();
         self.warping = false;
         self.warp_frame = 0;
         self.sector_name = generate_sector_name(state.sector);
@@ -1036,8 +1036,10 @@ impl Scene for TravelScene {
                 let dx = (col.x - fleet_x).abs();
                 let dy = (col.y - fy).abs();
                 if dx < 3.0 && dy < 1.5 {
-                    state.scrap += col.kind.value();
-                    state.total_scrap += col.kind.value();
+                    let base_value = col.kind.value();
+                    let scrap_value = (base_value as f32 * (1.0 + state.prestige_bonus_scrap)) as u64;
+                    state.scrap += scrap_value;
+                    state.total_scrap += scrap_value;
                     particles.sparkle(col.x, col.y, col.kind.color());
                     collected_indices.push(ci);
                     break;

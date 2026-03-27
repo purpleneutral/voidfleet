@@ -2,6 +2,7 @@ use rand::Rng;
 use ratatui::style::Color;
 use ratatui::Frame;
 
+use crate::engine::economy::calculate_loot;
 use crate::rendering::particles::ParticleSystem;
 use crate::state::GameState;
 
@@ -26,6 +27,10 @@ struct LootData {
     xp_end_ratio: f32,
     /// Fleet status: (ship_name, alive)
     fleet_status: Vec<(&'static str, bool)>,
+    /// Whether the battle was lost (fleet destroyed)
+    battle_lost: bool,
+    /// Death penalty description (shown instead of rewards on loss)
+    death_penalty: String,
 }
 
 /// Sparkle particle for rare loot effects within the loot box.
@@ -72,16 +77,67 @@ impl Scene for LootScene {
         self.lines_revealed = 0;
         self.level_up_flash = 0;
 
-        // Compute loot before mutating state (state is immutable here,
-        // actual mutations happen in tick on frame 1).
         let mut rng = rand::thread_rng();
         let sector = state.sector;
-        let sector_mult = sector as u64;
-        let credits = 20 + sector_mult * 5;
-        let scrap = 10 + sector_mult * 3;
-        let xp = 15 + sector_mult * 2;
-        let bp_drop = rng.gen_range(0.0f32..1.0) < 0.1;
-        let art_drop = rng.gen_range(0.0f32..1.0) < 0.03;
+
+        // Detect battle loss: if all fleet ships are dead, this was a defeat
+        let battle_lost = state.fleet_total_hp() == 0;
+
+        if battle_lost {
+            // On loss: show death penalty, no rewards
+            // (handle_fleet_death will be called in tick frame 1)
+            let fleet_status: Vec<(&'static str, bool)> = state
+                .fleet
+                .iter()
+                .map(|s| (s.ship_type.name(), s.is_alive()))
+                .collect();
+
+            self.loot = LootData {
+                sector_cleared: sector,
+                battle_lost: true,
+                death_penalty: String::new(), // filled in tick when we mutate state
+                fleet_status,
+                ..LootData::default()
+            };
+            self.xp_anim = 0.0;
+            return;
+        }
+
+        // ── Calculate loot using economy module ──────────────
+        let performance = if state.fleet_max_hp() > 0 {
+            state.fleet_total_hp() as f32 / state.fleet_max_hp() as f32
+        } else {
+            0.0
+        };
+        let loot = calculate_loot(state, performance);
+
+        // Apply prestige bonuses
+        let credit_mult = 1.0 + state.prestige_bonus_credits;
+        let scrap_mult = 1.0 + state.prestige_bonus_scrap;
+        let xp_mult = 1.0 + state.prestige_bonus_xp;
+
+        // Apply Pip combat bonus (affects loot amounts)
+        let pip_mult = state.pip_combat_bonus();
+
+        // Apply route modifier
+        let route_mult = if state.current_route_modifier > 0.0 {
+            state.current_route_modifier
+        } else {
+            1.0
+        };
+
+        let total_mult_credits = credit_mult * pip_mult * route_mult;
+        let total_mult_scrap = scrap_mult * pip_mult * route_mult;
+        let total_mult_xp = xp_mult * pip_mult * route_mult;
+
+        let credits = (loot.credits as f32 * total_mult_credits) as u64;
+        let scrap = (loot.scrap as f32 * total_mult_scrap) as u64;
+        let xp = (loot.xp as f32 * total_mult_xp) as u64;
+
+        // Blueprint/artifact drops based on chances
+        let bp_drop = rng.gen_range(0.0f32..1.0) < loot.blueprint_chance;
+        let art_drop = rng.gen_range(0.0f32..1.0) < loot.artifact_chance;
+
         let new_record = sector >= state.highest_sector && sector > 1;
 
         // Pre-compute level-up detection
@@ -128,6 +184,8 @@ impl Scene for LootScene {
             xp_start_ratio,
             xp_end_ratio,
             fleet_status,
+            battle_lost: false,
+            death_penalty: String::new(),
         };
 
         self.xp_anim = xp_start_ratio;
@@ -136,26 +194,36 @@ impl Scene for LootScene {
     fn tick(&mut self, state: &mut GameState, _particles: &mut ParticleSystem) -> SceneAction {
         self.tick_count += 1;
 
-        // Award loot on first tick
+        // Award loot on first tick (state mutation happens here)
         if self.tick_count == 1 {
-            state.credits += self.loot.credits_gained;
-            state.scrap += self.loot.scrap_gained;
-            state.add_xp(self.loot.xp_gained);
+            if self.loot.battle_lost {
+                // Handle fleet death: apply penalty, respawn fleet
+                let penalty = state.handle_fleet_death();
+                self.loot.death_penalty = penalty;
+            } else {
+                // Award resources
+                state.credits += self.loot.credits_gained;
+                state.scrap += self.loot.scrap_gained;
+                state.add_xp(self.loot.xp_gained);
 
-            if self.loot.blueprint_drop {
-                state.blueprints += 1;
-            }
-            if self.loot.artifact_drop {
-                state.artifacts += 1;
-            }
+                // Track lifetime credits for prestige stats
+                state.lifetime_credits += self.loot.credits_gained;
 
-            // Heal fleet
-            for ship in &mut state.fleet {
-                ship.heal_full();
-            }
+                if self.loot.blueprint_drop {
+                    state.blueprints += 1;
+                }
+                if self.loot.artifact_drop {
+                    state.artifacts += 1;
+                }
 
-            // Advance sector
-            state.sector += 1;
+                // Heal fleet
+                for ship in &mut state.fleet {
+                    ship.heal_full();
+                }
+
+                // Advance sector
+                state.sector += 1;
+            }
         }
 
         // Reveal lines progressively (every 15 ticks)
@@ -165,28 +233,29 @@ impl Scene for LootScene {
             self.lines_revealed = target_reveal;
         }
 
-        // Animate XP bar fill
-        let target_xp = if self.loot.level_up {
-            // If leveled up, fill to 100% first then jump to new ratio
-            if self.xp_anim < 0.98 {
-                1.0
+        // Animate XP bar fill (only on win)
+        if !self.loot.battle_lost {
+            let target_xp = if self.loot.level_up {
+                if self.xp_anim < 0.98 {
+                    1.0
+                } else {
+                    self.loot.xp_end_ratio
+                }
             } else {
                 self.loot.xp_end_ratio
+            };
+            self.xp_anim += (target_xp - self.xp_anim) * 0.08;
+            if (self.xp_anim - target_xp).abs() < 0.01 {
+                self.xp_anim = target_xp;
             }
-        } else {
-            self.loot.xp_end_ratio
-        };
-        self.xp_anim += (target_xp - self.xp_anim) * 0.08;
-        if (self.xp_anim - target_xp).abs() < 0.01 {
-            self.xp_anim = target_xp;
-        }
 
-        // Level-up flash
-        if self.loot.level_up && self.xp_anim >= 0.95 && self.level_up_flash == 0 {
-            self.level_up_flash = 30; // 1.5 seconds of flashing
-        }
-        if self.level_up_flash > 0 {
-            self.level_up_flash -= 1;
+            // Level-up flash
+            if self.loot.level_up && self.xp_anim >= 0.95 && self.level_up_flash == 0 {
+                self.level_up_flash = 30;
+            }
+            if self.level_up_flash > 0 {
+                self.level_up_flash -= 1;
+            }
         }
 
         // Tick sparkles
@@ -201,12 +270,14 @@ impl Scene for LootScene {
             true
         });
 
-        // Spawn sparkles for rare drops when they appear
-        if self.loot.blueprint_drop && self.lines_revealed >= 3 && self.tick_count % 4 == 0 {
-            self.spawn_sparkles(Color::Cyan);
-        }
-        if self.loot.artifact_drop && self.lines_revealed >= 4 && self.tick_count % 4 == 0 {
-            self.spawn_sparkles(Color::Magenta);
+        // Spawn sparkles for rare drops when they appear (win only)
+        if !self.loot.battle_lost {
+            if self.loot.blueprint_drop && self.lines_revealed >= 3 && self.tick_count % 4 == 0 {
+                self.spawn_sparkles(Color::Cyan);
+            }
+            if self.loot.artifact_drop && self.lines_revealed >= 4 && self.tick_count % 4 == 0 {
+                self.spawn_sparkles(Color::Magenta);
+            }
         }
 
         // Auto-advance after 100 ticks (5 seconds)
@@ -255,10 +326,12 @@ impl Scene for LootScene {
             }
         }
 
-        // Draw XP bar (always at a fixed row in the box)
-        let xp_row = by + lines.len() as u16 - 3; // 3 from bottom of content
-        if self.lines_revealed >= lines.len().saturating_sub(4) {
-            self.draw_xp_bar(buf, area, bx, xp_row, box_width);
+        // Draw XP bar (always at a fixed row in the box) — win only
+        if !self.loot.battle_lost {
+            let xp_row = by + lines.len() as u16 - 3;
+            if self.lines_revealed >= lines.len().saturating_sub(4) {
+                self.draw_xp_bar(buf, area, bx, xp_row, box_width);
+            }
         }
 
         // Draw sparkles
@@ -278,8 +351,8 @@ impl Scene for LootScene {
             }
         }
 
-        // NEW RECORD banner
-        if self.loot.new_record && self.tick_count > 20 {
+        // NEW RECORD banner (win only)
+        if !self.loot.battle_lost && self.loot.new_record && self.tick_count > 20 {
             let record_y = by.saturating_sub(2);
             let record_text = "★ NEW RECORD ★";
             let rx = area.width.saturating_sub(record_text.len() as u16) / 2;
@@ -302,6 +375,11 @@ impl Scene for LootScene {
 
 impl LootScene {
     fn total_display_lines(&self) -> usize {
+        if self.loot.battle_lost {
+            // header + blank + penalty line + blank + fleet line
+            return 5;
+        }
+
         let mut count = 2; // header + blank
         count += 1; // scrap
         count += 1; // credits
@@ -323,6 +401,31 @@ impl LootScene {
 
     fn build_lines(&self) -> Vec<(String, Color)> {
         let mut lines = Vec::new();
+
+        if self.loot.battle_lost {
+            // Death/loss display
+            lines.push((
+                "FLEET DESTROYED".to_string(),
+                Color::Red,
+            ));
+            lines.push((String::new(), Color::White));
+            lines.push((
+                self.loot.death_penalty.clone(),
+                Color::Rgb(255, 120, 120),
+            ));
+            lines.push((String::new(), Color::White));
+
+            // Fleet status (all dead)
+            let fleet_str: String = self
+                .loot
+                .fleet_status
+                .iter()
+                .map(|_| "\u{2620}".to_string()) // ☠ skull for all
+                .collect::<Vec<_>>()
+                .join("  ");
+            lines.push((format!("  Fleet: {}", fleet_str), Color::Red));
+            return lines;
+        }
 
         // Header
         lines.push((
@@ -389,7 +492,6 @@ impl LootScene {
             .iter()
             .map(|(name, alive)| {
                 if *alive {
-                    // Show abbreviated ship type
                     let abbr = match *name {
                         "Scout" => "=>",
                         "Fighter" => "=|>",
@@ -421,7 +523,11 @@ impl LootScene {
         w: u16,
         h: u16,
     ) {
-        let border_color = Color::Rgb(100, 100, 160);
+        let border_color = if self.loot.battle_lost {
+            Color::Rgb(160, 50, 50) // red border on loss
+        } else {
+            Color::Rgb(100, 100, 160)
+        };
 
         // Top border
         if by < area.height {
@@ -514,7 +620,6 @@ impl LootScene {
         let mut rng = rand::thread_rng();
         let sparkle_chars = ['✦', '✧', '·', '*', '⁺'];
         for _ in 0..3 {
-            // Spawn around center of screen roughly where loot text is
             self.sparkles.push(Sparkle {
                 x: rng.gen_range(20.0..60.0),
                 y: rng.gen_range(8.0..18.0),

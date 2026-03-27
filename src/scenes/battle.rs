@@ -2,6 +2,8 @@ use rand::Rng;
 use ratatui::style::Color;
 use ratatui::Frame;
 
+use crate::engine::combat::{effective_damage, effective_hp, fire_rate};
+use crate::engine::procedural::{generate_enemy_fleet_adaptive, difficulty_modifier, post_death_modifier};
 use crate::engine::ship::{Ship, ShipAbility, ShipType};
 use crate::rendering::particles::{Particle, ParticleSystem};
 use crate::state::{GamePhase, GameState};
@@ -138,40 +140,43 @@ impl EnemyShip {
     }
 }
 
-// Enemy templates — sprites face left (mirrored player ships).
-const ENEMY_PIRATE: &[&str] = &["◄="];
-const ENEMY_MILITIA: &[&str] = &["◄╚═"];
-const ENEMY_CRUISER: &[&str] = &["◄══╗", "◄══╝"];
-const ENEMY_WARSHIP: &[&str] = &["╔═══►", "╣███◄", "╚═══►"];
-
-fn enemy_template(sector: u32, rng: &mut impl Rng) -> EnemyShip {
-    // Difficulty scales with sector — higher sectors get tougher ships + stat boost
-    let scale = 1.0 + (sector as f32 - 1.0) * 0.15;
-    let tier = rng.gen_range(0..=(sector.min(20) / 5).min(3));
-
-    let (name, sprite, base_hp, base_dmg, base_speed) = match tier {
-        0 => ("Pirate Scout", ENEMY_PIRATE, 8u32, 2u32, 9.0f32),
-        1 => ("Militia Fighter", ENEMY_MILITIA, 18, 6, 7.0),
-        2 => ("Cruiser", ENEMY_CRUISER, 50, 12, 4.0),
-        _ => ("Warship", ENEMY_WARSHIP, 120, 28, 3.0),
+/// Convert an `EnemyTemplate` from the procedural generator into a local `EnemyShip`.
+fn enemy_from_template(
+    tmpl: &crate::engine::procedural::EnemyTemplate,
+    sector: u32,
+    route_modifier: f32,
+    rng: &mut impl Rng,
+) -> EnemyShip {
+    // Infer tier from speed (matches procedural generator tiers)
+    let tier = if tmpl.speed >= 8.0 {
+        0 // scouts
+    } else if tmpl.speed >= 6.0 {
+        1 // fighters
+    } else if tmpl.speed >= 4.0 {
+        2 // frigates/cruisers
+    } else {
+        3 // destroyers/capital/boss
     };
 
-    let hp = (base_hp as f32 * scale) as u32;
-    let fire_rate = fire_rate_ticks(base_speed, sector);
+    // Apply route modifier to HP and damage
+    let hp = ((tmpl.hp as f32 * route_modifier) as u32).max(1);
+    let damage = ((tmpl.damage as f32 * route_modifier) as u32).max(1);
+
+    let fr = fire_rate_ticks(tmpl.speed, sector);
     let strategy = AIStrategy::for_tier(tier, rng);
 
     EnemyShip {
-        x: 0.0, // set by enter()
+        x: 0.0, // set by layout_enemies()
         y: 0.0,
         base_y: 0.0,
         hp,
         max_hp: hp,
-        damage: (base_dmg as f32 * scale) as u32,
-        speed: base_speed,
-        name,
-        sprite,
-        fire_cooldown: rng.gen_range(0..fire_rate), // stagger first volley
-        fire_rate,
+        damage,
+        speed: tmpl.speed,
+        name: tmpl.name,
+        sprite: tmpl.sprite,
+        fire_cooldown: rng.gen_range(0..fr.max(1)), // stagger first volley
+        fire_rate: fr,
         tier,
         dodge_offset: 0.0,
         strategy,
@@ -1134,28 +1139,31 @@ impl Scene for BattleScene {
             s.is_alive() && s.ship_type.ability() == Some(ShipAbility::Scan)
         });
 
-        // Generate enemy fleet based on sector
+        // Generate enemy fleet using procedural generator (adaptive difficulty + boss encounters)
         let mut rng = rand::thread_rng();
-        let count = (2 + state.sector / 3).min(8) as usize;
+        let modifier = difficulty_modifier(state) * post_death_modifier(state);
+        let templates = generate_enemy_fleet_adaptive(state.sector, modifier);
+        let route_mod = state.current_route_modifier;
         self.enemies.clear();
-        for _ in 0..count {
-            self.enemies.push(enemy_template(state.sector, &mut rng));
+        for tmpl in &templates {
+            self.enemies.push(enemy_from_template(tmpl, state.sector, route_mod, &mut rng));
         }
         self.layout_enemies();
 
-        // Player ship states
+        // Player ship states — use combat.rs fire_rate with tech bonus
+        let tech_engines = state.tech_engines;
         self.player_states = state
             .fleet
             .iter()
             .map(|s| {
-                let rate = fire_rate_ticks(s.speed(), state.sector);
+                let rate = fire_rate(s, tech_engines);
                 // Stagger ability cooldowns so they don't all fire at once
                 let ability_start = match s.ship_type.ability() {
                     Some(a) => rng.gen_range(0..a.cooldown_ticks().max(1)),
                     None => 0,
                 };
                 PlayerShipState {
-                    fire_cooldown: rng.gen_range(0..rate),
+                    fire_cooldown: rng.gen_range(0..rate.max(1)),
                     flash: 0,
                     dodge: 0.0,
                     death_frame: 0,
@@ -1203,8 +1211,13 @@ impl Scene for BattleScene {
         // ── Handle end-of-battle freeze ────────────────────────────────
         if let BattlePhase::Freeze(ref mut frames) = self.phase {
             if *frames == 0 {
-                state.total_battles += 1;
-                return SceneAction::TransitionTo(GamePhase::Loot);
+                if self.player_won {
+                    state.total_battles += 1;
+                    return SceneAction::TransitionTo(GamePhase::Loot);
+                } else {
+                    // Fleet was destroyed — death penalty already applied, skip loot
+                    return SceneAction::TransitionTo(GamePhase::Travel);
+                }
             }
             *frames -= 1;
             return SceneAction::Continue;
@@ -1331,6 +1344,8 @@ impl Scene for BattleScene {
             let positions = self.player_positions(&state.fleet);
             let mut new_projectiles: Vec<Projectile> = Vec::new();
             let mut new_temp_fighters: Vec<TempFighter> = Vec::new();
+            let ability_tech_lasers = state.tech_lasers;
+            let ability_pip_bonus = state.pip_combat_bonus();
 
             for (i, ship) in state.fleet.iter().enumerate() {
                 if !ship.is_alive() || i >= self.player_states.len() || i >= positions.len() {
@@ -1362,7 +1377,7 @@ impl Scene for BattleScene {
                             }
                             let ey = enemy.y;
                             if (ey - py).abs() < 1.5 && enemy.x > px {
-                                let beam_dmg = (ship.damage() / 3).max(1);
+                                let beam_dmg = ((effective_damage(ship, ability_tech_lasers) as f32 * ability_pip_bonus) as u32 / 3).max(1);
                                 let actual = beam_dmg.min(enemy.hp);
                                 enemy.hp -= actual;
                                 if !enemy.is_alive() {
@@ -1421,12 +1436,13 @@ impl Scene for BattleScene {
                 match ability {
                     ShipAbility::HeavyPayload => {
                         // Fire a slow, large AOE projectile
+                        let payload_dmg = (effective_damage(ship, ability_tech_lasers) as f32 * ability_pip_bonus) as u32 * 2;
                         new_projectiles.push(Projectile {
                             x: muzzle_x,
                             y: py,
                             vx: 0.5,
                             vy: 0.0,
-                            damage: ship.damage() * 2,
+                            damage: payload_dmg,
                             friendly: true,
                             kind: ProjectileKind::HeavyPayload,
                             homing_target_y: -1.0,
@@ -1443,6 +1459,7 @@ impl Scene for BattleScene {
                     }
                     ShipAbility::Broadside => {
                         // Fire 5 projectiles in a vertical spread
+                        let broadside_dmg = (effective_damage(ship, ability_tech_lasers) as f32 * ability_pip_bonus) as u32;
                         let offsets: [f32; 5] = [-2.0, -1.0, 0.0, 1.0, 2.0];
                         for &y_off in &offsets {
                             new_projectiles.push(Projectile {
@@ -1450,7 +1467,7 @@ impl Scene for BattleScene {
                                 y: py + y_off,
                                 vx: 1.5,
                                 vy: y_off * 0.05, // slight spread
-                                damage: ship.damage(),
+                                damage: broadside_dmg,
                                 friendly: true,
                                 kind: ProjectileKind::BroadsideShot,
                                 homing_target_y: -1.0,
@@ -1581,6 +1598,9 @@ impl Scene for BattleScene {
 
         // ── Player fleet fires ─────────────────────────────────────────
         let positions = self.player_positions(&state.fleet);
+        let pip_bonus = state.pip_combat_bonus();
+        let tech_lasers = state.tech_lasers;
+        let tech_engines = state.tech_engines;
         for (i, ship) in state.fleet.iter().enumerate() {
             if !ship.is_alive() || i >= self.player_states.len() {
                 continue;
@@ -1595,6 +1615,9 @@ impl Scene for BattleScene {
                     ProjectileKind::CapitalBeam => 0.6 + ship.speed() * 0.04,
                     _ => 1.2 + ship.speed() * 0.08,
                 };
+
+                // Tech-aware damage + pip combat bonus
+                let dmg = (effective_damage(ship, tech_lasers) as f32 * pip_bonus) as u32;
 
                 // Smart targeting: aim toward selected enemy
                 let target_idx = Self::player_select_target(ship, &self.enemies);
@@ -1632,14 +1655,14 @@ impl Scene for BattleScene {
                     y: py,
                     vx: speed,
                     vy,
-                    damage: ship.damage(),
+                    damage: dmg,
                     friendly: true,
                     kind,
                     homing_target_y: homing_y,
                 });
 
                 Self::emit_muzzle_flash(particles, muzzle_x, py, true);
-                self.player_states[i].fire_cooldown = fire_rate_ticks(ship.speed(), self.sector);
+                self.player_states[i].fire_cooldown = fire_rate(ship, tech_engines);
             } else {
                 self.player_states[i].fire_cooldown -= 1;
             }
@@ -1934,6 +1957,13 @@ impl Scene for BattleScene {
 
         if Self::player_alive_count(&state.fleet) == 0 {
             self.player_won = false;
+
+            // enemies_destroyed already incremented inline during combat for each kill.
+            // Apply death penalty (loses scrap/credits, pushes back sectors, heals fleet).
+            // handle_fleet_death increments state.deaths internally.
+            let _penalty = state.handle_fleet_death();
+
+            state.total_battles += 1;
             Self::projectiles_to_particles(&mut self.projectiles, particles);
             self.phase = BattlePhase::Freeze(10);
             return SceneAction::Continue;
@@ -2263,7 +2293,7 @@ impl Scene for BattleScene {
 
         // Player fleet HP
         let player_hp: u32 = state.fleet.iter().map(|s| s.current_hp).sum();
-        let player_max: u32 = state.fleet.iter().map(|s| s.max_hp()).sum();
+        let player_max: u32 = state.fleet.iter().map(|s| effective_hp(s, state.tech_shields)).sum();
         let player_ratio = if player_max > 0 {
             player_hp as f32 / player_max as f32
         } else {

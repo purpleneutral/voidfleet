@@ -7,7 +7,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs},
 };
 
+use crate::engine::economy;
 use crate::engine::ship::{Ship, ShipType};
+use crate::rendering::layout::centered_rect;
 use crate::state::GameState;
 
 // ── Tab enum ────────────────────────────────────────────────────────────────
@@ -54,11 +56,6 @@ const SHIP_TYPES: [ShipType; 7] = [
 // ── Tech tree constants ─────────────────────────────────────────────────────
 
 const TECH_MAX_LEVEL: u8 = 10;
-const TECH_BASE_COST: u64 = 80;
-
-fn tech_upgrade_cost(current_level: u8) -> u64 {
-    TECH_BASE_COST * (current_level as u64 + 1)
-}
 
 // ── UpgradeScreen ───────────────────────────────────────────────────────────
 
@@ -161,7 +158,7 @@ impl UpgradeScreen {
             if type_idx < SHIP_TYPES.len() {
                 let stype = SHIP_TYPES[type_idx];
                 if state.level >= stype.unlock_level() {
-                    let cost = stype.cost();
+                    let cost = economy::ship_build_cost(stype, state.fleet.len());
                     if state.credits >= cost {
                         state.credits -= cost;
                         state.fleet.push(Ship::new(stype));
@@ -182,7 +179,7 @@ impl UpgradeScreen {
         if level >= max {
             return;
         }
-        let cost = tech_upgrade_cost(level);
+        let cost = economy::tech_upgrade_cost(level);
         if state.credits >= cost {
             state.credits -= cost;
             match self.selected_item {
@@ -349,12 +346,13 @@ impl UpgradeScreen {
 
             let (line, style) = if unlocked {
                 let marker = if selected { "▸ " } else { "  " };
-                let cost_str = if stype.cost() == 0 {
+                let build_cost = economy::ship_build_cost(*stype, state.fleet.len());
+                let cost_str = if build_cost == 0 {
                     "FREE".to_string()
                 } else {
-                    format!("₿{}", stype.cost())
+                    format!("₿{}", build_cost)
                 };
-                let affordable = state.credits >= stype.cost();
+                let affordable = state.credits >= build_cost;
                 let cost_color = if affordable { Color::Green } else { Color::Red };
                 let line = Line::from(vec![
                     Span::styled(
@@ -496,7 +494,7 @@ impl UpgradeScreen {
                 lines.push(Line::from(""));
 
                 if unlocked {
-                    let cost = stype.cost();
+                    let cost = economy::ship_build_cost(stype, state.fleet.len());
                     let affordable = state.credits >= cost;
                     let cost_color = if affordable { Color::Green } else { Color::Red };
                     let cost_str = if cost == 0 {
@@ -573,7 +571,7 @@ impl UpgradeScreen {
             let cost_span = if maxed {
                 Span::styled(" ★ MAX", Style::default().fg(Color::Yellow))
             } else {
-                let cost = tech_upgrade_cost(*level);
+                let cost = economy::tech_upgrade_cost(*level);
                 let affordable = state.credits >= cost;
                 let cost_color = if affordable { Color::Green } else { Color::Red };
                 Span::styled(format!(" ₿{}", cost), Style::default().fg(cost_color))
@@ -749,23 +747,4 @@ fn stat_line_single<'a>(label: &'a str, value: u32, color: Color) -> Line<'a> {
     ])
 }
 
-/// Create a centered rectangle that occupies `percent_x`% width and `percent_y`% height.
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}

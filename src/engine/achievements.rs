@@ -57,8 +57,8 @@ pub const ACHIEVEMENTS: &[Achievement] = &[
         name: "Boss Slayer",
         description: "Defeat your first boss",
         icon: '👑',
-        // Boss every 5 sectors, so check if player has beaten one
-        condition: |s| s.highest_sector >= 6,
+        // Bosses spawn at sector 10, 20, 30... — must have passed sector 10
+        condition: |s| s.highest_sector >= 11,
     },
     Achievement {
         id: "rich",

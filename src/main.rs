@@ -73,6 +73,7 @@ fn main() -> io::Result<()> {
     // Time tracking
     let mut last_save = Instant::now();
     let mut last_time_tick = Instant::now();
+    let mut tick_count: u64 = 0;
 
     // Main game loop
     loop {
@@ -189,6 +190,8 @@ fn main() -> io::Result<()> {
                 })?;
             }
             AppMode::Playing => {
+                tick_count += 1;
+
                 // Tick particles
                 particles.tick();
 
@@ -207,7 +210,11 @@ fn main() -> io::Result<()> {
 
                     // Notify Pip of transitions
                     if state.phase == GamePhase::Battle && next_phase == GamePhase::Loot {
-                        bridge.notify_battle_win(&mut state);
+                        if state.fleet_total_hp() == 0 {
+                            bridge.notify_battle_loss(&mut state);
+                        } else {
+                            bridge.notify_battle_win(&mut state);
+                        }
                     }
                     if next_phase == GamePhase::Loot {
                         bridge.notify_loot();
@@ -231,13 +238,15 @@ fn main() -> io::Result<()> {
                 // Tick Pip (always, even when bridge isn't open)
                 bridge.tick(&mut state);
 
-                // Check achievements
-                let new_achievements = check_achievements(&state);
-                for ach in new_achievements {
-                    state.achievements_unlocked.push(ach.id.to_string());
-                    popup_text = Some(format!("{} Achievement: {} — {}", ach.icon, ach.name, ach.description));
-                    popup_timer = 60; // 3 seconds at 20fps
-                    bridge.notify_achievement(&mut state);
+                // Check achievements (throttled to every 20 ticks)
+                if tick_count % 20 == 0 {
+                    let new_achievements = check_achievements(&state);
+                    for ach in new_achievements {
+                        state.achievements_unlocked.push(ach.id.to_string());
+                        popup_text = Some(format!("{} Achievement: {} — {}", ach.icon, ach.name, ach.description));
+                        popup_timer = 60; // 3 seconds at 20fps
+                        bridge.notify_achievement(&mut state);
+                    }
                 }
 
                 // Render

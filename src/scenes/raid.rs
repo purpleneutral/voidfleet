@@ -805,15 +805,21 @@ impl Scene for RaidScene {
         }
 
         // ── Update turret projectiles ───────────────────────────────────
-        let ships = &mut self.ships;
+        let hover_ships = &mut self.ships;
+        let sector = state.sector;
         self.projectiles.retain_mut(|proj| {
             proj.y += proj.vy;
 
-            for ship in ships.iter_mut() {
-                let dx = (proj.x - ship.x).abs();
-                let dy = (proj.y - ship.current_y).abs();
+            for (i, hover) in hover_ships.iter_mut().enumerate() {
+                let dx = (proj.x - hover.x).abs();
+                let dy = (proj.y - hover.current_y).abs();
                 if dx < 3.0 && dy < 1.5 {
-                    ship.flash_frames = 6;
+                    // Apply turret damage to the actual fleet ship
+                    if let Some(ship) = state.fleet.get_mut(i) {
+                        let dmg = 5 + sector / 3;
+                        ship.current_hp = ship.current_hp.saturating_sub(dmg);
+                    }
+                    hover.flash_frames = 4;
                     particles.explode(proj.x, proj.y, 4, Color::Red);
                     return false;
                 }

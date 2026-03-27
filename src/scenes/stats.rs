@@ -1,12 +1,13 @@
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::Alignment,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crate::engine::achievements::ACHIEVEMENTS;
+use crate::rendering::layout::centered_rect;
 use crate::state::GameState;
 
 // ── StatsScreen ─────────────────────────────────────────────────────────────
@@ -243,27 +244,6 @@ fn render_achievements(lines: &mut Vec<Line<'static>>, state: &GameState) {
             Style::default().fg(Color::DarkGray),
         )));
     }
-}
-
-/// Create a centered rectangle that occupies `percent_x`% width and `percent_y`% height.
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
 }
 
 #[cfg(test)]
