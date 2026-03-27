@@ -3,7 +3,7 @@
 [![CI](https://github.com/purpleneutral/voidfleet/actions/workflows/ci.yml/badge.svg)](https://github.com/purpleneutral/voidfleet/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A space conquest idle TUI game built in Rust. Watch your fleet travel through space, battle enemies, raid planets, and grow stronger — all rendered as animated ASCII art in your terminal.
+A space conquest idle TUI game built in Rust. Watch your fleet travel through space, battle enemies, raid planets, trade goods, recruit crew, and grow stronger — all rendered as animated ASCII art in your terminal.
 
 ![Void Fleet Demo](screenshots/demo.gif)
 
@@ -14,10 +14,17 @@ A space conquest idle TUI game built in Rust. Watch your fleet travel through sp
 - **Fleet management** — 7 ship types from Scout to Capital Ship, each with unique sprites and special abilities
 - **Ship abilities** — Bomber AOE blasts, Destroyer broadsides, Capital beam weapons, Carrier fighter launches
 - **Smart AI** — enemies flank, focus fire, and retreat; your ships auto-dodge and protect formation
-- **Pip companion** — a tiny robot buddy on your bridge that reacts to game events, needs feeding, and evolves visually
+- **Voyage system** — themed multi-sector journeys with escalating prestige bonuses; complete voyages for permanent damage, hull, speed, and crit bonuses
+- **Crew system** — recruit Pilots, Gunners, Engineers, Medics, Captains, and Navigators with unique abilities, stats, and crew bonds that unlock synergies
+- **Trade economy** — 8 trade goods (Ore, Food, Tech, Weapons, Luxuries, Med Supplies, Contraband, Artifacts) with dynamic sector markets, contraband risk, and faction price modifiers
+- **Mission contracts** — procedurally generated missions from factions: Bounty Hunts, Deliveries, Escorts, Exploration, Sabotage, Rescue, and Trade Runs
+- **Faction diplomacy** — 5 factions (Trade Guild, Pirate Clan, Military Corp, Alien Collective, Rebel Alliance) with reputation tracking, rivalries, and sector control
+- **Equipment & inventory** — loot drops with 5 rarity tiers (Common → Legendary), equipment sets with bonuses, slot-based ship loadouts, and a salvage system
+- **Pip companion** — a tiny robot buddy on your bridge that reacts to game events, needs feeding, and evolves visually through 5 stages
 - **Upgrade system** — tech tree (lasers, shields, engines, beams), ship upgrades, Pip gifts
 - **Sector map** — branching route choices with different risk/reward profiles
 - **Travel events** — random encounters with meaningful choices (distress signals, wormholes, pirate ambushes)
+- **Game log** — scrollable event history with colored entries, sector markers, and auto-scroll
 - **Prestige system** — reset at sector 30+ for permanent bonuses
 - **13 achievements** — from "First Blood" to "Admiral"
 - **Adaptive difficulty** — rubber banding keeps it challenging but fair
@@ -46,9 +53,16 @@ Requires Rust 1.85+ (2024 edition).
 | Key | Action |
 |-----|--------|
 | `U` | Open upgrade screen |
+| `I` | Open inventory / equipment |
+| `C` | Open crew roster |
 | `B` | Visit bridge (Pip companion) |
 | `M` | Open sector map |
+| `F` | Open faction diplomacy |
+| `T` | Open trade market |
+| `J` | Open mission journal |
+| `L` | Open game log |
 | `Tab` | View stats |
+| `?` | Help screen |
 | `Space` | Skip current phase |
 | `S` | Manual save |
 | `P` | Prestige (sector 30+) |
@@ -101,16 +115,26 @@ TRAVEL (45s) → ENCOUNTER → BATTLE (20s) or RAID (15s) → LOOT (4s) → repe
 
 ## Architecture
 
+~25,800 lines of Rust.
+
 ```
 src/
   main.rs              — game loop, input, HUD
-  state.rs             — game state, save/load
+  state.rs             — game state, save/load, voyage progression
   engine/
     ship.rs            — ship types, stats, sprites
     combat.rs          — tech-aware damage calculations
     economy.rs         — loot, costs, catch-up mechanics
     procedural.rs      — enemy generation, adaptive difficulty
     achievements.rs    — achievement definitions and checking
+    voyage.rs          — voyage system, themed cycles, prestige bonuses
+    trade.rs           — trade goods, sector markets, contraband risk
+    missions.rs        — procedural mission contracts, faction-issued
+    factions.rs        — faction definitions, reputation, rivalries, sector control
+    abilities.rs       — crew ability triggers, effects, and context
+    crew.rs            — crew classes, stats, recruitment, bonds
+    equipment.rs       — loot rarity, equipment slots, set bonuses
+    events.rs          — game event types and event log management
   scenes/
     travel.rs          — starfield, fleet cruise, random events
     battle.rs          — combat simulation, AI, projectiles
@@ -121,6 +145,14 @@ src/
     upgrades.rs        — ship/tech upgrade shop
     stats.rs           — lifetime statistics
     map.rs             — sector route selection
+    voyage.rs          — voyage completion cinematic
+    trade.rs           — buy/sell goods at sector markets
+    missions.rs        — mission journal (available/active/log)
+    crew.rs            — crew roster, assignments, recruitment
+    diplomacy.rs       — faction reputation and relations
+    inventory.rs       — equipment management, ship loadouts, salvage
+    gamelog.rs         — scrollable game event log
+    help.rs            — help/controls overlay
   rendering/
     particles.rs       — particle system
     starfield.rs       — parallax background
