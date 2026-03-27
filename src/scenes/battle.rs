@@ -12,6 +12,7 @@ use crate::rendering::particles::{Particle, ParticleSystem};
 use crate::state::{GamePhase, GameState};
 
 use crate::engine::events::EventBus;
+use crate::engine::factions::{self, Faction, ReputationChange};
 use super::{Scene, SceneAction};
 
 // ---------------------------------------------------------------------------
@@ -404,6 +405,8 @@ pub struct BattleScene {
     revive_used: bool,
     /// Crew ability: floating ability text popups.
     ability_texts: Vec<AbilityText>,
+    /// Faction controlling the enemy fleet in this battle.
+    battle_faction: Faction,
 }
 
 /// Floating ability trigger text that drifts upward and fades.
@@ -439,6 +442,7 @@ impl BattleScene {
             rally_ticks: 0,
             revive_used: false,
             ability_texts: Vec::new(),
+            battle_faction: Faction::Independent,
         }
     }
 
@@ -1286,6 +1290,9 @@ impl Scene for BattleScene {
         self.rally_ticks = 0;
         self.revive_used = false;
         self.ability_texts.clear();
+
+        // Determine enemy faction for this battle
+        self.battle_faction = factions::encounter_faction(state.sector, state.total_battles as u32);
     }
 
     fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem, events: &mut EventBus) -> SceneAction {
@@ -1339,6 +1346,15 @@ impl Scene for BattleScene {
                         fleet_hp_pct,
                         was_boss: has_boss,
                     });
+                    // Emit faction rep change for killing enemy ships
+                    if self.battle_faction != Faction::Independent {
+                        let rep_penalty = enemy_count as i32 * ReputationChange::KILL_SHIP;
+                        events.emit(crate::engine::events::GameEvent::FactionRepChange {
+                            faction: self.battle_faction.name().to_string(),
+                            amount: rep_penalty,
+                            reason: format!("destroyed {} ships", enemy_count),
+                        });
+                    }
                     // Transfer equipment drops to state for loot scene
                     state.pending_loot = std::mem::take(&mut self.pending_drops);
                     return SceneAction::TransitionTo(GamePhase::Loot);
@@ -2496,6 +2512,15 @@ impl Scene for BattleScene {
                 fleet_hp_pct,
                 was_boss: has_boss,
             });
+            // Emit faction rep change for timeout victory
+            if self.battle_faction != Faction::Independent && enemy_count > 0 {
+                let rep_penalty = enemy_count as i32 * ReputationChange::KILL_SHIP;
+                events.emit(crate::engine::events::GameEvent::FactionRepChange {
+                    faction: self.battle_faction.name().to_string(),
+                    amount: rep_penalty,
+                    reason: format!("destroyed {} ships", enemy_count),
+                });
+            }
             state.pending_loot = std::mem::take(&mut self.pending_drops);
             return SceneAction::TransitionTo(GamePhase::Loot);
         }
@@ -2598,12 +2623,11 @@ impl Scene for BattleScene {
 
             let damaged = enemy.hp < enemy.max_hp;
 
-            // Color based on strategy for visual variety
+            // Color based on faction, with strategy accent
+            let faction_color = self.battle_faction.info().color;
             let base_fg = match enemy.strategy {
                 AIStrategy::Bomber => Color::Yellow,
-                AIStrategy::Aggressive => Color::Rgb(255, 100, 100),
-                AIStrategy::Flanker => Color::Rgb(255, 130, 180),
-                _ => Color::LightRed,
+                _ => faction_color,
             };
 
             let fg = if damaged && self.tick_count % 6 < 2 {
@@ -3006,9 +3030,14 @@ impl Scene for BattleScene {
             }
             BattlePhase::Combat => "",
         };
+        let faction_label = if self.battle_faction != Faction::Independent {
+            format!(" — vs {}", self.battle_faction.name())
+        } else {
+            String::new()
+        };
         let header = format!(
-            "⚔ BATTLE — Sector {} — {:.0}s{}",
-            state.sector, state.phase_timer, phase_label
+            "⚔ BATTLE — Sector {} — {:.0}s{}{}",
+            state.sector, state.phase_timer, faction_label, phase_label
         );
         let hx = (area.width / 2).saturating_sub(header.len() as u16 / 2);
         for (i, ch) in header.chars().enumerate() {

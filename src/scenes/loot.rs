@@ -4,6 +4,8 @@ use ratatui::Frame;
 
 use crate::engine::economy::calculate_loot;
 use crate::engine::equipment::Rarity;
+use crate::engine::factions;
+use crate::engine::trade::TradeGood;
 use crate::rendering::particles::ParticleSystem;
 use crate::state::GameState;
 
@@ -70,6 +72,10 @@ pub struct LootScene {
     xp_anim: f32,
     /// Flash timer for level-up text.
     level_up_flash: u8,
+    /// Whether this loot screen came from a raid (for trade goods looting).
+    pub from_raid: bool,
+    /// Sector faction for raid loot determination.
+    pub raid_sector: u32,
 }
 
 impl LootScene {
@@ -81,6 +87,8 @@ impl LootScene {
             lines_revealed: 0,
             xp_anim: 0.0,
             level_up_flash: 0,
+            from_raid: false,
+            raid_sector: 0,
         }
     }
 }
@@ -289,6 +297,28 @@ impl Scene for LootScene {
                 // Heal fleet
                 for ship in &mut state.fleet {
                     ship.heal_full();
+                }
+
+                // Auto-loot trade goods from raids based on sector faction
+                if self.from_raid && state.cargo_space_remaining() > 0 {
+                    let faction = factions::sector_dominant_faction(self.raid_sector);
+                    let mut rng = rand::thread_rng();
+                    let (good, qty_range) = match faction {
+                        factions::Faction::PirateClan => (TradeGood::Weapons, 1..=2),
+                        factions::Faction::TradeGuild => (TradeGood::Luxuries, 1..=2),
+                        factions::Faction::MilitaryCorp => (TradeGood::Weapons, 1..=1),
+                        factions::Faction::AlienCollective => (TradeGood::Artifacts, 1..=1),
+                        factions::Faction::RebelAlliance => (TradeGood::MedSupplies, 1..=2),
+                        factions::Faction::Independent => (TradeGood::Ore, 1..=3),
+                    };
+                    let qty = rng.gen_range(qty_range).min(state.cargo_space_remaining());
+                    if qty > 0 {
+                        *state.cargo.entry(good.key().to_string()).or_insert(0) += qty;
+                        events.emit(crate::engine::events::GameEvent::ScrapGained {
+                            amount: 0,
+                            source: format!("Looted {} {} from raid", qty, good.name()),
+                        });
+                    }
                 }
 
                 // Advance sector

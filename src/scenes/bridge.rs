@@ -2,12 +2,13 @@ use crossterm::event::KeyCode;
 use ratatui::style::Color;
 use ratatui::Frame;
 
+use crate::engine::events::GameEvent;
 use crate::state::GameState;
 
 // ── Pip's emotional states ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mood {
+pub enum Mood {
     Idle,
     Happy,
     Sleeping,
@@ -195,6 +196,85 @@ impl BridgeScene {
         self.pip_mood_timer = 60;
     }
 
+    /// React to game events with deeper mood changes and Pip stat effects.
+    /// Called from process_events for richer emotional responses.
+    pub fn react_to_event(&mut self, event: &GameEvent, state: &mut GameState) {
+        match event {
+            GameEvent::BattleWon { was_boss, fleet_hp_pct, .. } => {
+                state.pip_happiness = state.pip_happiness.saturating_add(10).min(100);
+                state.add_pip_xp(10);
+                if *was_boss {
+                    self.pip_mood = Mood::Dancing;
+                    self.pip_mood_timer = 200;
+                    self.say("BOSS DOWN!!");
+                } else if *fleet_hp_pct > 0.9 {
+                    self.pip_mood = Mood::Excited;
+                    self.pip_mood_timer = 100;
+                } else if *fleet_hp_pct < 0.3 {
+                    // Close call — happy but shaken
+                    self.pip_mood = Mood::Happy;
+                    self.pip_mood_timer = 60;
+                } else {
+                    self.pip_mood = Mood::Excited;
+                    self.pip_mood_timer = 100;
+                }
+            }
+            GameEvent::BattleLost { .. } => {
+                state.pip_happiness = state.pip_happiness.saturating_sub(15);
+                self.pip_mood = Mood::Sad;
+                self.pip_mood_timer = 300;
+            }
+            GameEvent::EquipmentDropped { rarity, .. } => {
+                match rarity.as_str() {
+                    "Legendary" => {
+                        self.pip_mood = Mood::Excited;
+                        self.pip_mood_timer = 150;
+                        self.say("LEGENDARY?!");
+                    }
+                    "Epic" => {
+                        self.pip_mood = Mood::Excited;
+                        self.pip_mood_timer = 80;
+                    }
+                    _ => {
+                        if self.pip_mood != Mood::Sad {
+                            self.pip_mood = Mood::Happy;
+                            self.pip_mood_timer = 20;
+                        }
+                    }
+                }
+            }
+            GameEvent::AchievementUnlocked { .. } => {
+                state.add_pip_xp(20);
+                self.pip_mood = Mood::Dancing;
+                self.pip_mood_timer = 60;
+            }
+            GameEvent::CrewGrief { fallen, .. } => {
+                self.pip_mood = Mood::Sad;
+                self.pip_mood_timer = 400;
+                self.say(&format!("{}...", fallen));
+            }
+            GameEvent::PrestigeCompleted { .. } => {
+                self.pip_mood = Mood::Dancing;
+                self.pip_mood_timer = 200;
+                self.say("A new beginning!");
+            }
+            _ => {}
+        }
+    }
+
+    /// Check resource-based mood — called each tick for ambient reactions.
+    fn check_resource_mood(&mut self, state: &GameState) {
+        // Only trigger if no active mood override
+        if self.pip_mood_timer > 0 {
+            return;
+        }
+        if state.scrap < 50 && self.pip_mood == Mood::Idle {
+            self.say("We're running low...");
+            self.pip_mood = Mood::Sad;
+            self.pip_mood_timer = 60;
+        }
+    }
+
     pub fn handle_input(&mut self, key: KeyCode, state: &mut GameState) {
         // Gift shop sub-menu
         if self.gift_shop_open {
@@ -332,6 +412,11 @@ impl BridgeScene {
             } else {
                 Mood::Idle
             };
+        }
+
+        // Check resource-based mood (every 200 ticks)
+        if self.tick_count.is_multiple_of(200) {
+            self.check_resource_mood(state);
         }
 
         // Blink every ~80 ticks

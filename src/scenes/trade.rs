@@ -95,6 +95,21 @@ impl TradeScreen {
         }
     }
 
+    /// Get reputation-adjusted buy price (higher if hostile, lower if allied).
+    fn adjusted_buy_price(&self, state: &GameState, base_price: u64) -> u64 {
+        let rep_mod = state.price_modifier(self.faction);
+        (base_price as f32 * rep_mod).round().max(1.0) as u64
+    }
+
+    /// Get reputation-adjusted sell price (lower if hostile, higher if allied).
+    fn adjusted_sell_price(&self, state: &GameState, base_price: u64) -> u64 {
+        // Inverse: allied means better sell prices, hostile means worse
+        let rep_mod = state.price_modifier(self.faction);
+        // Sell modifier is inverted: allied (0.7 buy) → 1.3 sell; hostile (1.5 buy) → 0.7 sell
+        let sell_mod = 2.0 - rep_mod;
+        (base_price as f32 * sell_mod).round().max(1.0) as u64
+    }
+
     fn execute_buy(&mut self, state: &mut GameState) {
         let market = match self.market.as_ref() {
             Some(m) => m,
@@ -103,10 +118,11 @@ impl TradeScreen {
         if self.selected >= TradeGood::ALL.len() { return; }
         let good = TradeGood::ALL[self.selected];
 
-        let buy_price = match market.buy_price(good) {
+        let base_price = match market.buy_price(good) {
             Some(p) => p,
             None => return,
         };
+        let buy_price = self.adjusted_buy_price(state, base_price);
 
         let qty = self.quantity.min(state.cargo_space_remaining());
         if qty == 0 { return; }
@@ -123,10 +139,11 @@ impl TradeScreen {
         if self.selected >= TradeGood::ALL.len() { return; }
         let good = TradeGood::ALL[self.selected];
 
-        let sell_price = match market.sell_price(good) {
+        let base_price = match market.sell_price(good) {
             Some(p) => p,
             None => return,
         };
+        let sell_price = self.adjusted_sell_price(state, base_price);
 
         let held = state.cargo.get(good.key()).copied().unwrap_or(0);
         let qty = self.quantity.min(held);
@@ -268,7 +285,10 @@ impl TradeScreen {
                     crate::engine::trade::Supply::Normal => Color::White,
                     crate::engine::trade::Supply::Scarce => Color::Red,
                 };
-                (format!("{:<5}", mp.buy_price), format!("{:<5}", mp.sell_price), supply_label, color)
+                // Apply reputation price modifier for display
+                let adj_buy = self.adjusted_buy_price(state, mp.buy_price);
+                let adj_sell = self.adjusted_sell_price(state, mp.sell_price);
+                (format!("{:<5}", adj_buy), format!("{:<5}", adj_sell), supply_label, color)
             } else {
                 (" --  ".to_string(), " --  ".to_string(), "N/A", Color::DarkGray)
             };
@@ -322,7 +342,9 @@ impl TradeScreen {
             let held = state.cargo.get(good.key()).copied().unwrap_or(0);
 
             if held > 0 {
-                if let (Some(buy), Some(sell)) = (market.buy_price(good), market.sell_price(good)) {
+                if let (Some(buy_base), Some(sell_base)) = (market.buy_price(good), market.sell_price(good)) {
+                    let sell = self.adjusted_sell_price(state, sell_base);
+                    let buy = self.adjusted_buy_price(state, buy_base);
                     let sell_total = sell * held as u64;
                     let buy_total = buy * held as u64;
                     if sell_total >= buy_total {
@@ -351,7 +373,8 @@ impl TradeScreen {
                         ]));
                     }
                 }
-            } else if let Some(buy) = market.buy_price(good) {
+            } else if let Some(buy_base) = market.buy_price(good) {
+                let buy = self.adjusted_buy_price(state, buy_base);
                 let qty = self.quantity;
                 let cost = buy * qty as u64;
                 let affordable = state.credits >= cost;

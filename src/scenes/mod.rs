@@ -12,6 +12,7 @@ pub mod crew;
 pub mod diplomacy;
 pub mod trade;
 pub mod missions;
+pub mod gamelog;
 
 use ratatui::Frame;
 use crate::engine::events::EventBus;

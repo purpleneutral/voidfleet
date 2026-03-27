@@ -14,7 +14,8 @@ use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 
 use engine::achievements::check_achievements;
-use engine::events::{EventBus, process_events};
+use engine::events::{EventBus, pip_commentary, process_events};
+use engine::{missions, trade};
 use rendering::particles::ParticleSystem;
 use scenes::{Scene, SceneAction};
 use scenes::battle::BattleScene;
@@ -31,6 +32,7 @@ use scenes::trade::TradeScreen;
 use scenes::missions::MissionScreen;
 use scenes::upgrades::UpgradeScreen;
 use scenes::map::MapScreen;
+use scenes::gamelog::GameLogScreen;
 use state::{GamePhase, GameState};
 
 const TICK_RATE: Duration = Duration::from_millis(50); // 20 fps
@@ -81,10 +83,15 @@ fn main() -> io::Result<()> {
     let mut diplomacy = DiplomacyScreen::new();
     let mut trade_screen = TradeScreen::new();
     let mut mission_screen = MissionScreen::new();
+    let mut gamelog = GameLogScreen::new();
 
     // Achievement popup display
     let mut popup_text: Option<String> = None;
     let mut popup_timer: u8 = 0;
+
+    // Pip commentary bubble (HUD-level, separate from bridge speech)
+    let mut pip_comment: Option<String> = None;
+    let mut pip_comment_timer: u8 = 0;
 
     // Time tracking
     let mut last_save = Instant::now();
@@ -137,7 +144,12 @@ fn main() -> io::Result<()> {
                             }
                         }
                         AppMode::Playing => {
-                            if trade_screen.open {
+                            if gamelog.open {
+                                match key.code {
+                                    KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('L') => gamelog.toggle(),
+                                    other => gamelog.handle_input(other),
+                                }
+                            } else if trade_screen.open {
                                 match key.code {
                                     KeyCode::Esc => { trade_screen.open = false; }
                                     other => trade_screen.handle_input(other, &mut state),
@@ -185,6 +197,7 @@ fn main() -> io::Result<()> {
                                     KeyCode::Char('m') | KeyCode::Char('M') => map_screen.toggle(&state),
                                     KeyCode::Char('t') | KeyCode::Char('T') => trade_screen.toggle(&state),
                                     KeyCode::Char('j') | KeyCode::Char('J') => mission_screen.toggle(&mut state),
+                                    KeyCode::Char('l') | KeyCode::Char('L') => gamelog.toggle(),
                                     KeyCode::Char('p') | KeyCode::Char('P') => {
                                         if state.prestige() {
                                             // Prestige resets state, re-enter travel scene
@@ -251,6 +264,79 @@ fn main() -> io::Result<()> {
                         bridge.notify_loot();
                     }
 
+                    // ── Sector transition logic (Loot → Travel) ──────────
+                    // When transitioning from Loot to Travel, the sector has been
+                    // cleared and advanced. Run mission/contraband/faction checks.
+                    if state.phase == GamePhase::Loot && next_phase == GamePhase::Travel {
+                        // Check mission progress
+                        // Note: boss_killed/raid_completed tracked via events;
+                        // sector-based missions (Delivery, Escort, Exploration) progress here.
+                        let mission_updates = state.check_mission_progress(
+                            state.sector,
+                            true,   // battle was won (we came from loot, not death)
+                            false,  // boss status not tracked across scenes yet
+                            false,  // raid status handled separately
+                            false,  // fleet ship loss
+                        );
+                        for update in &mission_updates {
+                            match &update.update_type {
+                                missions::MissionUpdateType::Completed {
+                                    reward_credits, reward_rep, ..
+                                } => {
+                                    event_bus.emit(engine::events::GameEvent::MissionCompleted {
+                                        title: update.title.clone(),
+                                        reward_credits: *reward_credits,
+                                        reward_rep: *reward_rep,
+                                    });
+                                    // Apply faction rep for mission completion
+                                    if let Some(mission) = state.active_missions.iter()
+                                        .chain(state.available_missions.iter())
+                                        .find(|m| m.id == update.mission_id)
+                                    {
+                                        let faction = mission.faction;
+                                        state.change_reputation(faction, *reward_rep);
+                                    }
+                                }
+                                missions::MissionUpdateType::Failed { reason } => {
+                                    event_bus.emit(engine::events::GameEvent::MissionFailed {
+                                        title: update.title.clone(),
+                                        reason: reason.clone(),
+                                    });
+                                }
+                                missions::MissionUpdateType::Progress { .. } => {}
+                            }
+                        }
+
+                        // Expire old missions
+                        state.fail_expired_missions();
+
+                        // Contraband check when entering new sector
+                        let sector_faction = state.sector_faction(state.sector);
+                        let contraband_results = trade::check_contraband(
+                            state.sector,
+                            &sector_faction,
+                            &state.cargo,
+                            state.sector as u32 + state.total_battles as u32,
+                        );
+                        for result in contraband_results {
+                            event_bus.emit(engine::events::GameEvent::ContrabandDetected {
+                                good: result.good.name().to_string(),
+                                faction: sector_faction.name().to_string(),
+                                fine: result.fine,
+                            });
+                        }
+
+                        // Refresh available missions for new sector
+                        state.refresh_available_missions(state.sector);
+                    }
+
+                    // Track whether we're entering loot from a raid
+                    let prev_phase = state.phase;
+                    if next_phase == GamePhase::Loot {
+                        loot.from_raid = prev_phase == GamePhase::Raid;
+                        loot.raid_sector = state.sector;
+                    }
+
                     state.phase = next_phase;
                     match next_phase {
                         GamePhase::Travel => state.phase_timer = 45.0,
@@ -285,7 +371,19 @@ fn main() -> io::Result<()> {
                 // Process queued events (central hub for cross-system effects)
                 if event_bus.has_pending() {
                     let events = event_bus.drain();
+                    // Pip commentary — pick the last relevant comment
+                    for event in &events {
+                        if let Some(comment) = pip_commentary(event, &state) {
+                            pip_comment = Some(comment);
+                            pip_comment_timer = 60; // 3 seconds at 20fps
+                        }
+                    }
                     process_events(&events, &mut state, &mut bridge, &mut popup_text, &mut popup_timer);
+                    // Convert events to log entries
+                    for event in &events {
+                        let log_entries = engine::events::event_to_log_entries(event, &state);
+                        gamelog.add_entries(log_entries);
+                    }
                 }
 
                 // Render
@@ -313,7 +411,9 @@ fn main() -> io::Result<()> {
 
                     // HUD bar
                     // Determine active overlay for context-aware HUD
-                    let active_overlay = if trade_screen.open {
+                    let active_overlay = if gamelog.open {
+                        "log"
+                    } else if trade_screen.open {
                         "trade"
                     } else if mission_screen.open {
                         "missions"
@@ -344,7 +444,16 @@ fn main() -> io::Result<()> {
                             render_popup(frame, text, popup_timer);
                         }
 
+                    // Pip commentary bubble (bottom-right, above HUD)
+                    if let Some(ref comment) = pip_comment
+                        && pip_comment_timer > 0 {
+                            render_pip_bubble(frame, comment, pip_comment_timer);
+                        }
+
                     // Overlays
+                    if gamelog.open {
+                        gamelog.render(frame);
+                    }
                     if trade_screen.open {
                         trade_screen.render(frame, &state);
                     }
@@ -379,6 +488,14 @@ fn main() -> io::Result<()> {
                     popup_timer -= 1;
                     if popup_timer == 0 {
                         popup_text = None;
+                    }
+                }
+
+                // Tick pip comment timer
+                if pip_comment_timer > 0 {
+                    pip_comment_timer -= 1;
+                    if pip_comment_timer == 0 {
+                        pip_comment = None;
                     }
                 }
 
@@ -452,10 +569,11 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
         "diplomacy" => " FACTIONS │ [↑↓]Browse [Esc]Close ".to_string(),
         "stats" => " STATS │ [Esc/Tab]Close ".to_string(),
         "map" => " SECTOR MAP │ [A/B/C]Choose Route [Esc]Close ".to_string(),
+        "log" => " SHIP LOG │ [↑↓]Scroll [PgUp/PgDn]Page [Esc]Close ".to_string(),
         "event" => " EVENT │ [↑↓]Select [Enter]Choose ".to_string(),
         _ => {
             let mut hud = format!(
-                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [I]nventory [C]rew [F]actions [T]rade [J]ournal [B]ridge [M]ap [Tab]Stats [Space]Skip ",
+                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [I]nventory [C]rew [F]actions [T]rade [J]ournal [L]og [B]ridge [M]ap [Tab]Stats [Space]Skip ",
                 phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
             );
             if state.sector >= 30 {
@@ -477,6 +595,7 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
         "upgrades" => ("UPGRADES", Color::Green),
         "stats" => ("STATS", Color::Cyan),
         "map" => ("SECTOR MAP", Color::Yellow),
+        "log" => ("SHIP LOG", Color::White),
         "event" => ("EVENT", Color::Yellow),
         _ => (phase_name, phase_color),
     };
@@ -539,6 +658,52 @@ fn render_popup(frame: &mut Frame, text: &str, timer: u8) {
             cell.set_char(ch);
             cell.set_fg(fg);
             cell.set_bg(Color::Rgb(30, 30, 10));
+        }
+    }
+}
+
+fn render_pip_bubble(frame: &mut Frame, text: &str, timer: u8) {
+    let area = frame.area();
+    let buf = frame.buffer_mut();
+
+    // Small face + bubble in bottom-right, above HUD bar
+    let face = "(◕◕)";
+    let bubble = format!("\u{300c}{}\u{300d}", text);
+    let face_width = face.chars().count() as u16;
+    let bubble_width = bubble.chars().count() as u16;
+    let total_width = face_width + 1 + bubble_width;
+    let x = area.width.saturating_sub(total_width + 2);
+    let y = area.height.saturating_sub(3); // above HUD
+
+    if y == 0 || x == 0 {
+        return;
+    }
+
+    // Draw face
+    for (i, ch) in face.chars().enumerate() {
+        let cx = x + i as u16;
+        if cx < area.width && y < area.height {
+            let cell = &mut buf[(cx, y)];
+            cell.set_char(ch);
+            cell.set_fg(Color::Green); // Pip color
+        }
+    }
+
+    // Draw bubble with fade
+    let bx = x + face_width + 1;
+    let fade = if timer > 40 {
+        Color::White
+    } else if timer > 20 {
+        Color::Gray
+    } else {
+        Color::DarkGray
+    };
+    for (i, ch) in bubble.chars().enumerate() {
+        let cx = bx + i as u16;
+        if cx < area.width && y < area.height {
+            let cell = &mut buf[(cx, y)];
+            cell.set_char(ch);
+            cell.set_fg(fade);
         }
     }
 }

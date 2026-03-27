@@ -6,6 +6,7 @@ use crate::rendering::particles::{Particle, ParticleSystem};
 use crate::state::{GamePhase, GameState};
 
 use crate::engine::events::EventBus;
+use crate::engine::factions::{self, Faction, ReputationChange};
 use super::{Scene, SceneAction};
 
 // ── Planet types ────────────────────────────────────────────────────────
@@ -266,6 +267,9 @@ pub struct RaidScene {
     // Raid duration for reward calculation
     raid_duration: f32,
     elapsed: f32,
+
+    // Faction controlling this planet
+    raid_faction: Faction,
 }
 
 impl RaidScene {
@@ -287,6 +291,7 @@ impl RaidScene {
             cells_degraded: 0,
             raid_duration: 20.0,
             elapsed: 0.0,
+            raid_faction: Faction::Independent,
         }
     }
 
@@ -602,6 +607,7 @@ impl Scene for RaidScene {
 
         self.planet_type = PlanetType::pick(&mut rng);
         self.raid_duration = 15.0 + (state.sector as f32 * 0.5).min(15.0);
+        self.raid_faction = factions::sector_dominant_faction(state.sector);
 
         self.generate_terrain();
         self.generate_buildings();
@@ -837,6 +843,14 @@ impl Scene for RaidScene {
                 scrap: self.scrap_gained,
                 credits: self.credits_gained,
             });
+            // Raiding a faction's planet hurts rep with them
+            if self.raid_faction != Faction::Independent {
+                events.emit(crate::engine::events::GameEvent::FactionRepChange {
+                    faction: self.raid_faction.name().to_string(),
+                    amount: ReputationChange::RAID_PLANET,
+                    reason: "raided their planet".to_string(),
+                });
+            }
             return SceneAction::TransitionTo(GamePhase::Loot);
         }
 
@@ -1123,9 +1137,15 @@ impl Scene for RaidScene {
             PlanetType::Volcanic => "VOLCANIC",
             PlanetType::Ocean => "OCEAN",
         };
+        let faction_label = if self.raid_faction != Faction::Independent {
+            format!(" {} ", self.raid_faction.code())
+        } else {
+            String::new()
+        };
         let status = format!(
-            " RAID │ {} │ Sector {} │ {:.0}s │ +{}{} +{}₿ │ Fleet: {} │ Lv.{} ",
+            " RAID │ {}{} │ Sector {} │ {:.0}s │ +{}{} +{}₿ │ Fleet: {} │ Lv.{} ",
             planet_label,
+            faction_label,
             state.sector,
             state.phase_timer.max(0.0),
             self.scrap_gained,
