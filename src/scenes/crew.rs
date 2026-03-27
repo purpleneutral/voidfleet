@@ -772,8 +772,8 @@ fn class_color(class: CrewClass) -> Color {
     match class {
         CrewClass::Pilot => Color::Cyan,
         CrewClass::Gunner => Color::Red,
-        CrewClass::Engineer => Color::Yellow,
-        CrewClass::Medic => Color::Green,
+        CrewClass::Engineer => Color::Green,
+        CrewClass::Medic => Color::Yellow,
         CrewClass::Captain => Color::Magenta,
     }
 }
@@ -801,12 +801,10 @@ fn morale_bar(morale: u8) -> String {
 }
 
 fn morale_color(morale: u8) -> Color {
-    if morale >= 80 {
+    if morale > 70 {
         Color::Green
-    } else if morale >= 50 {
+    } else if morale >= 40 {
         Color::Yellow
-    } else if morale >= 25 {
-        Color::Rgb(255, 140, 0) // orange
     } else {
         Color::Red
     }
