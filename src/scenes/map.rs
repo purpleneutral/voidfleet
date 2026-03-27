@@ -8,8 +8,43 @@ use ratatui::{
     Frame,
 };
 
+use crate::engine::abilities::AbilityEffect;
+use crate::engine::crew::CrewClass;
 use crate::rendering::layout::centered_rect;
 use crate::state::GameState;
+
+/// Check if fleet has a Navigator with Stellar Cartography ability.
+fn has_stellar_cartography(state: &GameState) -> bool {
+    state.crew_roster.iter().any(|c| {
+        c.class == CrewClass::Navigator
+            && c.assigned_ship.is_some()
+            && c.class.available_abilities(c.level).iter().any(|a| {
+                matches!(a.effect, AbilityEffect::StellarCartography)
+            })
+    })
+}
+
+/// Format threat level based on difficulty multiplier.
+fn threat_label(difficulty: f32) -> (&'static str, Color) {
+    if difficulty >= 1.3 {
+        ("⚔ High", Color::Red)
+    } else if difficulty >= 0.9 {
+        ("⚔ Medium", Color::Yellow)
+    } else {
+        ("⚔ Low", Color::Green)
+    }
+}
+
+/// Format loot quality based on loot multiplier.
+fn loot_label(loot: f32) -> (&'static str, Color) {
+    if loot >= 1.5 {
+        ("💰 Rich", Color::Green)
+    } else if loot >= 0.9 {
+        ("💰 Moderate", Color::Yellow)
+    } else {
+        ("💰 Sparse", Color::Red)
+    }
+}
 
 // ── Route types ─────────────────────────────────────────────────────────
 
@@ -340,34 +375,47 @@ impl MapScreen {
                         Span::styled(choice.name.to_string(), name_style),
                     ]));
 
-                    // Stats line
-                    let diff_color = if choice.difficulty > 1.2 {
-                        Color::Red
-                    } else if choice.difficulty > 0.9 {
-                        Color::Yellow
-                    } else {
-                        Color::Green
-                    };
-                    let loot_color = if choice.loot > 1.5 {
-                        Color::Green
-                    } else if choice.loot > 0.9 {
-                        Color::Yellow
-                    } else {
-                        Color::Red
-                    };
+                    // Stats line — Navigator reveals details, otherwise shows ???
+                    let has_nav = has_stellar_cartography(state);
 
-                    lines.push(Line::from(vec![
-                        Span::raw("        "),
-                        Span::styled(
-                            format!("Danger: {:.0}%", choice.difficulty * 100.0),
-                            Style::default().fg(diff_color),
-                        ),
-                        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            format!("Loot: {:.0}%", choice.loot * 100.0),
-                            Style::default().fg(loot_color),
-                        ),
-                    ]));
+                    if has_nav {
+                        let (threat_text, threat_color) = threat_label(choice.difficulty);
+                        let (loot_text, loot_c) = loot_label(choice.loot);
+
+                        lines.push(Line::from(vec![
+                            Span::raw("        "),
+                            Span::styled(
+                                format!("Danger: {:.0}%", choice.difficulty * 100.0),
+                                Style::default().fg(threat_color),
+                            ),
+                            Span::styled(
+                                format!(" {}", threat_text),
+                                Style::default().fg(threat_color),
+                            ),
+                            Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                format!("Loot: {:.0}%", choice.loot * 100.0),
+                                Style::default().fg(loot_c),
+                            ),
+                            Span::styled(
+                                format!(" {}", loot_text),
+                                Style::default().fg(loot_c),
+                            ),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::raw("        "),
+                            Span::styled(
+                                "Danger: ???",
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                "Loot: ???",
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]));
+                    }
 
                     // Flavor text
                     lines.push(Line::from(Span::styled(

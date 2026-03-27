@@ -7,7 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Tabs},
 };
 
-use crate::engine::crew::{generate_crew, CrewClass, CrewMember};
+use crate::engine::crew::{generate_crew, BondType, CrewClass, CrewMember};
 use crate::rendering::layout::centered_rect;
 use crate::state::GameState;
 
@@ -775,6 +775,7 @@ fn class_color(class: CrewClass) -> Color {
         CrewClass::Engineer => Color::Green,
         CrewClass::Medic => Color::Yellow,
         CrewClass::Captain => Color::Magenta,
+        CrewClass::Navigator => Color::Blue,
     }
 }
 
@@ -943,6 +944,114 @@ fn render_crew_detail<'a>(crew: &CrewMember, state: &GameState) -> Vec<Line<'a>>
         ),
         Style::default().fg(Color::DarkGray),
     )));
+
+    lines.push(Line::from(""));
+
+    // ── Abilities ──────────────────────────────────────────
+    lines.push(Line::from(Span::styled(
+        "  Abilities:",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let all_abilities = crew.class.abilities();
+    if all_abilities.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    None",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for ability in &all_abilities {
+            let unlocked = crew.level >= ability.level_required;
+            if unlocked {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("    {} ", ability.icon),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(
+                        format!("{} (Lv.{})", ability.name, ability.level_required),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(
+                        format!(" \u{2014} {}", ability.description),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("    {} ", ability.icon),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("{} (Lv.{})", ability.name, ability.level_required),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!(" \u{2014} \u{1f512} Requires Lv.{}", ability.level_required),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+    }
+
+    // ── Bonds ──────────────────────────────────────────────
+    let mut has_bonds = false;
+    for bond in &state.crew_bonds {
+        let (other_id, is_member) = if bond.crew_a_id == crew.id {
+            (bond.crew_b_id, true)
+        } else if bond.crew_b_id == crew.id {
+            (bond.crew_a_id, true)
+        } else {
+            (0, false)
+        };
+        if !is_member || bond.bond_type == BondType::None {
+            continue;
+        }
+        if !has_bonds {
+            lines.push(Line::from(""));
+            has_bonds = true;
+        }
+        let other_name = state.crew_roster.iter()
+            .find(|c| c.id == other_id)
+            .map(|c| c.name.as_str())
+            .unwrap_or("Unknown");
+        let bond_color = match bond.bond_type {
+            BondType::BattleBrothers => Color::Green,
+            BondType::Respect => Color::Cyan,
+            BondType::Rivals => Color::Red,
+            BondType::Acquaintance => Color::Yellow,
+            BondType::None => Color::DarkGray,
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Bond: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", bond.bond_type.description()),
+                Style::default().fg(bond_color),
+            ),
+            Span::styled(
+                format!(" with {}", other_name),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+
+    // Grief/vengeance status
+    if crew.grief_battles_remaining > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  \u{1f494} Grieving ({} battles left)", crew.grief_battles_remaining),
+            Style::default().fg(Color::Magenta),
+        )));
+    }
+    if crew.vengeance_battles_remaining > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  \u{1f525} Vengeance ({} battles left)", crew.vengeance_battles_remaining),
+            Style::default().fg(Color::Red),
+        )));
+    }
 
     lines
 }

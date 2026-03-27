@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::engine::crew::CrewMember;
+use crate::engine::crew::{CrewBond, CrewMember};
 use crate::engine::equipment::{Equipment, SetBonus, SET_BONUSES};
 use crate::engine::ship::{Ship, ShipType};
 
@@ -99,6 +99,8 @@ pub struct GameState {
     pub crew_capacity: usize,
     #[serde(default)]
     pub next_crew_id: u64,
+    #[serde(default)]
+    pub crew_bonds: Vec<CrewBond>,
 
     // Transient (not saved)
     #[serde(skip)]
@@ -170,6 +172,7 @@ impl GameState {
             crew_roster: Vec::new(),
             crew_capacity: 5,
             next_crew_id: 1,
+            crew_bonds: Vec::new(),
             pending_popups: Vec::new(),
             pending_loot: Vec::new(),
         }
@@ -395,6 +398,7 @@ impl GameState {
         self.phase_timer = 45.0;
         self.inventory.clear();
         self.crew_roster.clear();
+        self.crew_bonds.clear();
         self.next_crew_id = 1;
         // Keep: achievements, deaths, highest_sector, prestige_level, totals, time_played, inventory_capacity, crew_capacity
         true

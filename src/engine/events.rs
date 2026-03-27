@@ -44,6 +44,15 @@ pub enum GameEvent {
     // Raid
     RaidStarted { planet_type: String },
     RaidCompleted { scrap: u64, credits: u64 },
+
+    // Crew relationships
+    CrewAbilityTriggered { crew_name: String, ability_name: String, icon: char },
+    CrewBondFormed { crew_a: String, crew_b: String, bond_type: String },
+    CrewGrief { survivor: String, fallen: String },
+    CrewVengeance { crew_name: String },
+    CrewDeserted { crew_name: String },
+    CrewMoraleChange { crew_id: u64, amount: i8 },
+    CrewBondProgress { crew_a_id: u64, crew_b_id: u64, amount: u32 },
 }
 
 // ── Event Bus ───────────────────────────────────────────────────────────────
@@ -205,6 +214,37 @@ pub fn process_events(
             GameEvent::RaidCompleted { scrap, credits } => {
                 state.total_raids += 1;
                 let _ = (scrap, credits); // amounts already applied in raid scene
+            }
+            // Crew relationship events
+            GameEvent::CrewBondFormed { crew_a, crew_b, bond_type } => {
+                *popup_text = Some(format!("⚔ {} & {}: {}!", crew_a, crew_b, bond_type));
+                *popup_timer = 60;
+            }
+            GameEvent::CrewGrief { survivor, fallen } => {
+                *popup_text = Some(format!("💔 {} grieves for {}...", survivor, fallen));
+                *popup_timer = 70;
+            }
+            GameEvent::CrewVengeance { crew_name } => {
+                *popup_text = Some(format!("🔥 {} burns with vengeance!", crew_name));
+                *popup_timer = 60;
+            }
+            GameEvent::CrewDeserted { crew_name } => {
+                *popup_text = Some(format!("🚪 {} has deserted the crew!", crew_name));
+                *popup_timer = 80;
+            }
+            GameEvent::CrewMoraleChange { crew_id, amount } => {
+                if let Some(crew) = state.crew_roster.iter_mut().find(|c| c.id == *crew_id) {
+                    if *amount >= 0 {
+                        crew.morale = crew.morale.saturating_add(*amount as u8).min(100);
+                    } else {
+                        crew.morale = crew.morale.saturating_sub(amount.unsigned_abs());
+                    }
+                }
+            }
+            GameEvent::CrewBondProgress { crew_a_id, crew_b_id, amount } => {
+                if let Some(idx) = crate::engine::crew::find_bond(&state.crew_bonds, *crew_a_id, *crew_b_id) {
+                    state.crew_bonds[idx].battles_together += amount;
+                }
             }
             // Other events are logged to history but don't trigger cross-system effects yet.
             _ => {}

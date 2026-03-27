@@ -1,3 +1,4 @@
+pub mod abilities;
 pub mod achievements;
 pub mod combat;
 pub mod crew;

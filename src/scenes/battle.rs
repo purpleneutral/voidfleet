@@ -2,7 +2,9 @@ use rand::Rng;
 use ratatui::style::Color;
 use ratatui::Frame;
 
+use crate::engine::abilities::{AbilityContext, AbilityEffect};
 use crate::engine::combat::{effective_damage, effective_hp, fire_rate};
+use crate::engine::crew::CrewClass;
 use crate::engine::equipment::{generate_equipment, Equipment, Rarity};
 use crate::engine::procedural::{generate_enemy_fleet_adaptive, difficulty_modifier, post_death_modifier};
 use crate::engine::ship::{Ship, ShipAbility, ShipType};
@@ -310,6 +312,12 @@ struct PlayerShipState {
     beam_charge: u32,
     /// Beam weapon active timer (ticks remaining, 0 = inactive). Renders beam across screen.
     beam_active: u32,
+    /// Crew ability: untargetable ticks remaining (evasive maneuvers).
+    untargetable_ticks: u32,
+    /// Crew ability: lock-on guaranteed crit for first projectile.
+    lock_on_active: bool,
+    /// Crew ability: number of barrage extra shots pending.
+    barrage_pending: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +396,23 @@ pub struct BattleScene {
     pending_drops: Vec<Equipment>,
     /// Active "CRIT!" text overlays.
     crit_texts: Vec<CritText>,
+    /// Crew ability: rally damage bonus (from Captain).
+    rally_bonus: f32,
+    /// Crew ability: rally ticks remaining.
+    rally_ticks: u32,
+    /// Crew ability: revive already used this battle.
+    revive_used: bool,
+    /// Crew ability: floating ability text popups.
+    ability_texts: Vec<AbilityText>,
+}
+
+/// Floating ability trigger text that drifts upward and fades.
+struct AbilityText {
+    x: f32,
+    y: f32,
+    text: String,
+    color: Color,
+    life: u8,
 }
 
 impl BattleScene {
@@ -410,6 +435,10 @@ impl BattleScene {
             has_scan: false,
             pending_drops: Vec::new(),
             crit_texts: Vec::new(),
+            rally_bonus: 0.0,
+            rally_ticks: 0,
+            revive_used: false,
+            ability_texts: Vec::new(),
         }
     }
 
@@ -1246,9 +1275,17 @@ impl Scene for BattleScene {
                     shield_timer: 0,
                     beam_charge: 0,
                     beam_active: 0,
+                    untargetable_ticks: 0,
+                    lock_on_active: false,
+                    barrage_pending: 0,
                 }
             })
             .collect();
+
+        self.rally_bonus = 0.0;
+        self.rally_ticks = 0;
+        self.revive_used = false;
+        self.ability_texts.clear();
     }
 
     fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem, events: &mut EventBus) -> SceneAction {
@@ -1260,6 +1297,12 @@ impl Scene for BattleScene {
             if self.slide_progress >= 1.0 {
                 self.slide_progress = 1.0;
                 self.phase = BattlePhase::Combat;
+                // Reset crew battle state when combat begins
+                for crew in &mut state.crew_roster {
+                    if crew.assigned_ship.is_some() {
+                        crew.reset_battle_state();
+                    }
+                }
             }
             // During slide-in, enemies also slide from right
             let slide = self.slide_progress;
@@ -1321,6 +1364,210 @@ impl Scene for BattleScene {
             ct.life = ct.life.saturating_sub(1);
             ct.life > 0
         });
+
+        // ── Update ability texts ───────────────────────────────────────
+        self.ability_texts.retain_mut(|at| {
+            at.y -= 0.12;
+            at.life = at.life.saturating_sub(1);
+            at.life > 0
+        });
+
+        // ── Update rally timer ─────────────────────────────────────────
+        if self.rally_ticks > 0 {
+            self.rally_ticks -= 1;
+            if self.rally_ticks == 0 {
+                self.rally_bonus = 0.0;
+            }
+        }
+
+        // ── Crew abilities: tick cooldowns and check triggers ──────────
+        {
+            let positions = self.player_positions(&state.fleet);
+
+            // Collect ability actions first to avoid borrow conflicts
+            struct AbilityAction {
+                ship_idx: usize,
+                crew_idx: usize,
+                ability_idx: usize,
+                effect: AbilityEffect,
+                crew_name: String,
+                ability_name: String,
+                icon: char,
+                px: f32,
+                py: f32,
+            }
+            let mut actions: Vec<AbilityAction> = Vec::new();
+
+            for (i, ship) in state.fleet.iter().enumerate() {
+                if !ship.is_alive() || i >= self.player_states.len() || i >= positions.len() {
+                    continue;
+                }
+                let crew_id = match ship.crew_id {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let crew_idx = match state.crew_roster.iter().position(|c| c.id == crew_id) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+
+                // Tick cooldowns
+                state.crew_roster[crew_idx].tick_cooldowns();
+
+                // Build context
+                let hp_pct = if ship.max_hp() > 0 {
+                    ship.current_hp as f32 / ship.max_hp() as f32
+                } else {
+                    1.0
+                };
+                let context = AbilityContext {
+                    ship_hp_percent: hp_pct,
+                    battle_started: self.tick_count <= 2,
+                    ally_just_destroyed: false,
+                    enemy_just_killed: false,
+                    shot_fired: false,
+                };
+
+                let triggered = state.crew_roster[crew_idx].check_abilities(&context);
+                let crew_name = state.crew_roster[crew_idx].name.clone();
+                let (px, py) = positions[i];
+
+                for (ability_idx, ability) in triggered {
+                    actions.push(AbilityAction {
+                        ship_idx: i,
+                        crew_idx,
+                        ability_idx,
+                        effect: ability.effect.clone(),
+                        crew_name: crew_name.clone(),
+                        ability_name: ability.name.clone(),
+                        icon: ability.icon,
+                        px,
+                        py,
+                    });
+                }
+            }
+
+            // Now apply all actions
+            for action in actions {
+                let i = action.ship_idx;
+                match &action.effect {
+                    AbilityEffect::PassiveRegen { hp_per_tick } => {
+                        let ship = &mut state.fleet[i];
+                        ship.current_hp = (ship.current_hp as f32 + hp_per_tick).min(ship.max_hp() as f32) as u32;
+                    }
+                    AbilityEffect::EvasiveManeuvers { untargetable_ticks } => {
+                        self.player_states[i].untargetable_ticks = *untargetable_ticks;
+                        state.crew_roster[action.crew_idx].activate_ability(action.ability_idx);
+                        self.ability_texts.push(AbilityText {
+                            x: action.px, y: action.py - 1.0,
+                            text: "\u{26a1} EVASIVE!".to_string(),
+                            color: Color::Cyan, life: 15,
+                        });
+                        events.emit(crate::engine::events::GameEvent::CrewAbilityTriggered {
+                            crew_name: action.crew_name, ability_name: action.ability_name, icon: action.icon,
+                        });
+                    }
+                    AbilityEffect::EmergencyRepair { heal_percent } => {
+                        let ship = &mut state.fleet[i];
+                        let heal = (ship.max_hp() as f32 * heal_percent) as u32;
+                        ship.current_hp = (ship.current_hp + heal).min(ship.max_hp());
+                        state.crew_roster[action.crew_idx].activate_ability(action.ability_idx);
+                        self.ability_texts.push(AbilityText {
+                            x: action.px, y: action.py - 1.0,
+                            text: "\u{1f527} REPAIR!".to_string(),
+                            color: Color::Green, life: 15,
+                        });
+                        particles.explode(action.px, action.py, 8, Color::Green);
+                        events.emit(crate::engine::events::GameEvent::CrewAbilityTriggered {
+                            crew_name: action.crew_name, ability_name: action.ability_name, icon: action.icon,
+                        });
+                    }
+                    AbilityEffect::LockOn { guaranteed_crit: true } => {
+                        self.player_states[i].lock_on_active = true;
+                        state.crew_roster[action.crew_idx].activate_ability(action.ability_idx);
+                        self.ability_texts.push(AbilityText {
+                            x: action.px, y: action.py - 1.0,
+                            text: "\u{1f3af} LOCK-ON!".to_string(),
+                            color: Color::Red, life: 15,
+                        });
+                        events.emit(crate::engine::events::GameEvent::CrewAbilityTriggered {
+                            crew_name: action.crew_name, ability_name: action.ability_name, icon: action.icon,
+                        });
+                    }
+                    AbilityEffect::Rally { damage_bonus, duration_ticks } => {
+                        self.rally_bonus = *damage_bonus;
+                        self.rally_ticks = *duration_ticks;
+                        state.crew_roster[action.crew_idx].activate_ability(action.ability_idx);
+                        self.ability_texts.push(AbilityText {
+                            x: action.px, y: action.py - 1.0,
+                            text: "\u{2694} RALLY!".to_string(),
+                            color: Color::Rgb(255, 200, 50), life: 20,
+                        });
+                        particles.explode(action.px, action.py, 10, Color::Rgb(255, 200, 50));
+                        events.emit(crate::engine::events::GameEvent::CrewAbilityTriggered {
+                            crew_name: action.crew_name, ability_name: action.ability_name, icon: action.icon,
+                        });
+                    }
+                    AbilityEffect::Inspire { min_morale } => {
+                        let min_m = *min_morale;
+                        for crew in &mut state.crew_roster {
+                            if crew.assigned_ship.is_some() && crew.morale < min_m {
+                                crew.morale = min_m;
+                            }
+                        }
+                    }
+                    AbilityEffect::Triage { heal_per_tick, target } => {
+                        // Find the ship with lowest HP%
+                        let mut lowest_idx: Option<usize> = None;
+                        let mut lowest_pct = f32::MAX;
+                        for (si, s) in state.fleet.iter().enumerate() {
+                            if !s.is_alive() || s.current_hp >= s.max_hp() {
+                                continue;
+                            }
+                            let pct = match target {
+                                crate::engine::abilities::TriageTarget::LowestPercent => {
+                                    s.current_hp as f32 / s.max_hp() as f32
+                                }
+                                crate::engine::abilities::TriageTarget::LowestHP => {
+                                    s.current_hp as f32
+                                }
+                            };
+                            if pct < lowest_pct {
+                                lowest_pct = pct;
+                                lowest_idx = Some(si);
+                            }
+                        }
+                        if let Some(si) = lowest_idx {
+                            let heal = *heal_per_tick;
+                            let target_ship = &mut state.fleet[si];
+                            target_ship.current_hp = (target_ship.current_hp as f32 + heal)
+                                .min(target_ship.max_hp() as f32) as u32;
+                            // Green line particle from medic to patient (every 20 ticks)
+                            if self.tick_count.is_multiple_of(20) && si < positions.len() {
+                                let (tx, ty) = positions[si];
+                                particles.emit(Particle::new(
+                                    action.px, action.py, (tx - action.px) * 0.05, (ty - action.py) * 0.05,
+                                    10, '+', Color::Green,
+                                ));
+                            }
+                        }
+                    }
+                    AbilityEffect::ShieldOverclock { .. } => {
+                        // Passive shield bonus — handled via crew_shield_modifier
+                    }
+                    _ => {
+                        // Other effects (Afterburner, HomingShots, etc.) — future implementation
+                    }
+                }
+            }
+
+            // Decrement untargetable ticks
+            for ps in self.player_states.iter_mut() {
+                if ps.untargetable_ticks > 0 {
+                    ps.untargetable_ticks -= 1;
+                }
+            }
+        }
 
         // ── Update death animations ────────────────────────────────────
         for e in self.enemies.iter_mut() {
@@ -1716,10 +1963,11 @@ impl Scene for BattleScene {
                     _ => 1.2 + ship.speed() * 0.08,
                 };
 
-                // Tech-aware damage + pip combat bonus + crew modifier
+                // Tech-aware damage + pip combat bonus + crew modifier + rally
                 let crew = state.get_ship_crew(i);
                 let crew_mod = crate::engine::crew::crew_damage_modifier(crew);
-                let dmg = (effective_damage(ship, tech_lasers) as f32 * pip_bonus * crew_mod) as u32;
+                let rally_mult = 1.0 + self.rally_bonus;
+                let dmg = (effective_damage(ship, tech_lasers) as f32 * pip_bonus * crew_mod * rally_mult) as u32;
 
                 // Smart targeting: aim toward selected enemy
                 let target_idx = Self::player_select_target(ship, &self.enemies);
@@ -1752,16 +2000,69 @@ impl Scene for BattleScene {
                     -1.0
                 };
 
+                // Check for lock-on crit (crew ability)
+                let lock_on_dmg = if i < self.player_states.len() && self.player_states[i].lock_on_active {
+                    self.player_states[i].lock_on_active = false;
+                    dmg * 2 // guaranteed crit
+                } else {
+                    dmg
+                };
+
                 self.projectiles.push(Projectile {
                     x: muzzle_x,
                     y: py,
                     vx: speed,
                     vy,
-                    damage: dmg,
+                    damage: lock_on_dmg,
                     friendly: true,
                     kind,
                     homing_target_y: homing_y,
                 });
+
+                // Check for barrage extra shots (crew ability — EveryNShots)
+                if i < self.player_states.len() {
+                    // Record shot for EveryNShots tracking
+                    if let Some(crew_id) = ship.crew_id {
+                        if let Some(crew) = state.crew_roster.iter_mut().find(|c| c.id == crew_id) {
+                            crew.record_shot();
+                            // Check if barrage triggers
+                            let barrage_abilities = crew.class.available_abilities(crew.level);
+                            for ability in &barrage_abilities {
+                                if let AbilityEffect::Barrage { extra_shots } = &ability.effect {
+                                    if let crate::engine::abilities::AbilityTrigger::EveryNShots(n) = ability.trigger {
+                                        if n > 0 && crew.shot_counter % n as u32 == 0 {
+                                            // Fire extra projectiles at vy offsets
+                                            let offsets = [-0.2_f32, 0.2];
+                                            for (_si, &y_off) in offsets.iter().enumerate().take(*extra_shots as usize) {
+                                                self.projectiles.push(Projectile {
+                                                    x: muzzle_x,
+                                                    y: py + y_off,
+                                                    vx: speed,
+                                                    vy: vy + y_off,
+                                                    damage: dmg,
+                                                    friendly: true,
+                                                    kind,
+                                                    homing_target_y: homing_y,
+                                                });
+                                            }
+                                            self.ability_texts.push(AbilityText {
+                                                x: px, y: py - 1.0,
+                                                text: "💥 BARRAGE!".to_string(),
+                                                color: Color::Red,
+                                                life: 12,
+                                            });
+                                            events.emit(crate::engine::events::GameEvent::CrewAbilityTriggered {
+                                                crew_name: crew.name.clone(),
+                                                ability_name: "Barrage".to_string(),
+                                                icon: '💥',
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 Self::emit_muzzle_flash(particles, muzzle_x, py, true);
                 self.player_states[i].fire_cooldown = fire_rate(ship, tech_engines);
@@ -2013,6 +2314,10 @@ impl Scene for BattleScene {
                 if !ship.is_alive() || si >= positions.len() {
                     continue;
                 }
+                // Skip untargetable ships (evasive maneuvers)
+                if si < self.player_states.len() && self.player_states[si].untargetable_ticks > 0 {
+                    continue;
+                }
                 let (sx, sy) = positions[si];
                 let sprite = ship.ship_type.sprite();
                 let sprite_w = sprite[0].chars().count() as f32;
@@ -2051,24 +2356,63 @@ impl Scene for BattleScene {
                         Color::White,
                     ));
 
-                    // Death? Start death animation
+                    // Death? Check for Revive, then start death animation
                     if !ship.is_alive() && si < self.player_states.len() {
-                        self.player_states[si].death_frame = 1;
-                        let is_big = matches!(
-                            ship.ship_type,
-                            ShipType::Destroyer
-                                | ShipType::Capital
-                                | ShipType::Carrier
-                                | ShipType::Frigate
-                        );
-                        if !is_big {
-                            Self::chain_explosion(
-                                particles,
-                                sx + sprite_w / 2.0,
-                                sy,
-                                false,
+                        // Check if a Medic with Revive can save this ship
+                        let mut revived = false;
+                        if !self.revive_used {
+                            for crew in state.crew_roster.iter() {
+                                if crew.class == CrewClass::Medic
+                                    && crew.assigned_ship.is_some()
+                                    && crew.assigned_ship != Some(si) // medic can't revive own ship
+                                {
+                                    let revive_abilities = crew.class.available_abilities(crew.level);
+                                    for ability in &revive_abilities {
+                                        if let AbilityEffect::Revive { hp_percent } = &ability.effect {
+                                            // Revive!
+                                            ship.current_hp = (ship.max_hp() as f32 * hp_percent) as u32;
+                                            self.revive_used = true;
+                                            revived = true;
+                                            // White flash + particles
+                                            self.player_states[si].flash = 6;
+                                            particles.explode(sx + sprite_w / 2.0, sy, 15, Color::White);
+                                            self.ability_texts.push(AbilityText {
+                                                x: sx, y: sy - 1.0,
+                                                text: "✦ REVIVE!".to_string(),
+                                                color: Color::White,
+                                                life: 20,
+                                            });
+                                            events.emit(crate::engine::events::GameEvent::CrewAbilityTriggered {
+                                                crew_name: crew.name.clone(),
+                                                ability_name: "Revive".to_string(),
+                                                icon: '✦',
+                                            });
+                                            break;
+                                        }
+                                    }
+                                    if revived { break; }
+                                }
+                            }
+                        }
+
+                        if !revived {
+                            self.player_states[si].death_frame = 1;
+                            let is_big = matches!(
+                                ship.ship_type,
+                                ShipType::Destroyer
+                                    | ShipType::Capital
+                                    | ShipType::Carrier
+                                    | ShipType::Frigate
                             );
-                            self.player_states[si].death_exploded = true;
+                            if !is_big {
+                                Self::chain_explosion(
+                                    particles,
+                                    sx + sprite_w / 2.0,
+                                    sy,
+                                    false,
+                                );
+                                self.player_states[si].death_exploded = true;
+                            }
                         }
                     }
                     break;
@@ -2468,6 +2812,74 @@ impl Scene for BattleScene {
                         let cell = &mut buf[(area.x + x, area.y + cy)];
                         cell.set_char(ch);
                         cell.set_fg(gold);
+                    }
+                }
+            }
+        }
+
+        // ── Ability text overlays ─────────────────────────────────────
+        for at in &self.ability_texts {
+            let ax = at.x as u16;
+            let ay = at.y as u16;
+            if ay < area.height {
+                let fade = if at.life > 8 { at.color } else {
+                    // Fade toward dark
+                    match at.color {
+                        Color::Rgb(r, g, b) => Color::Rgb(r / 2, g / 2, b / 2),
+                        c => c,
+                    }
+                };
+                for (i, ch) in at.text.chars().enumerate() {
+                    let x = ax.wrapping_add(i as u16);
+                    if x < area.width {
+                        let cell = &mut buf[(area.x + x, area.y + ay)];
+                        cell.set_char(ch);
+                        cell.set_fg(fade);
+                    }
+                }
+            }
+        }
+
+        // ── Untargetable ship blinking ────────────────────────────────
+        let positions_render = self.player_positions(&state.fleet);
+        for (i, ship) in state.fleet.iter().enumerate() {
+            if !ship.is_alive() || i >= self.player_states.len() || i >= positions_render.len() {
+                continue;
+            }
+            if self.player_states[i].untargetable_ticks > 0 && self.tick_count % 4 < 2 {
+                // Blink effect: draw ship transparent (skip every other frame)
+                let (fx, fy) = positions_render[i];
+                let sprite = ship.ship_type.sprite();
+                for (row, line) in sprite.iter().enumerate() {
+                    let sy = (fy + row as f32) as u16;
+                    for (col, _ch) in line.chars().enumerate() {
+                        let sx = (fx + col as f32) as u16;
+                        if sx < area.width && sy < area.height {
+                            let cell = &mut buf[(area.x + sx, area.y + sy)];
+                            cell.set_fg(Color::DarkGray);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Rally active indicator ────────────────────────────────────
+        if self.rally_ticks > 0 {
+            let rally_text = "⚔ RALLY ACTIVE";
+            let rx = area.width.saturating_sub(rally_text.len() as u16 + 2);
+            let ry = 1;
+            if ry < area.height {
+                let pulse = if self.tick_count % 6 < 3 {
+                    Color::Rgb(255, 200, 50)
+                } else {
+                    Color::Rgb(200, 150, 30)
+                };
+                for (i, ch) in rally_text.chars().enumerate() {
+                    let x = rx + i as u16;
+                    if x < area.width {
+                        let cell = &mut buf[(area.x + x, area.y + ry)];
+                        cell.set_char(ch);
+                        cell.set_fg(pulse);
                     }
                 }
             }

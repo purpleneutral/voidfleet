@@ -5,7 +5,7 @@ use rand::prelude::Distribution;
 use ratatui::Frame;
 use ratatui::style::{Color, Style};
 
-use crate::engine::crew::generate_crew;
+use crate::engine::crew::{generate_crew, CrewClass};
 use crate::engine::equipment::{generate_equipment, Equipment, Rarity};
 use crate::engine::ship::{Ship, ShipType};
 use crate::rendering::particles::ParticleSystem;
@@ -13,6 +13,11 @@ use crate::rendering::starfield::Starfield;
 use crate::state::{GamePhase, GameState};
 use crate::engine::events::EventBus;
 use super::{Scene, SceneAction};
+
+/// Check if the fleet has an assigned Navigator.
+fn fleet_has_navigator(state: &GameState) -> bool {
+    state.crew_roster.iter().any(|c| c.class == CrewClass::Navigator && c.assigned_ship.is_some())
+}
 
 // ── Collectibles ──────────────────────────────────────────────
 
@@ -204,6 +209,14 @@ enum EventOutcome {
     TradeEquipment { item: Equipment, scrap_cost: u64 },
     /// Gain a crew member for free.
     GainCrew,
+    /// Morale change for a specific crew member.
+    CrewMoraleChange { crew_id: u64, amount: i8 },
+    /// Bond progress between two crew members.
+    CrewBondProgress { crew_a_id: u64, crew_b_id: u64, amount: u32 },
+    /// Skip next battle for a crew member (shore leave).
+    CrewShoreLeave { crew_id: u64 },
+    /// Crew deserts (removed from roster).
+    CrewDesert { crew_id: u64 },
 }
 
 struct TravelEvent {
@@ -247,10 +260,16 @@ enum EventType {
     CosmicStorm,
     MysteriousTrader,
     StrandedCrew,
+    // Crew-specific events
+    CrewSpotsCache,
+    CrewChallenge,
+    CrewArguing,
+    CrewDetectsSignal,
+    CrewHomesick,
 }
 
 impl EventType {
-    const ALL: [EventType; 9] = [
+    const ALL: [EventType; 14] = [
         EventType::DistressSignal,
         EventType::AbandonedWreck,
         EventType::TradingPost,
@@ -260,6 +279,11 @@ impl EventType {
         EventType::CosmicStorm,
         EventType::MysteriousTrader,
         EventType::StrandedCrew,
+        EventType::CrewSpotsCache,
+        EventType::CrewChallenge,
+        EventType::CrewArguing,
+        EventType::CrewDetectsSignal,
+        EventType::CrewHomesick,
     ];
 }
 
@@ -339,6 +363,46 @@ fn event_weights(state: &GameState, last_event: Option<EventType>) -> Vec<(Event
                     3.0 // high priority when no crew
                 } else {
                     1.0
+                }
+            }
+            EventType::CrewSpotsCache => {
+                use crate::engine::crew::crew_eligible_spotter;
+                if state.crew_roster.iter().any(|c| c.assigned_ship.is_some() && crew_eligible_spotter(c)) {
+                    1.5
+                } else {
+                    0.0
+                }
+            }
+            EventType::CrewChallenge => {
+                use crate::engine::crew::crew_eligible_challenger;
+                if state.crew_roster.iter().any(|c| c.assigned_ship.is_some() && crew_eligible_challenger(c)) {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            EventType::CrewArguing => {
+                use crate::engine::crew::find_conflicting_pair;
+                if find_conflicting_pair(&state.crew_roster).is_some() {
+                    1.5
+                } else {
+                    0.0
+                }
+            }
+            EventType::CrewDetectsSignal => {
+                use crate::engine::crew::crew_eligible_signal_detector;
+                if state.crew_roster.iter().any(|c| c.assigned_ship.is_some() && crew_eligible_signal_detector(c)) {
+                    1.2
+                } else {
+                    0.0
+                }
+            }
+            EventType::CrewHomesick => {
+                use crate::engine::crew::crew_eligible_homesick;
+                if state.crew_roster.iter().any(|c| c.assigned_ship.is_some() && crew_eligible_homesick(c)) {
+                    2.0
+                } else {
+                    0.0
                 }
             }
         };
@@ -422,9 +486,10 @@ fn generate_random_event(state: &GameState, last_event: Option<EventType>) -> (T
             )
         }
         EventType::TradingPost => {
-            // Prices scale with sector
-            let heal_cost = (100.0 * (1.0 + state.sector as f32 / 30.0)) as u64;
-            let sell_scrap = (50.0 * (1.0 + state.sector as f32 / 40.0)) as u64;
+            // Prices scale with sector; Navigator gives 10% discount
+            let nav_discount = if fleet_has_navigator(state) { 0.90 } else { 1.0 };
+            let heal_cost = (100.0 * (1.0 + state.sector as f32 / 30.0) * nav_discount) as u64;
+            let sell_scrap = (50.0 * (1.0 + state.sector as f32 / 40.0) * nav_discount) as u64;
             let sell_credits = (80.0 * scale) as u64;
             TravelEvent::new(
                 "💰 Trading Post",
@@ -578,6 +643,124 @@ fn generate_random_event(state: &GameState, last_event: Option<EventType>) -> (T
                 ],
             )
         }
+
+        // ── Crew-specific events ─────────────────────────────
+        EventType::CrewSpotsCache => {
+            use crate::engine::crew::crew_eligible_spotter;
+            let spotter = state.crew_roster.iter()
+                .find(|c| c.assigned_ship.is_some() && crew_eligible_spotter(c));
+            let (name, crew_id) = match spotter {
+                Some(c) => (c.name.clone(), c.id),
+                None => ("A crew member".to_string(), 0),
+            };
+            let scrap_amount = ((rng.gen_range(80..200) as f32) * scale) as u64;
+            let equip_outcome = {
+                let item = generate_equipment(state.sector, None);
+                EventOutcome::GainEquipment(item)
+            };
+            TravelEvent::new(
+                &format!("🔍 {} Spots Hidden Cache", name),
+                &format!("{} notices something on the scanners...\nA concealed supply cache, tucked behind an asteroid.", name),
+                vec![
+                    (format!("Investigate (+{}◇ or equipment)", scrap_amount),
+                     if rng.gen_bool(0.5) { EventOutcome::GainScrap(scrap_amount) } else { equip_outcome }),
+                    ("Too risky, move on".into(), EventOutcome::CrewMoraleChange { crew_id, amount: -5 }),
+                ],
+            )
+        }
+        EventType::CrewChallenge => {
+            use crate::engine::crew::crew_eligible_challenger;
+            let challenger = state.crew_roster.iter()
+                .find(|c| c.assigned_ship.is_some() && crew_eligible_challenger(c));
+            let (name, crew_id) = match challenger {
+                Some(c) => (c.name.clone(), c.id),
+                None => ("A crew member".to_string(), 0),
+            };
+            let win = rng.gen_bool(0.6);
+            TravelEvent::new(
+                &format!("💪 {}'s Challenge", name),
+                &format!("{} wants to challenge a rival at the next stop.\n\"I can take 'em, Captain. Trust me.\"", name),
+                vec![
+                    ("Accept the challenge".into(),
+                     if win {
+                         EventOutcome::GainCredits(200)
+                     } else {
+                         EventOutcome::LoseScrap(100)
+                     }),
+                    ("Decline".into(), EventOutcome::CrewMoraleChange { crew_id, amount: -5 }),
+                ],
+            )
+        }
+        EventType::CrewArguing => {
+            use crate::engine::crew::find_conflicting_pair;
+            let pair = find_conflicting_pair(&state.crew_roster);
+            let (name_a, id_a, name_b, id_b) = match pair {
+                Some((i, j)) => (
+                    state.crew_roster[i].name.clone(), state.crew_roster[i].id,
+                    state.crew_roster[j].name.clone(), state.crew_roster[j].id,
+                ),
+                None => ("Crew A".to_string(), 0, "Crew B".to_string(), 0),
+            };
+            TravelEvent::new(
+                &format!("😤 {} and {} Arguing", name_a, name_b),
+                &format!("{} and {} are at each other's throats.\nThe tension is affecting the whole crew.", name_a, name_b),
+                vec![
+                    (format!("Side with {}", name_a), EventOutcome::CrewMoraleChange { crew_id: id_b, amount: -15 }),
+                    (format!("Side with {}", name_b), EventOutcome::CrewMoraleChange { crew_id: id_a, amount: -15 }),
+                    ("Mediate".into(), EventOutcome::CrewBondProgress { crew_a_id: id_a, crew_b_id: id_b, amount: 5 }),
+                ],
+            )
+        }
+        EventType::CrewDetectsSignal => {
+            use crate::engine::crew::crew_eligible_signal_detector;
+            let detector = state.crew_roster.iter()
+                .find(|c| c.assigned_ship.is_some() && crew_eligible_signal_detector(c));
+            let name = match detector {
+                Some(c) => c.name.clone(),
+                None => "A crew member".to_string(),
+            };
+            let is_good = rng.gen_bool(0.7);
+            let good_outcome = if rng.gen_bool(0.5) {
+                let item = generate_equipment(state.sector, None);
+                EventOutcome::GainEquipment(item)
+            } else {
+                let scrap_amount = ((rng.gen_range(100..300) as f32) * scale) as u64;
+                EventOutcome::GainScrap(scrap_amount)
+            };
+            TravelEvent::new(
+                &format!("📡 {} Detects Signal", name),
+                &format!("{} picks up a faint transmission.\n\"Could be a supply drop... or a trap.\"", name),
+                vec![
+                    ("Investigate the signal".into(),
+                     if is_good { good_outcome } else { EventOutcome::StartBattle }),
+                    ("Ignore it".into(), EventOutcome::Nothing),
+                ],
+            )
+        }
+        EventType::CrewHomesick => {
+            use crate::engine::crew::crew_eligible_homesick;
+            let homesick = state.crew_roster.iter()
+                .find(|c| c.assigned_ship.is_some() && crew_eligible_homesick(c));
+            let (name, crew_id) = match homesick {
+                Some(c) => (c.name.clone(), c.id),
+                None => ("A crew member".to_string(), 0),
+            };
+            let desert_roll = rng.gen_bool(0.05);
+            TravelEvent::new(
+                &format!("🌙 {} Homesick", name),
+                &format!("{} has been staring out the viewport for hours.\nYou can see the weight of the void in their eyes.", name),
+                vec![
+                    ("Comfort them".into(), EventOutcome::CrewMoraleChange { crew_id, amount: 20 }),
+                    ("Give shore leave (skip 1 battle)".into(), EventOutcome::CrewShoreLeave { crew_id }),
+                    ("Ignore".into(),
+                     if desert_roll {
+                         EventOutcome::CrewDesert { crew_id }
+                     } else {
+                         EventOutcome::CrewMoraleChange { crew_id, amount: -10 }
+                     }),
+                ],
+            )
+        }
     };
 
     (event, event_type)
@@ -643,6 +826,9 @@ pub struct TravelScene {
     event: Option<TravelEvent>,
     event_checked: bool, // true once we've rolled for an event this travel phase
     last_event_type: Option<EventType>, // prevents same event twice in a row
+
+    // Navigator shortcut
+    navigator_shortcut_checked: bool,
 }
 
 impl TravelScene {
@@ -666,6 +852,7 @@ impl TravelScene {
             event: None,
             event_checked: false,
             last_event_type: None,
+            navigator_shortcut_checked: false,
         }
     }
 
@@ -1063,6 +1250,66 @@ fn apply_event_outcome(outcome: EventOutcome, state: &mut GameState, _label: &st
                 "Crew roster is full!".to_string()
             }
         }
+        EventOutcome::CrewMoraleChange { crew_id, amount } => {
+            if let Some(crew) = state.crew_roster.iter_mut().find(|c| c.id == crew_id) {
+                let name = crew.name.clone();
+                if amount >= 0 {
+                    crew.morale = crew.morale.saturating_add(amount as u8).min(100);
+                    format!("{} morale +{}!", name, amount)
+                } else {
+                    crew.morale = crew.morale.saturating_sub(amount.unsigned_abs());
+                    format!("{} morale {}.", name, amount)
+                }
+            } else {
+                "No effect.".to_string()
+            }
+        }
+        EventOutcome::CrewBondProgress { crew_a_id, crew_b_id, amount } => {
+            if let Some(idx) = crate::engine::crew::find_bond(&state.crew_bonds, crew_a_id, crew_b_id) {
+                state.crew_bonds[idx].battles_together += amount;
+                "Tensions eased. Bond progressed.".to_string()
+            } else {
+                // Both lose a bit of morale from the mediation
+                for crew in &mut state.crew_roster {
+                    if crew.id == crew_a_id || crew.id == crew_b_id {
+                        crew.morale = crew.morale.saturating_sub(5);
+                    }
+                }
+                "You mediated. Both calmed down.".to_string()
+            }
+        }
+        EventOutcome::CrewShoreLeave { crew_id } => {
+            if let Some(crew) = state.crew_roster.iter_mut().find(|c| c.id == crew_id) {
+                let name = crew.name.clone();
+                crew.morale = 100;
+                // Temporarily unassign — they'll miss 1 battle
+                if let Some(ship_idx) = crew.assigned_ship.take() {
+                    if ship_idx < state.fleet.len() {
+                        state.fleet[ship_idx].crew_id = None;
+                    }
+                }
+                format!("{} is taking shore leave. Morale restored!", name)
+            } else {
+                "No effect.".to_string()
+            }
+        }
+        EventOutcome::CrewDesert { crew_id } => {
+            if let Some(idx) = state.crew_roster.iter().position(|c| c.id == crew_id) {
+                let name = state.crew_roster[idx].name.clone();
+                // Unassign from ship
+                if let Some(ship_idx) = state.crew_roster[idx].assigned_ship {
+                    if ship_idx < state.fleet.len() {
+                        state.fleet[ship_idx].crew_id = None;
+                    }
+                }
+                state.crew_roster.remove(idx);
+                // Also clean up bonds referencing this crew
+                state.crew_bonds.retain(|b| b.crew_a_id != crew_id && b.crew_b_id != crew_id);
+                format!("{} has deserted! They've left the fleet.", name)
+            } else {
+                "No effect.".to_string()
+            }
+        }
     }
 }
 
@@ -1078,13 +1325,15 @@ impl Scene for TravelScene {
         self.asteroid_fields.clear();
         self.colored_stars.clear();
         self.tick_count = 0;
-        self.travel_duration = (45.0 + (state.sector as f32 * 2.0).min(30.0)) * state.pip_travel_bonus();
+        let nav_bonus = if fleet_has_navigator(state) { 0.85 } else { 1.0 }; // 15% faster with Navigator
+        self.travel_duration = (45.0 + (state.sector as f32 * 2.0).min(30.0)) * state.pip_travel_bonus() * nav_bonus;
         self.warping = false;
         self.warp_frame = 0;
         self.sector_name = generate_sector_name(state.sector);
         self.sector_name_fade_tick = 0;
         self.event = None;
         self.event_checked = false;
+        self.navigator_shortcut_checked = false;
         // Note: last_event_type is intentionally NOT reset — prevents repeats across sectors
     }
 
@@ -1140,6 +1389,50 @@ impl Scene for TravelScene {
             return SceneAction::Continue;
         }
 
+        // ── Navigator shortcut check (once at start of travel) ─────
+        if !self.navigator_shortcut_checked {
+            self.navigator_shortcut_checked = true;
+            if fleet_has_navigator(state) {
+                let mut rng = rand::thread_rng();
+                // Check for Shortcut ability
+                let has_shortcut = state.crew_roster.iter().any(|c| {
+                    c.class == CrewClass::Navigator
+                        && c.assigned_ship.is_some()
+                        && c.class.available_abilities(c.level).iter().any(|a| {
+                            matches!(a.effect, crate::engine::abilities::AbilityEffect::Shortcut { .. })
+                        })
+                });
+                if has_shortcut && rng.gen_bool(0.10) {
+                    // Shortcut! Skip to next phase with bonus scrap
+                    let bonus_scrap = 50 + state.sector as u64 * 5;
+                    state.scrap += bonus_scrap;
+                    state.total_scrap += bonus_scrap;
+                    let nav_name = state.crew_roster.iter()
+                        .find(|c| c.class == CrewClass::Navigator && c.assigned_ship.is_some())
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| "Navigator".to_string());
+                    events.emit(crate::engine::events::GameEvent::CrewAbilityTriggered {
+                        crew_name: nav_name,
+                        ability_name: "Shortcut".to_string(),
+                        icon: '⚡',
+                    });
+                    // Create a shortcut event popup
+                    self.event = Some(TravelEvent {
+                        title: "⚡ Navigator Shortcut!".to_string(),
+                        description: "Your navigator found a shortcut through\na hidden jump lane! Bonus scrap collected.".to_string(),
+                        options: vec![
+                            ("Continue".to_string(), EventOutcome::Nothing),
+                        ],
+                        selected: 0,
+                        active: true,
+                        result_text: Some(format!("Navigator found a shortcut! +{}◇ scrap", bonus_scrap)),
+                        result_timer: 40,
+                    });
+                    return SceneAction::Continue;
+                }
+            }
+        }
+
         // ── Random event check at ~50% through travel ────────
         if !self.event_checked {
             let half_duration = self.travel_duration / 2.0;
@@ -1147,9 +1440,10 @@ impl Scene for TravelScene {
             if elapsed >= half_duration {
                 self.event_checked = true;
                 let mut rng = rand::thread_rng();
-                // 5-10% chance (scales slightly with sector)
-                let chance = 0.05 + (state.sector as f64 * 0.005).min(0.05);
-                if rng.gen_bool(chance.min(0.10)) {
+                // 5-10% chance (scales slightly with sector), Navigator increases by 5%
+                let nav_event_bonus = if fleet_has_navigator(state) { 0.05 } else { 0.0 };
+                let chance = 0.05 + (state.sector as f64 * 0.005).min(0.05) + nav_event_bonus;
+                if rng.gen_bool(chance.min(0.15)) {
                     let (event, event_type) = generate_random_event(state, self.last_event_type);
                     self.last_event_type = Some(event_type);
                     self.event = Some(event);
