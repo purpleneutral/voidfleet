@@ -1,6 +1,12 @@
 # Void Fleet
 
+[![CI](https://github.com/purpleneutral/voidfleet/actions/workflows/ci.yml/badge.svg)](https://github.com/purpleneutral/voidfleet/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A space conquest idle TUI game built in Rust. Watch your fleet travel through space, battle enemies, raid planets, and grow stronger — all rendered as animated ASCII art in your terminal.
+
+<!-- ![Void Fleet Demo](screenshots/demo.gif) -->
+<!-- Uncomment above after recording with: vhs demo.tape -->
 
 ## Features
 
