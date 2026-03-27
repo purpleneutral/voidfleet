@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::engine::equipment::{Equipment, SetBonus, SET_BONUSES};
 use crate::engine::ship::{Ship, ShipType};
 
 fn default_route_modifier() -> f32 {
@@ -82,10 +83,23 @@ pub struct GameState {
     #[serde(default)]
     pub pip_appearance: u8,
 
+    // Inventory
+    #[serde(default)]
+    pub inventory: Vec<Equipment>,
+    #[serde(default = "default_inventory_capacity")]
+    pub inventory_capacity: usize,
+    #[serde(default = "default_next_item_id")]
+    pub next_item_id: u64,
+
     // Transient (not saved)
     #[serde(skip)]
     pub pending_popups: Vec<String>,
+    #[serde(skip)]
+    pub pending_loot: Vec<Equipment>,
 }
+
+fn default_inventory_capacity() -> usize { 20 }
+fn default_next_item_id() -> u64 { 1 }
 
 fn default_pip_hunger() -> u8 { 80 }
 fn default_pip_energy() -> u8 { 80 }
@@ -140,7 +154,29 @@ impl GameState {
             pip_level: 1,
             pip_xp: 0,
             pip_appearance: 0,
+            inventory: Vec::new(),
+            inventory_capacity: 20,
+            next_item_id: 1,
             pending_popups: Vec::new(),
+            pending_loot: Vec::new(),
+        }
+    }
+
+    // ── Inventory methods ──────────────────────────────────────────
+
+    /// Try to add equipment to inventory. Returns `Ok(())` on success,
+    /// or `Err(salvage_value)` if inventory is full (item auto-salvaged).
+    pub fn try_add_to_inventory(&mut self, mut item: Equipment) -> Result<(), u64> {
+        if self.inventory.len() >= self.inventory_capacity {
+            // Inventory full — auto-salvage
+            let value = item.salvage_value();
+            self.scrap += value;
+            Err(value)
+        } else {
+            item.id = self.next_item_id;
+            self.next_item_id += 1;
+            self.inventory.push(item);
+            Ok(())
         }
     }
 
@@ -267,6 +303,51 @@ impl GameState {
         }
     }
 
+    /// Remove an item from inventory by its unique ID.
+    pub fn remove_from_inventory(&mut self, item_id: u64) -> Option<Equipment> {
+        if let Some(pos) = self.inventory.iter().position(|i| i.id == item_id) {
+            Some(self.inventory.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    /// Salvage an item from inventory, returning scrap value.
+    /// Value: Common=5, Uncommon=15, Rare=40, Epic=100, Legendary=250 * (1 + level/10)
+    pub fn salvage_item(&mut self, item_id: u64) -> u64 {
+        if let Some(item) = self.remove_from_inventory(item_id) {
+            let value = item.salvage_value();
+            self.scrap += value;
+            self.total_scrap += value;
+            value
+        } else {
+            0
+        }
+    }
+
+    /// Check all ships' equipped items for matching set IDs and return active set bonuses.
+    pub fn active_set_bonuses(&self) -> Vec<&'static SetBonus> {
+        // Count set pieces across all ships
+        let mut set_counts: std::collections::HashMap<&str, u8> = std::collections::HashMap::new();
+        for ship in &self.fleet {
+            for item in ship.equipped_items() {
+                if let Some(ref set_id) = item.set_id {
+                    *set_counts.entry(set_id.as_str()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        SET_BONUSES.iter()
+            .filter(|bonus| {
+                set_counts
+                    .get(bonus.set_id)
+                    .copied()
+                    .unwrap_or(0)
+                    >= bonus.pieces_required
+            })
+            .collect()
+    }
+
     /// Reset progression and gain permanent prestige bonuses.
     /// Requires sector 30+ to activate.
     pub fn prestige(&mut self) -> bool {
@@ -299,7 +380,8 @@ impl GameState {
         self.current_route_modifier = 1.0;
         self.phase = GamePhase::Travel;
         self.phase_timer = 45.0;
-        // Keep: achievements, deaths, highest_sector, prestige_level, totals, time_played
+        self.inventory.clear();
+        // Keep: achievements, deaths, highest_sector, prestige_level, totals, time_played, inventory_capacity
         true
     }
 

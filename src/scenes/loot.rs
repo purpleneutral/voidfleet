@@ -3,6 +3,7 @@ use ratatui::style::Color;
 use ratatui::Frame;
 
 use crate::engine::economy::calculate_loot;
+use crate::engine::equipment::Rarity;
 use crate::rendering::particles::ParticleSystem;
 use crate::state::GameState;
 
@@ -31,6 +32,19 @@ struct LootData {
     battle_lost: bool,
     /// Death penalty description (shown instead of rewards on loss)
     death_penalty: String,
+    /// Equipment drops from battle (name, slot label, rarity, stat summary, salvaged scrap or 0)
+    equipment_drops: Vec<EquipmentDropInfo>,
+}
+
+/// Snapshot of an equipment drop for display purposes.
+#[derive(Debug, Clone, Default)]
+struct EquipmentDropInfo {
+    name: String,
+    slot_label: String,
+    rarity: Option<Rarity>,
+    stat_line: String,
+    /// If > 0, item was salvaged for this many scrap (inventory full)
+    salvaged_for: u64,
 }
 
 /// Sparkle particle for rare loot effects within the loot box.
@@ -97,6 +111,7 @@ impl Scene for LootScene {
                 battle_lost: true,
                 death_penalty: String::new(), // filled in tick when we mutate state
                 fleet_status,
+                equipment_drops: Vec::new(),
                 ..LootData::default()
             };
             self.xp_anim = 0.0;
@@ -170,6 +185,19 @@ impl Scene for LootScene {
             .map(|s| (s.ship_type.name(), s.is_alive()))
             .collect();
 
+        // Snapshot equipment drops from pending_loot (we'll add to inventory in tick)
+        let equipment_drops: Vec<EquipmentDropInfo> = state
+            .pending_loot
+            .iter()
+            .map(|item| EquipmentDropInfo {
+                name: item.name.clone(),
+                slot_label: item.slot.name().to_string(),
+                rarity: Some(item.rarity),
+                stat_line: item.summary(),
+                salvaged_for: 0, // computed in tick when added to inventory
+            })
+            .collect();
+
         self.loot = LootData {
             sector_cleared: sector,
             credits_gained: credits,
@@ -186,6 +214,7 @@ impl Scene for LootScene {
             fleet_status,
             battle_lost: false,
             death_penalty: String::new(),
+            equipment_drops,
         };
 
         self.xp_anim = xp_start_ratio;
@@ -214,6 +243,22 @@ impl Scene for LootScene {
                 }
                 if self.loot.artifact_drop {
                     state.artifacts += 1;
+                }
+
+                // Add equipment drops to inventory
+                let pending = std::mem::take(&mut state.pending_loot);
+                for (idx, item) in pending.into_iter().enumerate() {
+                    match state.try_add_to_inventory(item) {
+                        Ok(()) => {
+                            // Successfully added — salvaged_for stays 0
+                        }
+                        Err(salvage_value) => {
+                            // Inventory full — auto-salvaged
+                            if idx < self.loot.equipment_drops.len() {
+                                self.loot.equipment_drops[idx].salvaged_for = salvage_value;
+                            }
+                        }
+                    }
                 }
 
                 // Heal fleet
@@ -278,10 +323,21 @@ impl Scene for LootScene {
             if self.loot.artifact_drop && self.lines_revealed >= 4 && self.tick_count.is_multiple_of(4) {
                 self.spawn_sparkles(Color::Magenta);
             }
+            // Legendary equipment sparkles
+            let equip_line_start = self.base_line_count();
+            let should_sparkle_legendary = self.tick_count.is_multiple_of(3)
+                && self.loot.equipment_drops.iter().enumerate().any(|(i, drop)| {
+                    drop.rarity == Some(Rarity::Legendary)
+                        && self.lines_revealed > equip_line_start + i * 2
+                });
+            if should_sparkle_legendary {
+                self.spawn_sparkles(Color::Yellow);
+            }
         }
 
-        // Auto-advance after 100 ticks (5 seconds)
-        if self.tick_count >= 100 {
+        // Auto-advance: base 100 ticks (5s) + 20 ticks (1s) per equipment drop
+        let equip_bonus = self.loot.equipment_drops.len() as u16 * 20;
+        if self.tick_count >= 100 + equip_bonus {
             state.phase_timer = 45.0;
             state.save();
             SceneAction::TransitionTo(crate::state::GamePhase::Travel)
@@ -298,8 +354,8 @@ impl Scene for LootScene {
         let lines = self.build_lines();
         let visible = &lines[..self.lines_revealed.min(lines.len())];
 
-        // Box dimensions
-        let box_width: u16 = 30;
+        // Box dimensions — wider if equipment drops present
+        let box_width: u16 = if self.loot.equipment_drops.is_empty() { 30 } else { 42 };
         let box_height = lines.len() as u16 + 2; // +2 for top/bottom border
         let bx = area.width.saturating_sub(box_width) / 2;
         let by = area.height.saturating_sub(box_height) / 2;
@@ -374,12 +430,8 @@ impl Scene for LootScene {
 }
 
 impl LootScene {
-    fn total_display_lines(&self) -> usize {
-        if self.loot.battle_lost {
-            // header + blank + penalty line + blank + fleet line
-            return 5;
-        }
-
+    /// Number of display lines before equipment drops section.
+    fn base_line_count(&self) -> usize {
         let mut count = 2; // header + blank
         count += 1; // scrap
         count += 1; // credits
@@ -389,6 +441,23 @@ impl LootScene {
         if self.loot.artifact_drop {
             count += 1;
         }
+        count
+    }
+
+    fn total_display_lines(&self) -> usize {
+        if self.loot.battle_lost {
+            // header + blank + penalty line + blank + fleet line
+            return 5;
+        }
+
+        let mut count = self.base_line_count();
+
+        // Equipment drops: 2 lines each (name + stats)
+        if !self.loot.equipment_drops.is_empty() {
+            count += 1; // blank before equipment
+            count += self.loot.equipment_drops.len() * 2;
+        }
+
         count += 1; // blank
         count += 1; // XP bar
         if self.loot.level_up {
@@ -457,6 +526,38 @@ impl LootScene {
                 "  Artifact!   +1".to_string(),
                 Color::Magenta,
             ));
+        }
+
+        // Equipment drops
+        if !self.loot.equipment_drops.is_empty() {
+            lines.push((String::new(), Color::White));
+            for drop in &self.loot.equipment_drops {
+                let rarity_color = drop.rarity.map_or(Color::Gray, |r| r.color());
+                let marker = drop.rarity.map_or('·', |r| match r {
+                    Rarity::Common => '·',
+                    Rarity::Uncommon => '○',
+                    Rarity::Rare => '●',
+                    Rarity::Epic => '◆',
+                    Rarity::Legendary => '★',
+                });
+                // Line 1: marker + name
+                if drop.salvaged_for > 0 {
+                    lines.push((
+                        format!("  {} {} (salvaged {}◇)", marker, drop.name, drop.salvaged_for),
+                        Color::DarkGray,
+                    ));
+                } else {
+                    lines.push((
+                        format!("  {} Loot: {}", marker, drop.name),
+                        rarity_color,
+                    ));
+                }
+                // Line 2: slot + stats
+                lines.push((
+                    format!("    {} │ {}", drop.slot_label, drop.stat_line),
+                    Color::Rgb(140, 140, 160),
+                ));
+            }
         }
 
         lines.push((String::new(), Color::White));

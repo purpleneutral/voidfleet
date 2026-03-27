@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::engine::equipment::{Equipment, Slot};
+
 // ---------------------------------------------------------------------------
 // Ship special abilities
 // ---------------------------------------------------------------------------
@@ -146,6 +148,16 @@ pub struct Ship {
     pub current_hp: u32,
     pub upgrade_level: u8, // 0-10, multiplies stats
 
+    // Equipment slots
+    #[serde(default)]
+    pub weapon: Option<Equipment>,
+    #[serde(default)]
+    pub shield: Option<Equipment>,
+    #[serde(default)]
+    pub engine_mod: Option<Equipment>,
+    #[serde(default)]
+    pub special: Option<Equipment>,
+
     // Runtime position (not saved, set by scene)
     #[serde(skip)]
     pub x: f32,
@@ -160,6 +172,10 @@ impl Ship {
             ship_type,
             current_hp: hp,
             upgrade_level: 0,
+            weapon: None,
+            shield: None,
+            engine_mod: None,
+            special: None,
             x: 0.0,
             y: 0.0,
         }
@@ -194,5 +210,73 @@ impl Ship {
     pub fn upgrade_cost(&self) -> u64 {
         let base = self.ship_type.cost().max(50);
         base * (self.upgrade_level as u64 + 1)
+    }
+
+    // ── Equipment methods ──────────────────────────────────────────
+
+    /// Returns references to all equipped items.
+    pub fn equipped_items(&self) -> Vec<&Equipment> {
+        [
+            self.weapon.as_ref(),
+            self.shield.as_ref(),
+            self.engine_mod.as_ref(),
+            self.special.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Equip an item to its matching slot. Returns the previously equipped item, if any.
+    pub fn equip(&mut self, item: Equipment) -> Option<Equipment> {
+        let slot = match item.slot {
+            Slot::Weapon => &mut self.weapon,
+            Slot::Shield => &mut self.shield,
+            Slot::Engine => &mut self.engine_mod,
+            Slot::Special => &mut self.special,
+        };
+        let old = slot.take();
+        *slot = Some(item);
+        old
+    }
+
+    /// Returns (flat_bonus, pct_bonus) for damage from all equipped items.
+    pub fn total_damage_bonus(&self) -> (i32, f32) {
+        let mut flat = 0i32;
+        let mut pct = 0.0f32;
+        for item in self.equipped_items() {
+            flat += item.modifiers.flat_damage;
+            pct += item.modifiers.pct_damage;
+        }
+        (flat, pct)
+    }
+
+    /// Returns (flat_bonus, pct_bonus) for HP from all equipped items.
+    pub fn total_hp_bonus(&self) -> (i32, f32) {
+        let mut flat = 0i32;
+        let mut pct = 0.0f32;
+        for item in self.equipped_items() {
+            flat += item.modifiers.flat_hp;
+            pct += item.modifiers.pct_hp;
+        }
+        (flat, pct)
+    }
+
+    /// Sum speed bonuses from all equipped items.
+    pub fn total_speed_bonus(&self) -> f32 {
+        self.equipped_items()
+            .iter()
+            .map(|item| item.modifiers.speed)
+            .sum()
+    }
+
+    /// Sum crit chance from all equipped items, capped at 0.75.
+    pub fn total_crit_chance(&self) -> f32 {
+        let total: f32 = self
+            .equipped_items()
+            .iter()
+            .map(|item| item.modifiers.crit_chance)
+            .sum();
+        total.min(0.75)
     }
 }

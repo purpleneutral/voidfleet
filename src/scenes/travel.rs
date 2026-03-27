@@ -5,6 +5,7 @@ use rand::prelude::Distribution;
 use ratatui::Frame;
 use ratatui::style::{Color, Style};
 
+use crate::engine::equipment::{generate_equipment, Equipment, Rarity};
 use crate::engine::ship::{Ship, ShipType};
 use crate::rendering::particles::ParticleSystem;
 use crate::rendering::starfield::Starfield;
@@ -194,6 +195,11 @@ enum EventOutcome {
     HealFleet(u64),
     GainBlueprint,
     GainArtifact,
+    GainEquipment(Equipment),
+    /// Buy equipment: deduct credits, gain item.
+    BuyEquipment { item: Equipment, credit_cost: u64 },
+    /// Trade scrap for equipment: deduct scrap, gain item.
+    TradeEquipment { item: Equipment, scrap_cost: u64 },
 }
 
 struct TravelEvent {
@@ -235,10 +241,11 @@ enum EventType {
     PirateAmbush,
     DerelictStation,
     CosmicStorm,
+    MysteriousTrader,
 }
 
 impl EventType {
-    const ALL: [EventType; 7] = [
+    const ALL: [EventType; 8] = [
         EventType::DistressSignal,
         EventType::AbandonedWreck,
         EventType::TradingPost,
@@ -246,6 +253,7 @@ impl EventType {
         EventType::PirateAmbush,
         EventType::DerelictStation,
         EventType::CosmicStorm,
+        EventType::MysteriousTrader,
     ];
 }
 
@@ -310,6 +318,13 @@ fn event_weights(state: &GameState, last_event: Option<EventType>) -> Vec<(Event
                 // Higher sectors = more storms
                 if state.sector > 15 { 1.5 } else { 1.0 }
             }
+            EventType::MysteriousTrader => {
+                // More common at higher sectors, needs credits/scrap to trade
+                let mut w = 0.5;
+                if state.sector > 10 { w += 0.5; }
+                if state.credits > 500 || state.scrap > 300 { w += 0.5; }
+                w
+            }
         };
 
         weights.push((event_type, w.max(0.01))); // ensure minimum weight
@@ -363,17 +378,30 @@ fn generate_random_event(state: &GameState, last_event: Option<EventType>) -> (T
         }
         EventType::AbandonedWreck => {
             let scrap_amount = ((rng.gen_range(50..201) as f32) * scale) as u64;
+            // Careful search: 25% equipment (Uncommon-Rare), 20% blueprint, 55% consolation scrap
+            let careful_roll: f32 = rng.gen_range(0.0..1.0);
+            let careful_outcome = if careful_roll < 0.25 {
+                // Generate Uncommon+ equipment
+                let mut item = generate_equipment(state.sector, None);
+                while item.rarity < Rarity::Uncommon {
+                    item = generate_equipment(state.sector, None);
+                }
+                if item.rarity > Rarity::Rare {
+                    item.rarity = Rarity::Rare; // cap at Rare for wreck
+                }
+                EventOutcome::GainEquipment(item)
+            } else if careful_roll < 0.45 {
+                EventOutcome::GainBlueprint
+            } else {
+                let consolation = ((rng.gen_range(20..80) as f32) * scale) as u64;
+                EventOutcome::GainScrap(consolation)
+            };
             TravelEvent::new(
                 "🔧 Abandoned Wreck",
                 "You find a drifting hulk. Its hull is breached\nbut the cargo bay might still hold salvage.",
                 vec![
                     (format!("Salvage quickly (+{}◇)", scrap_amount), EventOutcome::GainScrap(scrap_amount)),
-                    ("Careful search (30% blueprint)".into(), if rng.gen_bool(0.3) {
-                        EventOutcome::GainBlueprint
-                    } else {
-                        let consolation = ((rng.gen_range(20..80) as f32) * scale) as u64;
-                        EventOutcome::GainScrap(consolation)
-                    }),
+                    ("Careful search (equip/blueprint)".into(), careful_outcome),
                 ],
             )
         }
@@ -423,15 +451,27 @@ fn generate_random_event(state: &GameState, last_event: Option<EventType>) -> (T
         }
         EventType::DerelictStation => {
             let credits = ((rng.gen_range(100..501) as f32) * scale) as u64;
+            // Explore: 20% equipment (Rare-Epic), 15% artifact, 65% credits
+            let explore_roll: f32 = rng.gen_range(0.0..1.0);
+            let explore_outcome = if explore_roll < 0.20 {
+                let mut item = generate_equipment(state.sector, None);
+                while item.rarity < Rarity::Rare {
+                    item = generate_equipment(state.sector, None);
+                }
+                if item.rarity > Rarity::Epic {
+                    item.rarity = Rarity::Epic;
+                }
+                EventOutcome::GainEquipment(item)
+            } else if explore_roll < 0.35 {
+                EventOutcome::GainArtifact
+            } else {
+                EventOutcome::GainCredits(credits)
+            };
             TravelEvent::new(
                 "🏚 Derelict Station",
                 "An old station floats nearby, its lights\nflickering in the void. Power still runs.",
                 vec![
-                    (format!("Explore (+{}₿)", credits), if rng.gen_bool(0.15) {
-                        EventOutcome::GainArtifact
-                    } else {
-                        EventOutcome::GainCredits(credits)
-                    }),
+                    (format!("Explore (+{}₿ or more)", credits), explore_outcome),
                     ("Pass by".into(), EventOutcome::Nothing),
                 ],
             )
@@ -445,6 +485,67 @@ fn generate_random_event(state: &GameState, last_event: Option<EventType>) -> (T
                 vec![
                     (format!("Brace for impact (-{}hp)", damage), EventOutcome::DamageFleet(damage)),
                     (format!("Take a detour (+{:.0}s travel)", detour_time), EventOutcome::AddTravelTime(detour_time)),
+                ],
+            )
+        }
+        EventType::MysteriousTrader => {
+            // Generate equipment for sale: Epic/Legendary for credits, Rare for scrap
+            let mut buy_item = generate_equipment(state.sector, None);
+            // Re-roll until Epic+
+            for _ in 0..50 {
+                if buy_item.rarity >= Rarity::Epic {
+                    break;
+                }
+                buy_item = generate_equipment(state.sector, None);
+            }
+            if buy_item.rarity < Rarity::Epic {
+                buy_item.rarity = Rarity::Epic;
+            }
+
+            let mut trade_item = generate_equipment(state.sector, None);
+            // Re-roll until Rare+
+            for _ in 0..30 {
+                if trade_item.rarity >= Rarity::Rare {
+                    break;
+                }
+                trade_item = generate_equipment(state.sector, None);
+            }
+            if trade_item.rarity < Rarity::Rare {
+                trade_item.rarity = Rarity::Rare;
+            }
+
+            // Price scales with rarity and sector
+            let credit_cost = match buy_item.rarity {
+                Rarity::Legendary => rng.gen_range(1500..2001) as u64,
+                _ => rng.gen_range(500..1001) as u64,
+            } + state.sector as u64 * 20;
+
+            let scrap_cost = rng.gen_range(200..501) as u64 + state.sector as u64 * 10;
+
+            let buy_name = buy_item.name.clone();
+            let trade_name = trade_item.name.clone();
+
+            TravelEvent::new(
+                "🔮 Mysterious Trader",
+                "A cloaked ship hails you. A trader offers\nrare goods from distant sectors.",
+                vec![
+                    (
+                        format!("Buy {} (-{}₿)", buy_name, credit_cost),
+                        if state.credits >= credit_cost {
+                            EventOutcome::BuyEquipment { item: buy_item, credit_cost }
+                        } else {
+                            EventOutcome::Nothing
+                        },
+                    ),
+                    (
+                        format!("Trade scrap for {} (-{}◇)", trade_name, scrap_cost),
+                        if state.scrap >= scrap_cost {
+                            EventOutcome::TradeEquipment { item: trade_item, scrap_cost }
+                        } else {
+                            EventOutcome::Nothing
+                        },
+                    ),
+                    ("Decline".into(), EventOutcome::Nothing),
                 ],
             )
         }
@@ -888,6 +989,40 @@ fn apply_event_outcome(outcome: EventOutcome, state: &mut GameState, _label: &st
         EventOutcome::GainArtifact => {
             state.artifacts += 1;
             "You discovered an ancient artifact!".to_string()
+        }
+        EventOutcome::GainEquipment(item) => {
+            let name = item.name.clone();
+            let rarity = item.rarity.name();
+            match state.try_add_to_inventory(item) {
+                Ok(()) => format!("Found {} equipment: {}!", rarity, name),
+                Err(value) => format!("Inventory full! {} salvaged for {}◇", name, value),
+            }
+        }
+        EventOutcome::BuyEquipment { item, credit_cost } => {
+            if state.credits >= credit_cost {
+                state.credits -= credit_cost;
+                let name = item.name.clone();
+                let rarity = item.rarity.name();
+                match state.try_add_to_inventory(item) {
+                    Ok(()) => format!("Bought {} {} for {}₿!", rarity, name, credit_cost),
+                    Err(value) => format!("Inventory full! {} salvaged for {}◇", name, value),
+                }
+            } else {
+                "Not enough credits!".to_string()
+            }
+        }
+        EventOutcome::TradeEquipment { item, scrap_cost } => {
+            if state.scrap >= scrap_cost {
+                state.scrap -= scrap_cost;
+                let name = item.name.clone();
+                let rarity = item.rarity.name();
+                match state.try_add_to_inventory(item) {
+                    Ok(()) => format!("Traded {}◇ for {} {}!", scrap_cost, rarity, name),
+                    Err(value) => format!("Inventory full! {} salvaged for {}◇", name, value),
+                }
+            } else {
+                "Not enough scrap!".to_string()
+            }
         }
     }
 }

@@ -23,6 +23,7 @@ use scenes::stats::StatsScreen;
 use scenes::title::TitleScreen;
 use scenes::travel::TravelScene;
 use scenes::bridge::BridgeScene;
+use scenes::inventory::InventoryScreen;
 use scenes::upgrades::UpgradeScreen;
 use scenes::map::MapScreen;
 use state::{GamePhase, GameState};
@@ -66,6 +67,7 @@ fn main() -> io::Result<()> {
     let mut upgrades = UpgradeScreen::new();
     let mut stats = StatsScreen::new();
     let mut bridge = BridgeScene::new();
+    let mut inventory = InventoryScreen::new();
     let mut map_screen = MapScreen::new();
 
     // Achievement popup display
@@ -135,6 +137,11 @@ fn main() -> io::Result<()> {
                                     KeyCode::Esc | KeyCode::Tab => stats.toggle(),
                                     _ => {}
                                 }
+                            } else if inventory.open {
+                                match key.code {
+                                    KeyCode::Esc => inventory.toggle(),
+                                    other => inventory.handle_input(other, &mut state),
+                                }
                             } else if bridge.open {
                                 bridge.handle_input(key.code, &mut state);
                             } else if travel.has_active_event() {
@@ -146,6 +153,7 @@ fn main() -> io::Result<()> {
                                     KeyCode::Char('u') | KeyCode::Char('U') => upgrades.toggle(),
                                     KeyCode::Tab => stats.toggle(),
                                     KeyCode::Char('b') | KeyCode::Char('B') => bridge.toggle(&mut state),
+                                    KeyCode::Char('i') | KeyCode::Char('I') => inventory.toggle(),
                                     KeyCode::Char('m') | KeyCode::Char('M') => map_screen.toggle(&state),
                                     KeyCode::Char('p') | KeyCode::Char('P') => {
                                         if state.prestige() {
@@ -274,7 +282,9 @@ fn main() -> io::Result<()> {
 
                     // HUD bar
                     // Determine active overlay for context-aware HUD
-                    let active_overlay = if bridge.open {
+                    let active_overlay = if inventory.open {
+                        "inventory"
+                    } else if bridge.open {
                         "bridge"
                     } else if upgrades.open {
                         "upgrades"
@@ -296,6 +306,9 @@ fn main() -> io::Result<()> {
                         }
 
                     // Overlays
+                    if inventory.open {
+                        inventory.render(frame, &state);
+                    }
                     if bridge.open {
                         bridge.render(frame, &state);
                     }
@@ -361,6 +374,10 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
     };
 
     let controls = match overlay {
+        "inventory" => format!(
+            " INVENTORY │ {}/{} items │ ◇{} │ [↑↓]Navigate [←→/Tab]Tabs [Enter]Equip [D]Salvage [Esc]Close ",
+            state.inventory.len(), state.inventory_capacity, state.scrap
+        ),
         "bridge" => format!(
             " BRIDGE │ Pip Lv.{} │ ◇{} │ ₿{} │ [F]eed [P]et [G]ifts [Esc]Close ",
             state.pip_level, state.scrap, state.credits
@@ -374,7 +391,7 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
         "event" => " EVENT │ [↑↓]Select [Enter]Choose ".to_string(),
         _ => {
             let mut hud = format!(
-                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [B]ridge [M]ap [Tab]Stats [Space]Skip ",
+                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [I]nventory [B]ridge [M]ap [Tab]Stats [Space]Skip ",
                 phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
             );
             if state.sector >= 30 {
@@ -387,6 +404,7 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
 
     // Determine label color based on context
     let (label, label_color) = match overlay {
+        "inventory" => ("INVENTORY", Color::Yellow),
         "bridge" => ("BRIDGE", Color::Magenta),
         "upgrades" => ("UPGRADES", Color::Green),
         "stats" => ("STATS", Color::Cyan),

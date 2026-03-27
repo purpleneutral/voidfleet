@@ -3,6 +3,7 @@ use ratatui::style::Color;
 use ratatui::Frame;
 
 use crate::engine::combat::{effective_damage, effective_hp, fire_rate};
+use crate::engine::equipment::{generate_equipment, Equipment, Rarity};
 use crate::engine::procedural::{generate_enemy_fleet_adaptive, difficulty_modifier, post_death_modifier};
 use crate::engine::ship::{Ship, ShipAbility, ShipType};
 use crate::rendering::particles::{Particle, ParticleSystem};
@@ -350,6 +351,13 @@ struct ActiveBeam {
 // BattleScene
 // ---------------------------------------------------------------------------
 
+/// Floating crit text that drifts upward and fades.
+struct CritText {
+    x: f32,
+    y: f32,
+    life: u8,
+}
+
 pub struct BattleScene {
     enemies: Vec<EnemyShip>,
     projectiles: Vec<Projectile>,
@@ -375,6 +383,10 @@ pub struct BattleScene {
     active_beams: Vec<ActiveBeam>,
     /// Whether any player ship has Scan ability (show all enemy HP).
     has_scan: bool,
+    /// Equipment drops accumulated during battle.
+    pending_drops: Vec<Equipment>,
+    /// Active "CRIT!" text overlays.
+    crit_texts: Vec<CritText>,
 }
 
 impl BattleScene {
@@ -395,6 +407,8 @@ impl BattleScene {
             temp_fighters: Vec::new(),
             active_beams: Vec::new(),
             has_scan: false,
+            pending_drops: Vec::new(),
+            crit_texts: Vec::new(),
         }
     }
 
@@ -502,6 +516,61 @@ impl BattleScene {
         match tier {
             2 | 3 => ProjectileKind::EnemyHeavy,
             _ => ProjectileKind::EnemyLaser,
+        }
+    }
+
+    // -- equipment drop rolling --
+
+    /// Roll for an equipment drop when an enemy dies.
+    /// Drop chances: tier 0-1 (normal) = 30%, tier 2 (tough) = 50%, tier 3+ (boss) = 100% (Rare+).
+    fn roll_enemy_drop(pending_drops: &mut Vec<Equipment>, tier: u32, sector: u32) {
+        let mut rng = rand::thread_rng();
+        let (drop_chance, min_rarity) = match tier {
+            0 | 1 => (0.30, None),
+            2 => (0.50, None),
+            _ => (1.0, Some(Rarity::Rare)), // boss: guaranteed Rare+
+        };
+
+        if rng.gen_range(0.0..1.0f32) < drop_chance {
+            let drop = if let Some(min) = min_rarity {
+                // Generate with minimum rarity for boss drops
+                let mut item = generate_equipment(sector, None);
+                if item.rarity < min {
+                    // Re-roll until we get at least min rarity
+                    for _ in 0..20 {
+                        item = generate_equipment(sector, None);
+                        if item.rarity >= min {
+                            break;
+                        }
+                    }
+                    // Force minimum if still too low
+                    if item.rarity < min {
+                        item.rarity = min;
+                    }
+                }
+                item
+            } else {
+                generate_equipment(sector, None)
+            };
+            pending_drops.push(drop);
+        }
+    }
+
+    /// Emit crit particles — gold/yellow burst at hit location.
+    fn emit_crit_particles(particles: &mut ParticleSystem, x: f32, y: f32) {
+        let mut rng = rand::thread_rng();
+        for _ in 0..6 {
+            let angle: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
+            let speed: f32 = rng.gen_range(0.4..1.2);
+            particles.emit(Particle::new(
+                x,
+                y,
+                angle.cos() * speed,
+                angle.sin() * speed * 0.5,
+                rng.gen_range(4..8),
+                if rng.gen_bool(0.5) { '✦' } else { '◆' },
+                Color::Rgb(255, 200, 50),
+            ));
         }
     }
 
@@ -1135,6 +1204,8 @@ impl Scene for BattleScene {
         self.focus_fire_cooldown = 0;
         self.temp_fighters.clear();
         self.active_beams.clear();
+        self.pending_drops.clear();
+        self.crit_texts.clear();
         self.has_scan = state.fleet.iter().any(|s| {
             s.is_alive() && s.ship_type.ability() == Some(ShipAbility::Scan)
         });
@@ -1213,6 +1284,8 @@ impl Scene for BattleScene {
             if *frames == 0 {
                 if self.player_won {
                     state.total_battles += 1;
+                    // Transfer equipment drops to state for loot scene
+                    state.pending_loot = std::mem::take(&mut self.pending_drops);
                     return SceneAction::TransitionTo(GamePhase::Loot);
                 } else {
                     // Fleet was destroyed — death penalty already applied, skip loot
@@ -1226,6 +1299,16 @@ impl Scene for BattleScene {
         // ══════════════════════════════════════════════════════════════
         // COMBAT PHASE
         // ══════════════════════════════════════════════════════════════
+
+        // Track enemy tiers killed this tick for equipment drop rolling
+        let mut killed_enemy_tiers: Vec<u32> = Vec::new();
+
+        // ── Update crit texts ──────────────────────────────────────────
+        self.crit_texts.retain_mut(|ct| {
+            ct.y -= 0.15;
+            ct.life = ct.life.saturating_sub(1);
+            ct.life > 0
+        });
 
         // ── Update death animations ────────────────────────────────────
         for e in self.enemies.iter_mut() {
@@ -1388,6 +1471,7 @@ impl Scene for BattleScene {
                                         enemy.death_exploded = true;
                                     }
                                     state.enemies_destroyed += 1;
+                                    killed_enemy_tiers.push(enemy.tier);
                                 }
                             }
                         }
@@ -1694,6 +1778,7 @@ impl Scene for BattleScene {
                     &mut self.player_states,
                 );
                 state.enemies_destroyed += 1 + destroyed;
+                killed_enemy_tiers.push(e.tier);
                 continue;
             }
 
@@ -1772,6 +1857,17 @@ impl Scene for BattleScene {
         let mut to_remove_proj: Vec<usize> = Vec::new();
         // Collect AOE hits to process after the loop (avoids borrow issues)
         let mut aoe_hits: Vec<(f32, f32, u32)> = Vec::new(); // (x, y, damage)
+
+        // Fleet-wide crit chance: base 5% + max crit from any ship's equipment
+        let fleet_crit_chance = 0.05_f32
+            + state.fleet.iter()
+                .filter(|s| s.is_alive())
+                .map(|s| s.total_crit_chance())
+                .fold(0.0_f32, f32::max);
+
+        let mut rng_crit = rand::thread_rng();
+        let mut new_crit_texts: Vec<CritText> = Vec::new();
+
         for (pi, proj) in self.projectiles.iter().enumerate() {
             if !proj.friendly {
                 continue;
@@ -1784,7 +1880,10 @@ impl Scene for BattleScene {
                 let hit_x = proj.x >= enemy.x && proj.x <= enemy.x + sprite_w;
                 let hit_y = (proj.y - enemy.y).abs() < (enemy.height() as f32 * 0.5 + 0.5);
                 if hit_x && hit_y {
-                    let dmg = proj.damage.min(enemy.hp);
+                    // Crit check
+                    let is_crit = rng_crit.gen_range(0.0..1.0f32) < fleet_crit_chance;
+                    let effective_dmg = if is_crit { proj.damage * 2 } else { proj.damage };
+                    let dmg = effective_dmg.min(enemy.hp);
                     enemy.hp -= dmg;
                     to_remove_proj.push(pi);
 
@@ -1794,6 +1893,14 @@ impl Scene for BattleScene {
                         // Big dramatic explosion
                         particles.explode(proj.x, proj.y, 20, Color::Rgb(255, 200, 50));
                         Self::chain_explosion(particles, proj.x, proj.y, true);
+                    } else if is_crit {
+                        // Crit hit: gold particle burst + "CRIT!" text
+                        Self::emit_crit_particles(particles, proj.x, proj.y);
+                        new_crit_texts.push(CritText {
+                            x: proj.x,
+                            y: proj.y - 1.0,
+                            life: 12,
+                        });
                     } else {
                         // Normal hit spark
                         particles.emit(Particle::new(
@@ -1817,11 +1924,15 @@ impl Scene for BattleScene {
                             enemy.death_exploded = true;
                         }
                         state.enemies_destroyed += 1;
+                        killed_enemy_tiers.push(enemy.tier);
                     }
                     break;
                 }
             }
         }
+
+        // Store crit texts from this tick
+        self.crit_texts.extend(new_crit_texts);
 
         // ── Process HeavyPayload AOE damage ────────────────────────────
         for (aoe_x, aoe_y, aoe_dmg) in aoe_hits {
@@ -1845,6 +1956,7 @@ impl Scene for BattleScene {
                             enemy.death_exploded = true;
                         }
                         state.enemies_destroyed += 1;
+                        killed_enemy_tiers.push(enemy.tier);
                     }
                 }
             }
@@ -1937,6 +2049,11 @@ impl Scene for BattleScene {
             ps.flash = ps.flash.saturating_sub(1);
         }
 
+        // ── Roll equipment drops for enemies killed this tick ─────────
+        for tier in killed_enemy_tiers {
+            Self::roll_enemy_drop(&mut self.pending_drops, tier, self.sector);
+        }
+
         // ── Win / lose check ───────────────────────────────────────────
         // All enemies must be fully dead (done animating)
         let all_enemies_dead = self.enemies.iter().all(|e| e.hp == 0);
@@ -1974,6 +2091,7 @@ impl Scene for BattleScene {
         if state.phase_timer <= 0.0 {
             self.player_won = true;
             state.total_battles += 1;
+            state.pending_loot = std::mem::take(&mut self.pending_drops);
             return SceneAction::TransitionTo(GamePhase::Loot);
         }
 
@@ -2269,6 +2387,28 @@ impl Scene for BattleScene {
                 let cell = &mut buf[(area.x + px, area.y + py)];
                 cell.set_char(p.render_char());
                 cell.set_fg(p.color);
+            }
+        }
+
+        // ── Crit text overlays ────────────────────────────────────────
+        for ct in &self.crit_texts {
+            let cx = ct.x as u16;
+            let cy = ct.y as u16;
+            if cy < area.height {
+                let text = "CRIT!";
+                let gold = if ct.life > 6 {
+                    Color::Rgb(255, 200, 50)
+                } else {
+                    Color::Rgb(200, 150, 30)
+                };
+                for (i, ch) in text.chars().enumerate() {
+                    let x = cx.wrapping_add(i as u16);
+                    if x < area.width {
+                        let cell = &mut buf[(area.x + x, area.y + cy)];
+                        cell.set_char(ch);
+                        cell.set_fg(gold);
+                    }
+                }
             }
         }
 
