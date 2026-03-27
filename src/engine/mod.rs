@@ -5,5 +5,6 @@ pub mod crew;
 pub mod economy;
 pub mod equipment;
 pub mod events;
+pub mod factions;
 pub mod procedural;
 pub mod ship;

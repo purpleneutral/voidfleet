@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::engine::achievements::ACHIEVEMENTS;
+use crate::engine::factions::Faction;
 use crate::rendering::layout::centered_rect;
 use crate::state::GameState;
 
@@ -99,6 +100,15 @@ impl StatsScreen {
         lines.push(tech_bar("Shields", state.tech_shields));
         lines.push(tech_bar("Engines", state.tech_engines));
         lines.push(tech_bar("Beams", state.tech_beams));
+
+        // ── Factions ─────────────────────────────────────────────────────
+        lines.push(Line::from(""));
+        lines.push(section_header("Factions"));
+        for &faction in Faction::TRACKABLE.iter() {
+            let rep = state.faction_reputation.get(faction);
+            let tier = state.faction_reputation.tier(faction);
+            lines.push(faction_row(faction.icon(), faction.name(), rep, tier.color()));
+        }
 
         // ── Achievements ────────────────────────────────────────────────
         lines.push(Line::from(""));
@@ -195,6 +205,19 @@ fn tech_bar(name: &str, level: u8) -> Line<'static> {
         Span::styled(
             format!("  Lv.{}", level),
             Style::default().fg(Color::White),
+        ),
+    ])
+}
+
+/// Faction reputation row: "  ☠ Pirate Clans:    +15 Neutral"
+fn faction_row(icon: &str, name: &str, rep: i32, color: Color) -> Line<'static> {
+    let padded = format!("  {} {:<20}", icon, format!("{}:", name));
+    Line::from(vec![
+        Span::styled(padded, Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:+4}", rep), Style::default().fg(color)),
+        Span::styled(
+            format!(" {}", crate::engine::factions::Faction::reputation_tier(rep).name()),
+            Style::default().fg(color),
         ),
     ])
 }

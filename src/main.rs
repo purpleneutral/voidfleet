@@ -26,6 +26,7 @@ use scenes::travel::TravelScene;
 use scenes::bridge::BridgeScene;
 use scenes::inventory::InventoryScreen;
 use scenes::crew::CrewScreen;
+use scenes::diplomacy::DiplomacyScreen;
 use scenes::upgrades::UpgradeScreen;
 use scenes::map::MapScreen;
 use state::{GamePhase, GameState};
@@ -75,6 +76,7 @@ fn main() -> io::Result<()> {
     let mut inventory = InventoryScreen::new();
     let mut map_screen = MapScreen::new();
     let mut crew_screen = CrewScreen::new();
+    let mut diplomacy = DiplomacyScreen::new();
 
     // Achievement popup display
     let mut popup_text: Option<String> = None;
@@ -136,6 +138,8 @@ fn main() -> io::Result<()> {
                                     KeyCode::Esc => upgrades.toggle(),
                                     other => upgrades.handle_input(other, &mut state),
                                 }
+                            } else if diplomacy.open {
+                                diplomacy.handle_input(key.code);
                             } else if map_screen.open {
                                 map_screen.handle_input(key.code, &mut state);
                             } else if stats.open {
@@ -163,6 +167,7 @@ fn main() -> io::Result<()> {
                                     KeyCode::Char('b') | KeyCode::Char('B') => bridge.toggle(&mut state),
                                     KeyCode::Char('i') | KeyCode::Char('I') => inventory.toggle(),
                                     KeyCode::Char('c') | KeyCode::Char('C') => crew_screen.toggle(&state),
+                                    KeyCode::Char('f') | KeyCode::Char('F') => diplomacy.toggle(),
                                     KeyCode::Char('m') | KeyCode::Char('M') => map_screen.toggle(&state),
                                     KeyCode::Char('p') | KeyCode::Char('P') => {
                                         if state.prestige() {
@@ -296,6 +301,8 @@ fn main() -> io::Result<()> {
                         "inventory"
                     } else if crew_screen.open {
                         "crew"
+                    } else if diplomacy.open {
+                        "diplomacy"
                     } else if bridge.open {
                         "bridge"
                     } else if upgrades.open {
@@ -326,6 +333,9 @@ fn main() -> io::Result<()> {
                     }
                     if bridge.open {
                         bridge.render(frame, &state);
+                    }
+                    if diplomacy.open {
+                        diplomacy.render(frame, &state);
                     }
                     if map_screen.open {
                         map_screen.render(frame, &state);
@@ -405,12 +415,13 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
             " UPGRADES │ ◇{} │ ₿{} │ [↑↓]Navigate [←→/Tab]Tabs [Enter]Buy [Esc]Close ",
             state.scrap, state.credits
         ),
+        "diplomacy" => " FACTIONS │ [↑↓]Browse [Esc]Close ".to_string(),
         "stats" => " STATS │ [Esc/Tab]Close ".to_string(),
         "map" => " SECTOR MAP │ [A/B/C]Choose Route [Esc]Close ".to_string(),
         "event" => " EVENT │ [↑↓]Select [Enter]Choose ".to_string(),
         _ => {
             let mut hud = format!(
-                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [I]nventory [C]rew [B]ridge [M]ap [Tab]Stats [Space]Skip ",
+                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [I]nventory [C]rew [F]actions [B]ridge [M]ap [Tab]Stats [Space]Skip ",
                 phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
             );
             if state.sector >= 30 {
@@ -424,6 +435,7 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
     // Determine label color based on context
     let (label, label_color) = match overlay {
         "crew" => ("CREW", Color::Magenta),
+        "diplomacy" => ("FACTIONS", Color::LightBlue),
         "inventory" => ("INVENTORY", Color::Yellow),
         "bridge" => ("BRIDGE", Color::Magenta),
         "upgrades" => ("UPGRADES", Color::Green),

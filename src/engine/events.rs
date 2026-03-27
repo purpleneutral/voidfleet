@@ -53,6 +53,10 @@ pub enum GameEvent {
     CrewDeserted { crew_name: String },
     CrewMoraleChange { crew_id: u64, amount: i8 },
     CrewBondProgress { crew_a_id: u64, crew_b_id: u64, amount: u32 },
+
+    // Factions
+    FactionRepChange { faction: String, amount: i32, reason: String },
+    FactionEncounter { faction: String, hostile: bool },
 }
 
 // ── Event Bus ───────────────────────────────────────────────────────────────
@@ -244,6 +248,24 @@ pub fn process_events(
             GameEvent::CrewBondProgress { crew_a_id, crew_b_id, amount } => {
                 if let Some(idx) = crate::engine::crew::find_bond(&state.crew_bonds, *crew_a_id, *crew_b_id) {
                     state.crew_bonds[idx].battles_together += amount;
+                }
+            }
+            // Faction events
+            GameEvent::FactionRepChange { faction, amount, reason } => {
+                let abs_amount = amount.unsigned_abs();
+                if abs_amount >= 10 {
+                    let direction = if *amount > 0 { "+" } else { "" };
+                    *popup_text = Some(format!(
+                        "{}{} rep with {} ({})",
+                        direction, amount, faction, reason
+                    ));
+                    *popup_timer = 50;
+                }
+            }
+            GameEvent::FactionEncounter { faction, hostile } => {
+                if *hostile {
+                    *popup_text = Some(format!("⚠ Hostile {} fleet detected!", faction));
+                    *popup_timer = 40;
                 }
             }
             // Other events are logged to history but don't trigger cross-system effects yet.

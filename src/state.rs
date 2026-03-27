@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::engine::crew::{CrewBond, CrewMember};
 use crate::engine::equipment::{Equipment, SetBonus, SET_BONUSES};
+use crate::engine::factions::{FactionMission, FactionReputation};
 use crate::engine::ship::{Ship, ShipType};
 
 fn default_route_modifier() -> f32 {
@@ -102,6 +103,12 @@ pub struct GameState {
     #[serde(default)]
     pub crew_bonds: Vec<CrewBond>,
 
+    // Factions
+    #[serde(default)]
+    pub faction_reputation: FactionReputation,
+    #[serde(default)]
+    pub pending_faction_mission: Option<FactionMission>,
+
     // Transient (not saved)
     #[serde(skip)]
     pub pending_popups: Vec<String>,
@@ -173,6 +180,8 @@ impl GameState {
             crew_capacity: 5,
             next_crew_id: 1,
             crew_bonds: Vec::new(),
+            faction_reputation: FactionReputation::default(),
+            pending_faction_mission: None,
             pending_popups: Vec::new(),
             pending_loot: Vec::new(),
         }
@@ -400,6 +409,8 @@ impl GameState {
         self.crew_roster.clear();
         self.crew_bonds.clear();
         self.next_crew_id = 1;
+        self.faction_reputation = FactionReputation::default();
+        self.pending_faction_mission = None;
         // Keep: achievements, deaths, highest_sector, prestige_level, totals, time_played, inventory_capacity, crew_capacity
         true
     }
@@ -490,5 +501,38 @@ impl GameState {
             self.level += 1;
             self.xp_to_next = (self.xp_to_next as f64 * 1.3) as u64;
         }
+    }
+
+    // ── Faction methods ────────────────────────────────────────────
+
+    /// Get player reputation with a faction.
+    pub fn get_reputation(&self, faction: crate::engine::factions::Faction) -> i32 {
+        self.faction_reputation.get(faction)
+    }
+
+    /// Change reputation with a faction (includes rival penalty cascade).
+    /// Returns vec of (faction_key, old_rep, new_rep) for all changes.
+    pub fn change_reputation(
+        &mut self,
+        faction: crate::engine::factions::Faction,
+        amount: i32,
+    ) -> Vec<(String, i32, i32)> {
+        self.faction_reputation.change(faction, amount)
+    }
+
+    /// Get the dominant faction for a given sector.
+    pub fn sector_faction(&self, sector: u32) -> crate::engine::factions::Faction {
+        crate::engine::factions::sector_dominant_faction(sector)
+    }
+
+    /// Check if a faction is hostile to the player.
+    pub fn is_hostile(&self, faction: crate::engine::factions::Faction) -> bool {
+        self.faction_reputation.is_hostile(faction)
+    }
+
+    /// Get price modifier for trading with a faction.
+    /// 0.7 (allied) to 1.5 (hostile).
+    pub fn price_modifier(&self, faction: crate::engine::factions::Faction) -> f32 {
+        self.faction_reputation.price_modifier(faction)
     }
 }

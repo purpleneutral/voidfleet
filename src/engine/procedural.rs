@@ -3,6 +3,8 @@
 
 use crate::state::GameState;
 
+use crate::engine::factions::Faction;
+
 /// Template for a generated enemy ship.
 #[derive(Debug, Clone)]
 pub struct EnemyTemplate {
@@ -12,6 +14,7 @@ pub struct EnemyTemplate {
     pub speed: f32,
     pub sprite: &'static [&'static str],
     pub is_boss: bool,
+    pub faction: Faction,
 }
 
 // -- Enemy sprite constants --------------------------------------------------
@@ -158,6 +161,20 @@ pub fn generate_enemy_fleet_adaptive(sector: u32, modifier: f32) -> Vec<EnemyTem
     fleet
 }
 
+/// Generate an enemy fleet with faction assignment based on sector.
+/// Uses `encounter_faction` to determine the faction, then stamps all ships.
+pub fn generate_enemy_fleet_faction(sector: u32, modifier: f32, encounter_seed: u32) -> Vec<EnemyTemplate> {
+    let faction = crate::engine::factions::encounter_faction(sector, encounter_seed);
+    let mut fleet = generate_enemy_fleet_adaptive(sector, modifier);
+
+    // Stamp all ships with the encounter faction
+    for enemy in &mut fleet {
+        enemy.faction = faction;
+    }
+
+    fleet
+}
+
 /// Sector difficulty multiplier — gradual power curve.
 fn sector_scale(sector: u32) -> f32 {
     1.0 + (sector as f32 - 1.0) * 0.08
@@ -183,6 +200,7 @@ fn generate_standard_fleet(sector: u32) -> Vec<EnemyTemplate> {
                     speed: 9.0,
                     sprite: SPRITE_PIRATE_SCOUT,
                     is_boss: false,
+                    faction: Faction::Independent,
                 })
                 .collect()
         }
@@ -198,6 +216,7 @@ fn generate_standard_fleet(sector: u32) -> Vec<EnemyTemplate> {
                             speed: 7.0,
                             sprite: SPRITE_MILITIA_FIGHTER,
                             is_boss: false,
+                    faction: Faction::Independent,
                         }
                     } else {
                         EnemyTemplate {
@@ -207,6 +226,7 @@ fn generate_standard_fleet(sector: u32) -> Vec<EnemyTemplate> {
                             speed: 5.0,
                             sprite: SPRITE_MILITIA_GUNSHIP,
                             is_boss: false,
+                    faction: Faction::Independent,
                         }
                     }
                 })
@@ -223,6 +243,7 @@ fn generate_standard_fleet(sector: u32) -> Vec<EnemyTemplate> {
                         speed: 4.5,
                         sprite: SPRITE_MILITARY_FRIGATE,
                         is_boss: false,
+                    faction: Faction::Independent,
                     },
                     1 => EnemyTemplate {
                         name: "Militia Gunship",
@@ -231,6 +252,7 @@ fn generate_standard_fleet(sector: u32) -> Vec<EnemyTemplate> {
                         speed: 5.0,
                         sprite: SPRITE_MILITIA_GUNSHIP,
                         is_boss: false,
+                    faction: Faction::Independent,
                     },
                     _ => EnemyTemplate {
                         name: "Militia Fighter",
@@ -239,6 +261,7 @@ fn generate_standard_fleet(sector: u32) -> Vec<EnemyTemplate> {
                         speed: 7.0,
                         sprite: SPRITE_MILITIA_FIGHTER,
                         is_boss: false,
+                    faction: Faction::Independent,
                     },
                 })
                 .collect()
@@ -255,6 +278,7 @@ fn generate_standard_fleet(sector: u32) -> Vec<EnemyTemplate> {
                         speed: 3.0,
                         sprite: SPRITE_MILITARY_DESTROYER,
                         is_boss: false,
+                    faction: Faction::Independent,
                     },
                     1 => EnemyTemplate {
                         name: "Military Frigate",
@@ -263,6 +287,7 @@ fn generate_standard_fleet(sector: u32) -> Vec<EnemyTemplate> {
                         speed: 4.5,
                         sprite: SPRITE_MILITARY_FRIGATE,
                         is_boss: false,
+                    faction: Faction::Independent,
                     },
                     2 => EnemyTemplate {
                         name: "Elite Cruiser",
@@ -271,6 +296,7 @@ fn generate_standard_fleet(sector: u32) -> Vec<EnemyTemplate> {
                         speed: 3.5,
                         sprite: SPRITE_ELITE_CRUISER,
                         is_boss: false,
+                    faction: Faction::Independent,
                     },
                     _ => EnemyTemplate {
                         name: "Militia Gunship",
@@ -279,6 +305,7 @@ fn generate_standard_fleet(sector: u32) -> Vec<EnemyTemplate> {
                         speed: 5.0,
                         sprite: SPRITE_MILITIA_GUNSHIP,
                         is_boss: false,
+                    faction: Faction::Independent,
                     },
                 })
                 .collect()
@@ -309,6 +336,7 @@ fn generate_fighter_swarm(sector: u32) -> Vec<EnemyTemplate> {
             speed,
             sprite,
             is_boss: false,
+                    faction: Faction::Independent,
         })
         .collect()
 }
@@ -326,6 +354,7 @@ fn generate_heavy_escort_fleet(sector: u32) -> Vec<EnemyTemplate> {
             speed: 3.0,
             sprite: SPRITE_MILITARY_DESTROYER,
             is_boss: false,
+                    faction: Faction::Independent,
         }
     } else if sector >= 16 {
         EnemyTemplate {
@@ -335,6 +364,7 @@ fn generate_heavy_escort_fleet(sector: u32) -> Vec<EnemyTemplate> {
             speed: 4.5,
             sprite: SPRITE_MILITARY_FRIGATE,
             is_boss: false,
+                    faction: Faction::Independent,
         }
     } else {
         EnemyTemplate {
@@ -344,6 +374,7 @@ fn generate_heavy_escort_fleet(sector: u32) -> Vec<EnemyTemplate> {
             speed: 5.0,
             sprite: SPRITE_MILITIA_GUNSHIP,
             is_boss: false,
+                    faction: Faction::Independent,
         }
     };
 
@@ -359,6 +390,7 @@ fn generate_heavy_escort_fleet(sector: u32) -> Vec<EnemyTemplate> {
             speed: 9.0,
             sprite: SPRITE_PIRATE_SCOUT,
             is_boss: false,
+                    faction: Faction::Independent,
         });
     }
 
@@ -376,6 +408,7 @@ fn generate_boss(sector: u32) -> EnemyTemplate {
             speed: 4.0,
             sprite: SPRITE_BOSS,
             is_boss: true,
+                    faction: Faction::Independent,
         },
         2 => EnemyTemplate {
             name: "Militia Commander",
@@ -384,6 +417,7 @@ fn generate_boss(sector: u32) -> EnemyTemplate {
             speed: 3.5,
             sprite: SPRITE_BOSS,
             is_boss: true,
+                    faction: Faction::Independent,
         },
         3 => EnemyTemplate {
             name: "Admiral Vex",
@@ -392,6 +426,7 @@ fn generate_boss(sector: u32) -> EnemyTemplate {
             speed: 3.0,
             sprite: SPRITE_BOSS_DREADNOUGHT,
             is_boss: true,
+                    faction: Faction::Independent,
         },
         _ => EnemyTemplate {
             name: "Void Dreadnought",
@@ -400,6 +435,7 @@ fn generate_boss(sector: u32) -> EnemyTemplate {
             speed: 2.0,
             sprite: SPRITE_BOSS_DREADNOUGHT,
             is_boss: true,
+                    faction: Faction::Independent,
         },
     }
 }
@@ -413,6 +449,7 @@ fn generate_heavy_escort(sector: u32) -> EnemyTemplate {
             speed: 3.5,
             sprite: SPRITE_ELITE_CRUISER,
             is_boss: false,
+                    faction: Faction::Independent,
         }
     } else {
         EnemyTemplate {
@@ -422,6 +459,7 @@ fn generate_heavy_escort(sector: u32) -> EnemyTemplate {
             speed: 4.5,
             sprite: SPRITE_MILITARY_FRIGATE,
             is_boss: false,
+                    faction: Faction::Independent,
         }
     }
 }
@@ -435,6 +473,7 @@ fn generate_escort(sector: u32) -> EnemyTemplate {
             speed: 5.0,
             sprite: SPRITE_MILITARY_FRIGATE,
             is_boss: false,
+                    faction: Faction::Independent,
         }
     } else {
         EnemyTemplate {
@@ -444,6 +483,7 @@ fn generate_escort(sector: u32) -> EnemyTemplate {
             speed: 8.0,
             sprite: SPRITE_MILITIA_FIGHTER,
             is_boss: false,
+                    faction: Faction::Independent,
         }
     }
 }

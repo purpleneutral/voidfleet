@@ -7,6 +7,7 @@ use ratatui::style::{Color, Style};
 
 use crate::engine::crew::{generate_crew, CrewClass};
 use crate::engine::equipment::{generate_equipment, Equipment, Rarity};
+use crate::engine::factions::{Faction, FactionMission, ReputationTier, sector_faction};
 use crate::engine::ship::{Ship, ShipType};
 use crate::rendering::particles::ParticleSystem;
 use crate::rendering::starfield::Starfield;
@@ -217,6 +218,14 @@ enum EventOutcome {
     CrewShoreLeave { crew_id: u64 },
     /// Crew deserts (removed from roster).
     CrewDesert { crew_id: u64 },
+    /// Modify faction reputation.
+    FactionRepChange { faction: Faction, amount: i32 },
+    /// Combined: modify two factions at once (faction conflict).
+    FactionConflict { help: Faction, help_amount: i32, hurt: Faction, hurt_amount: i32 },
+    /// Accept a faction mission.
+    AcceptFactionMission { faction: Faction, sectors: u32, reward_credits: u64, rep_reward: i32 },
+    /// Skip next battle (faction patrol escort).
+    FactionEscort,
 }
 
 struct TravelEvent {
@@ -266,10 +275,15 @@ enum EventType {
     CrewArguing,
     CrewDetectsSignal,
     CrewHomesick,
+    // Faction events
+    FactionPatrol,
+    FactionTrader,
+    FactionConflict,
+    FactionMission,
 }
 
 impl EventType {
-    const ALL: [EventType; 14] = [
+    const ALL: [EventType; 18] = [
         EventType::DistressSignal,
         EventType::AbandonedWreck,
         EventType::TradingPost,
@@ -284,6 +298,10 @@ impl EventType {
         EventType::CrewArguing,
         EventType::CrewDetectsSignal,
         EventType::CrewHomesick,
+        EventType::FactionPatrol,
+        EventType::FactionTrader,
+        EventType::FactionConflict,
+        EventType::FactionMission,
     ];
 }
 
@@ -403,6 +421,31 @@ fn event_weights(state: &GameState, last_event: Option<EventType>) -> Vec<(Event
                     2.0
                 } else {
                     0.0
+                }
+            }
+            EventType::FactionPatrol => {
+                // More common in later sectors
+                if state.sector > 5 { 1.5 } else { 0.5 }
+            }
+            EventType::FactionTrader => {
+                // Need resources to trade
+                let mut w = 0.8;
+                if state.credits > 200 || state.scrap > 200 { w += 0.5; }
+                if state.sector > 10 { w += 0.3; }
+                w
+            }
+            EventType::FactionConflict => {
+                // More common in border sectors and later game
+                if state.sector > 8 { 1.2 } else { 0.3 }
+            }
+            EventType::FactionMission => {
+                // Only if no active mission
+                if state.pending_faction_mission.is_some() {
+                    0.0
+                } else if state.sector > 5 {
+                    1.0
+                } else {
+                    0.3
                 }
             }
         };
@@ -761,6 +804,168 @@ fn generate_random_event(state: &GameState, last_event: Option<EventType>) -> (T
                 ],
             )
         }
+
+        // ── Faction events ───────────────────────────────────
+        EventType::FactionPatrol => {
+            let faction = sector_faction(state.sector);
+            let tier = state.faction_reputation.tier(faction);
+            match tier {
+                ReputationTier::Friendly | ReputationTier::Allied => {
+                    TravelEvent::new(
+                        &format!("{} {} Escort", faction.icon(), faction.name()),
+                        &format!("{} patrol ships hail you warmly.\n\"We'll escort you through this sector, friend.\"", faction.name()),
+                        vec![
+                            ("Accept escort (skip battle, +5 rep)".into(),
+                             EventOutcome::FactionEscort),
+                            ("Decline politely".into(), EventOutcome::Nothing),
+                        ],
+                    )
+                }
+                ReputationTier::Neutral => {
+                    let bribe = 50 + state.sector as u64 * 5;
+                    TravelEvent::new(
+                        &format!("{} {} Patrol", faction.icon(), faction.name()),
+                        &format!("{} patrol scans your cargo.\n\"Everything checks out... unless you'd like to expedite.\"", faction.name()),
+                        vec![
+                            (format!("Pay bribe (-{}₿, +3 rep)", bribe),
+                             if state.credits >= bribe {
+                                 EventOutcome::FactionRepChange { faction, amount: 3 }
+                             } else {
+                                 EventOutcome::Nothing
+                             }),
+                            ("Comply with scan".into(), EventOutcome::Nothing),
+                        ],
+                    )
+                }
+                ReputationTier::Unfriendly | ReputationTier::Hostile => {
+                    TravelEvent::new(
+                        &format!("{} {} Hostiles!", faction.icon(), faction.name()),
+                        &format!("{} ships lock weapons!\n\"You're not welcome here. Prepare to be boarded!\"", faction.name()),
+                        vec![
+                            ("Fight them off!".into(), EventOutcome::StartBattle),
+                            ("Try to flee (-2 rep)".into(),
+                             EventOutcome::FactionRepChange { faction, amount: -2 }),
+                        ],
+                    )
+                }
+            }
+        }
+        EventType::FactionTrader => {
+            let faction = sector_faction(state.sector);
+            let tier = state.faction_reputation.tier(faction);
+            let discount = match tier {
+                ReputationTier::Allied => 0.70,
+                ReputationTier::Friendly => 0.85,
+                ReputationTier::Neutral => 1.0,
+                ReputationTier::Unfriendly => 1.25,
+                ReputationTier::Hostile => 1.50,
+            };
+            let base_price = 200 + state.sector as u64 * 15;
+            let item_price = (base_price as f64 * discount) as u64;
+
+            let mut item = generate_equipment(state.sector, None);
+            for _ in 0..20 {
+                if item.rarity >= Rarity::Uncommon {
+                    break;
+                }
+                item = generate_equipment(state.sector, None);
+            }
+            let item_name = item.name.clone();
+
+            let heal_cost = (80.0 * discount) as u64;
+
+            TravelEvent::new(
+                &format!("{} {} Merchant", faction.icon(), faction.name()),
+                &format!("{} trader offers wares.\nDiscount: {}%", faction.name(),
+                    match tier {
+                        ReputationTier::Allied => "30% off",
+                        ReputationTier::Friendly => "15% off",
+                        ReputationTier::Neutral => "Standard",
+                        ReputationTier::Unfriendly => "25% markup",
+                        ReputationTier::Hostile => "50% markup",
+                    }),
+                vec![
+                    (format!("Buy {} (-{}₿)", item_name, item_price),
+                     if state.credits >= item_price {
+                         EventOutcome::BuyEquipment { item, credit_cost: item_price }
+                     } else {
+                         EventOutcome::Nothing
+                     }),
+                    (format!("Repair fleet (-{}₿)", heal_cost),
+                     if state.credits >= heal_cost {
+                         EventOutcome::HealFleet(heal_cost)
+                     } else {
+                         EventOutcome::Nothing
+                     }),
+                    ("Browse and leave (+3 rep)".into(),
+                     EventOutcome::FactionRepChange { faction, amount: 3 }),
+                ],
+            )
+        }
+        EventType::FactionConflict => {
+            // Pick two rival factions
+            let faction_a = sector_faction(state.sector);
+            let rivals = faction_a.rivals();
+            let faction_b = if rivals.is_empty() {
+                // Fallback: pick a random different faction
+                *Faction::TRACKABLE.iter().find(|&&f| f != faction_a).unwrap_or(&Faction::PirateClan)
+            } else {
+                rivals[rng.gen_range(0..rivals.len())]
+            };
+
+            let credits_reward = ((rng.gen_range(100..300) as f32) * scale) as u64;
+            let scrap_reward = ((rng.gen_range(80..200) as f32) * scale) as u64;
+
+            TravelEvent::new(
+                "⚔ Faction Conflict",
+                &format!("{} ships are under attack by {}!\nThey're calling for help on all frequencies.",
+                    faction_a.name(), faction_b.name()),
+                vec![
+                    (format!("Help {} (+15 rep, +{}₿)", faction_a.name(), credits_reward),
+                     EventOutcome::FactionConflict {
+                         help: faction_a, help_amount: 15,
+                         hurt: faction_b, hurt_amount: -10,
+                     }),
+                    (format!("Help {} (+15 rep, +{}◇)", faction_b.name(), scrap_reward),
+                     EventOutcome::FactionConflict {
+                         help: faction_b, help_amount: 15,
+                         hurt: faction_a, hurt_amount: -10,
+                     }),
+                    ("Stay out of it".into(), EventOutcome::Nothing),
+                ],
+            )
+        }
+        EventType::FactionMission => {
+            let faction = sector_faction(state.sector);
+            let sectors = rng.gen_range(3..7);
+            let reward = ((rng.gen_range(300..800) as f32) * scale) as u64;
+
+            let missions = [
+                "needs supplies delivered",
+                "requests a patrol escort",
+                "wants intel gathered",
+                "needs a package smuggled",
+                "requests diplomatic courier",
+            ];
+            let mission_desc = missions[rng.gen_range(0..missions.len())];
+
+            TravelEvent::new(
+                &format!("{} {} Contract", faction.icon(), faction.name()),
+                &format!("{} {}.\n\"Complete it within {} sectors for {}₿.\"",
+                    faction.name(), mission_desc, sectors, reward),
+                vec![
+                    (format!("Accept mission (+20 rep on completion)"),
+                     EventOutcome::AcceptFactionMission {
+                         faction,
+                         sectors,
+                         reward_credits: reward,
+                         rep_reward: 20,
+                     }),
+                    ("Decline (-2 rep)".into(),
+                     EventOutcome::FactionRepChange { faction, amount: -2 }),
+                ],
+            )
+        }
     };
 
     (event, event_type)
@@ -829,6 +1034,9 @@ pub struct TravelScene {
 
     // Navigator shortcut
     navigator_shortcut_checked: bool,
+
+    // Faction mission tick
+    faction_mission_checked: bool,
 }
 
 impl TravelScene {
@@ -853,6 +1061,7 @@ impl TravelScene {
             event_checked: false,
             last_event_type: None,
             navigator_shortcut_checked: false,
+            faction_mission_checked: false,
         }
     }
 
@@ -1310,6 +1519,46 @@ fn apply_event_outcome(outcome: EventOutcome, state: &mut GameState, _label: &st
                 "No effect.".to_string()
             }
         }
+        EventOutcome::FactionRepChange { faction, amount } => {
+            state.faction_reputation.change(faction, amount);
+            let tier = state.faction_reputation.tier(faction);
+            if amount >= 0 {
+                format!("{} rep +{} ({})", faction.name(), amount, tier.name())
+            } else {
+                format!("{} rep {} ({})", faction.name(), amount, tier.name())
+            }
+        }
+        EventOutcome::FactionConflict { help, help_amount, hurt, hurt_amount } => {
+            state.faction_reputation.change(help, help_amount);
+            state.faction_reputation.change(hurt, hurt_amount);
+            // Award some credits/scrap based on which faction was helped
+            let bonus = 100 + state.sector as u64 * 10;
+            state.credits += bonus;
+            format!(
+                "Helped {}! +{} rep. {} rep with {}. +{}₿",
+                help.name(), help_amount, hurt_amount, hurt.name(), bonus
+            )
+        }
+        EventOutcome::AcceptFactionMission { faction, sectors, reward_credits, rep_reward } => {
+            state.pending_faction_mission = Some(FactionMission {
+                faction,
+                description: format!("{} contract", faction.name()),
+                sectors_remaining: sectors,
+                reward_credits,
+                rep_reward,
+            });
+            format!(
+                "Accepted {} mission! Complete in {} sectors.",
+                faction.name(), sectors
+            )
+        }
+        EventOutcome::FactionEscort => {
+            let faction = sector_faction(state.sector);
+            state.faction_reputation.change(faction, 5);
+            // Add extra travel time to represent skipping a battle
+            state.phase_timer += 10.0;
+            format!("{} escorts protect your fleet! +5 rep", faction.name())
+        }
     }
 }
 
@@ -1334,6 +1583,7 @@ impl Scene for TravelScene {
         self.event = None;
         self.event_checked = false;
         self.navigator_shortcut_checked = false;
+        self.faction_mission_checked = false;
         // Note: last_event_type is intentionally NOT reset — prevents repeats across sectors
     }
 
@@ -1387,6 +1637,31 @@ impl Scene for TravelScene {
             // Still animate starfield/particles but don't advance travel
             self.starfield.tick();
             return SceneAction::Continue;
+        }
+
+        // ── Faction mission tick (once per sector entry) ─────
+        if !self.faction_mission_checked {
+            self.faction_mission_checked = true;
+            // Tick the mission (decrement sectors_remaining)
+            if let Some(ref mut mission) = state.pending_faction_mission {
+                if mission.tick_sector() {
+                    // Mission complete — collect rewards
+                    let faction = mission.faction;
+                    let credits = mission.reward_credits;
+                    let rep = mission.rep_reward;
+                    let name = faction.name().to_string();
+                    state.credits += credits;
+                    state.faction_reputation.change(faction, rep);
+                    state.pending_faction_mission = None;
+                    events.emit(crate::engine::events::GameEvent::EventResolved {
+                        event_type: "Faction Mission".to_string(),
+                        outcome: format!(
+                            "✓ {} mission complete! +{}₿ +{} rep",
+                            name, credits, rep
+                        ),
+                    });
+                }
+            }
         }
 
         // ── Navigator shortcut check (once at start of travel) ─────
