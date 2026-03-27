@@ -9,64 +9,89 @@ use super::{Scene, SceneAction};
 
 // ── Planet types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanetType {
     Desert,
     Urban,
     Ice,
     Volcanic,
+    Ocean,
 }
 
 impl PlanetType {
     fn pick(rng: &mut impl Rng) -> Self {
-        match rng.gen_range(0..4) {
+        match rng.gen_range(0..5) {
             0 => Self::Desert,
             1 => Self::Urban,
             2 => Self::Ice,
-            _ => Self::Volcanic,
+            3 => Self::Volcanic,
+            _ => Self::Ocean,
         }
     }
 
     /// Fill a terrain row with appropriate block characters.
-    fn terrain_chars(&self, rng: &mut impl Rng, width: usize) -> Vec<char> {
+    fn terrain_chars(&self, rng: &mut impl Rng, width: usize, row: usize) -> Vec<char> {
         (0..width)
-            .map(|_| match self {
+            .map(|_col| match self {
                 Self::Desert => {
-                    let r: u8 = rng.gen_range(0..10);
-                    if r < 5 { '▒' } else { '░' }
-                }
-                Self::Urban => {
-                    let r: u8 = rng.gen_range(0..12);
-                    if r < 4 {
-                        '█'
-                    } else if r < 7 {
-                        '▓'
-                    } else if r < 9 {
+                    let r: u8 = rng.gen_range(0..20);
+                    if r < 6 {
+                        '░'
+                    } else if r < 12 {
                         '▒'
+                    } else if r == 12 && row == 0 {
+                        'ψ' // cactus on surface row
                     } else {
-                        '▪'
+                        '░'
                     }
                 }
-                Self::Ice => {
+                Self::Urban => {
+                    // Buildings are handled separately via building structs
                     let r: u8 = rng.gen_range(0..10);
                     if r < 4 {
                         '░'
                     } else if r < 7 {
+                        '▒'
+                    } else {
                         '·'
+                    }
+                }
+                Self::Ice => {
+                    let r: u8 = rng.gen_range(0..15);
+                    if r < 5 {
+                        '░'
+                    } else if r < 8 {
+                        '·'
+                    } else if r < 11 {
+                        '∙'
                     } else {
                         '▒'
                     }
                 }
                 Self::Volcanic => {
-                    let r: u8 = rng.gen_range(0..10);
+                    let r: u8 = rng.gen_range(0..15);
                     if r < 4 {
                         '▓'
-                    } else if r < 7 {
+                    } else if r < 8 {
                         '▒'
-                    } else if r < 9 {
+                    } else if r < 11 {
                         '~'
                     } else {
                         '░'
+                    }
+                }
+                Self::Ocean => {
+                    let r: u8 = rng.gen_range(0..15);
+                    if r < 5 {
+                        '≈'
+                    } else if r < 9 {
+                        '∼'
+                    } else if r < 12 {
+                        '~'
+                    } else if r == 12 && row == 0 {
+                        '▓' // small island
+                    } else {
+                        '≈'
                     }
                 }
             })
@@ -79,15 +104,37 @@ impl PlanetType {
             Self::Urban => Color::Gray,
             Self::Ice => Color::Cyan,
             Self::Volcanic => Color::Red,
+            Self::Ocean => Color::Blue,
         }
     }
 
     fn terrain_bg(&self) -> Color {
         match self {
-            Self::Desert => Color::Indexed(94),  // dark yellow/brown
+            Self::Desert => Color::Indexed(94),   // dark yellow/brown
             Self::Urban => Color::DarkGray,
-            Self::Ice => Color::Indexed(17),      // dark blue
-            Self::Volcanic => Color::Indexed(52), // dark red
+            Self::Ice => Color::Indexed(17),       // dark blue
+            Self::Volcanic => Color::Indexed(52),  // dark red
+            Self::Ocean => Color::Indexed(18),     // deep blue
+        }
+    }
+
+    fn resource_char(&self) -> char {
+        match self {
+            Self::Desert => '·',
+            Self::Urban => '◇',
+            Self::Ice => '✦',
+            Self::Volcanic => '◆',
+            Self::Ocean => '○',
+        }
+    }
+
+    fn resource_color(&self) -> Color {
+        match self {
+            Self::Desert => Color::Yellow,
+            Self::Urban => Color::LightYellow,
+            Self::Ice => Color::LightCyan,
+            Self::Volcanic => Color::LightRed,
+            Self::Ocean => Color::LightGreen,
         }
     }
 }
@@ -100,6 +147,8 @@ struct SurfaceEntity {
     base_speed: f32,
     kind: EntityKind,
     scared: bool,
+    frozen_timer: u8,     // frames of freeze-in-fear before running
+    panic_exclaim: u8,    // frames to show ! above head
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +171,19 @@ impl EntityKind {
             Self::Vehicle => Color::LightYellow,
         }
     }
+}
+
+// ── Buildings (urban planet) ────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct Building {
+    x: u16,
+    width: u8,       // 1-3 columns
+    height: u8,      // 2-4 rows tall (current, shrinks under beam)
+    #[allow(dead_code)]
+    max_height: u8,
+    destroyed: bool,
+    crumble_timer: u8, // ticks until next crumble step
 }
 
 // ── Defense turrets ─────────────────────────────────────────────────────
@@ -156,7 +218,8 @@ struct TractorBeam {
 struct HoverShip {
     x: f32,
     base_y: f32,
-    bob_offset: f32, // phase offset for bobbing
+    current_y: f32,    // for entry animation
+    bob_offset: f32,   // phase offset for bobbing
     flash_frames: u8,
 }
 
@@ -164,8 +227,8 @@ struct HoverShip {
 
 const TERRAIN_ROWS: u16 = 4;
 const TICK_DT: f32 = 0.05; // 20fps
-const BEAM_CHARS: [char; 4] = ['│', '↓', '|', ':'];
-const RESOURCE_CHARS: [char; 3] = ['·', '°', '◦'];
+const BEAM_CHARS: [char; 4] = ['│', '┃', '║', ':'];
+const ENTRY_FRAMES: u64 = 20;
 
 pub struct RaidScene {
     width: u16,
@@ -175,6 +238,9 @@ pub struct RaidScene {
 
     // Terrain grid: [row][col], row 0 is top row of terrain
     terrain: Vec<Vec<char>>,
+
+    // Buildings (urban only)
+    buildings: Vec<Building>,
 
     // Ships hovering
     ships: Vec<HoverShip>,
@@ -209,6 +275,7 @@ impl RaidScene {
             tick_count: 0,
             planet_type: PlanetType::Desert,
             terrain: Vec::new(),
+            buildings: Vec::new(),
             ships: Vec::new(),
             beams: Vec::new(),
             entities: Vec::new(),
@@ -230,8 +297,32 @@ impl RaidScene {
         let mut rng = rand::thread_rng();
         self.terrain.clear();
         let w = self.width as usize;
-        for _ in 0..TERRAIN_ROWS {
-            self.terrain.push(self.planet_type.terrain_chars(&mut rng, w));
+        for row in 0..TERRAIN_ROWS as usize {
+            self.terrain
+                .push(self.planet_type.terrain_chars(&mut rng, w, row));
+        }
+    }
+
+    fn generate_buildings(&mut self) {
+        let mut rng = rand::thread_rng();
+        self.buildings.clear();
+        if self.planet_type != PlanetType::Urban {
+            return;
+        }
+        // Place buildings across the width
+        let mut x: u16 = rng.gen_range(2..6);
+        while x < self.width.saturating_sub(4) {
+            let w = rng.gen_range(1..=3_u8);
+            let h = rng.gen_range(2..=4_u8);
+            self.buildings.push(Building {
+                x,
+                width: w,
+                height: h,
+                max_height: h,
+                destroyed: false,
+                crumble_timer: 0,
+            });
+            x += w as u16 + rng.gen_range(2..6);
         }
     }
 
@@ -239,20 +330,18 @@ impl RaidScene {
         let mut rng = rand::thread_rng();
         self.ships.clear();
 
-        let top_margin = 2.0_f32;
-        let fleet_zone_bottom = (self.surface_top_y() as f32) - 4.0;
-        let fleet_zone_height = (fleet_zone_bottom - top_margin).max(4.0);
-        let spacing = (fleet_zone_height / fleet_size.max(1) as f32).min(3.0);
-
-        let start_y = top_margin
-            + (fleet_zone_height - spacing * fleet_size as f32).max(0.0) / 2.0;
+        // Spread ships horizontally across the top
+        let hover_y = 3.0_f32; // stable hover row
+        let usable_width = (self.width as f32 - 8.0).max(10.0);
+        let n = fleet_size.max(1);
+        let spacing = usable_width / n as f32;
 
         for i in 0..fleet_size {
-            let x = rng.gen_range(4.0..(self.width as f32 * 0.8).max(10.0));
-            let base_y = start_y + i as f32 * spacing;
+            let x = 4.0 + (i as f32 + 0.5) * spacing;
             self.ships.push(HoverShip {
                 x,
-                base_y,
+                base_y: hover_y,
+                current_y: -3.0, // start above screen for entry animation
                 bob_offset: rng.gen_range(0.0..std::f32::consts::TAU),
                 flash_frames: 0,
             });
@@ -263,13 +352,13 @@ impl RaidScene {
         self.beams.clear();
         let surface_y = self.surface_top_y();
         for (i, ship) in self.ships.iter().enumerate() {
-            let ship_y = ship.base_y as u16 + 1; // beam starts just below ship
+            let ship_y = ship.base_y as u16 + 2; // beam starts just below ship
             self.beams.push(TractorBeam {
-                x: ship.x as u16 + 1, // roughly center of sprite
+                x: ship.x as u16 + 1,
                 ship_y,
                 surface_y,
                 frame: (i as u8).wrapping_mul(7), // stagger animation
-                active: true,
+                active: false, // activated after entry
             });
         }
     }
@@ -297,6 +386,8 @@ impl RaidScene {
                 },
                 kind,
                 scared: false,
+                frozen_timer: 0,
+                panic_exclaim: 0,
             });
         }
     }
@@ -323,7 +414,6 @@ impl RaidScene {
 
     fn degrade_terrain(&mut self) {
         let mut rng = rand::thread_rng();
-        // Pick a random beam contact point and degrade nearby terrain
         if self.terrain.is_empty() {
             return;
         }
@@ -347,6 +437,156 @@ impl RaidScene {
             }
         }
     }
+
+    fn crumble_buildings(&mut self, particles: &mut ParticleSystem) {
+        if self.planet_type != PlanetType::Urban {
+            return;
+        }
+        let mut rng = rand::thread_rng();
+        let beam_xs: Vec<u16> = self
+            .beams
+            .iter()
+            .filter(|b| b.active)
+            .map(|b| b.x)
+            .collect();
+        let surface_y = self.surface_top_y();
+
+        for bld in &mut self.buildings {
+            if bld.destroyed {
+                continue;
+            }
+            // Check if any beam overlaps this building
+            let under_beam = beam_xs.iter().any(|&bx| {
+                bx >= bld.x && bx < bld.x + bld.width as u16
+            });
+            if !under_beam {
+                bld.crumble_timer = 0;
+                continue;
+            }
+            bld.crumble_timer += 1;
+            // Crumble every ~20 ticks (1 second)
+            if bld.crumble_timer >= 20 {
+                bld.crumble_timer = 0;
+                if bld.height > 0 {
+                    bld.height -= 1;
+                    // Debris particles
+                    let cx = bld.x as f32 + bld.width as f32 / 2.0;
+                    let cy = surface_y as f32 - bld.height as f32;
+                    for _ in 0..5 {
+                        particles.emit(Particle::new(
+                            cx + rng.gen_range(-1.5..1.5),
+                            cy,
+                            rng.gen_range(-0.5..0.5),
+                            rng.gen_range(-0.3..0.3),
+                            rng.gen_range(5..12),
+                            if rng.gen_bool(0.5) { '▪' } else { '·' },
+                            Color::DarkGray,
+                        ));
+                    }
+                }
+                if bld.height == 0 {
+                    bld.destroyed = true;
+                }
+            }
+        }
+    }
+
+    /// Emit atmosphere entry particles below descending ships.
+    fn emit_entry_particles(&self, particles: &mut ParticleSystem) {
+        let mut rng = rand::thread_rng();
+        for ship in &self.ships {
+            if ship.current_y >= ship.base_y {
+                continue;
+            }
+            // Re-entry flame below ship
+            for _ in 0..3 {
+                let colors = [Color::Red, Color::LightRed, Color::Yellow, Color::LightYellow];
+                particles.emit(Particle::new(
+                    ship.x + rng.gen_range(-1.0..3.0),
+                    ship.current_y + 2.0,
+                    rng.gen_range(-0.3..0.3),
+                    rng.gen_range(0.3..1.0),
+                    rng.gen_range(3..8),
+                    if rng.gen_bool(0.5) { '▓' } else { '░' },
+                    colors[rng.gen_range(0..colors.len())],
+                ));
+            }
+        }
+    }
+
+    /// Emit ambient particles based on planet type.
+    fn emit_ambient_particles(&self, particles: &mut ParticleSystem) {
+        let mut rng = rand::thread_rng();
+        let surface_y = self.surface_top_y();
+        match self.planet_type {
+            PlanetType::Ice => {
+                // Snowflakes drifting down
+                if rng.gen_range(0..4) == 0 {
+                    particles.emit(Particle::new(
+                        rng.gen_range(0.0..self.width as f32),
+                        rng.gen_range(1.0..4.0),
+                        rng.gen_range(-0.15..0.15),
+                        rng.gen_range(0.1..0.3),
+                        rng.gen_range(20..40),
+                        '❄',
+                        if rng.gen_bool(0.5) {
+                            Color::White
+                        } else {
+                            Color::Cyan
+                        },
+                    ));
+                }
+            }
+            PlanetType::Volcanic => {
+                // Embers floating up from surface
+                if rng.gen_range(0..5) == 0 {
+                    let lava_cols: Vec<usize> = self
+                        .terrain
+                        .first()
+                        .map(|row| {
+                            row.iter()
+                                .enumerate()
+                                .filter(|&(_, c)| *c == '~')
+                                .map(|(i, _)| i)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !lava_cols.is_empty() {
+                        let col = lava_cols[rng.gen_range(0..lava_cols.len())];
+                        particles.emit(Particle::new(
+                            col as f32,
+                            surface_y as f32 - 1.0,
+                            rng.gen_range(-0.1..0.1),
+                            rng.gen_range(-0.4..-0.1),
+                            rng.gen_range(6..14),
+                            if rng.gen_bool(0.6) { '·' } else { '*' },
+                            if rng.gen_bool(0.5) {
+                                Color::LightRed
+                            } else {
+                                Color::Yellow
+                            },
+                        ));
+                    }
+                }
+            }
+            PlanetType::Ocean => {
+                // Fish jumping
+                if rng.gen_range(0..30) == 0 {
+                    let x = rng.gen_range(2.0..(self.width as f32 - 2.0));
+                    particles.emit(Particle::new(
+                        x,
+                        surface_y as f32 - 1.0,
+                        rng.gen_range(-0.2..0.2),
+                        rng.gen_range(-0.5..-0.2),
+                        rng.gen_range(4..8),
+                        '♓',
+                        Color::LightCyan,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Scene for RaidScene {
@@ -365,6 +605,7 @@ impl Scene for RaidScene {
         self.raid_duration = 15.0 + (state.sector as f32 * 0.5).min(15.0);
 
         self.generate_terrain();
+        self.generate_buildings();
         self.position_fleet(state.fleet.len());
         self.spawn_beams();
         self.spawn_entities();
@@ -376,10 +617,33 @@ impl Scene for RaidScene {
         self.elapsed += TICK_DT;
 
         let mut rng = rand::thread_rng();
+        let in_entry = self.tick_count <= ENTRY_FRAMES;
+
+        // ── Atmosphere entry animation ──────────────────────────────────
+        if in_entry {
+            let progress = self.tick_count as f32 / ENTRY_FRAMES as f32;
+            for ship in &mut self.ships {
+                // Lerp from above-screen to base_y
+                ship.current_y = -3.0 + (ship.base_y + 3.0) * progress;
+            }
+            self.emit_entry_particles(particles);
+
+            // Activate beams once entry completes
+            if self.tick_count == ENTRY_FRAMES {
+                for beam in &mut self.beams {
+                    beam.active = true;
+                }
+            }
+
+            // Don't run game logic during entry
+            return SceneAction::Continue;
+        }
 
         // ── Bob ships gently ────────────────────────────────────────────
         let t = self.tick_count as f32 * 0.08;
         for ship in &mut self.ships {
+            let bob = (t + ship.bob_offset).sin() * 0.5;
+            ship.current_y = ship.base_y + bob;
             if ship.flash_frames > 0 {
                 ship.flash_frames -= 1;
             }
@@ -388,12 +652,14 @@ impl Scene for RaidScene {
         // ── Animate beams ───────────────────────────────────────────────
         for (i, beam) in self.beams.iter_mut().enumerate() {
             beam.frame = beam.frame.wrapping_add(1);
-            // Update beam x to follow ship bob (horizontal stays fixed, y bobs)
             if let Some(ship) = self.ships.get(i) {
-                let bob = (t + ship.bob_offset).sin() * 0.5;
-                beam.ship_y = (ship.base_y + bob) as u16 + 1;
+                beam.ship_y = ship.current_y as u16 + 2;
+                beam.x = ship.x as u16 + 1;
             }
         }
+
+        // ── Ambient particles ───────────────────────────────────────────
+        self.emit_ambient_particles(particles);
 
         // ── Resource extraction (ticking up) ────────────────────────────
         if self.tick_count % 10 == 0 {
@@ -414,7 +680,8 @@ impl Scene for RaidScene {
                 if !beam.active {
                     continue;
                 }
-                let ch = RESOURCE_CHARS[rng.gen_range(0..RESOURCE_CHARS.len())];
+                let ch = self.planet_type.resource_char();
+                let color = self.planet_type.resource_color();
                 particles.emit(Particle::new(
                     beam.x as f32 + rng.gen_range(-1.0..1.0),
                     beam.surface_y as f32 - 1.0,
@@ -422,7 +689,7 @@ impl Scene for RaidScene {
                     rng.gen_range(-0.6..-0.2),
                     rng.gen_range(8..16),
                     ch,
-                    Color::Yellow,
+                    color,
                 ));
             }
         }
@@ -436,37 +703,56 @@ impl Scene for RaidScene {
             }
         }
 
-        // ── Surface entity movement ─────────────────────────────────────
-        let beam_xs: Vec<f32> = self.beams.iter().map(|b| b.x as f32).collect();
+        // ── Surface entity movement with panic behavior ─────────────────
+        let beam_xs: Vec<f32> = self
+            .beams
+            .iter()
+            .filter(|b| b.active)
+            .map(|b| b.x as f32)
+            .collect();
         for entity in &mut self.entities {
-            // Check if near a beam → scatter
-            let near_beam = beam_xs
-                .iter()
-                .any(|bx| (entity.x - bx).abs() < 6.0);
+            // Check if near a beam → trigger fear
+            let near_beam = beam_xs.iter().any(|bx| (entity.x - bx).abs() < 8.0);
+            let was_scared = entity.scared;
             entity.scared = near_beam;
 
+            // First time getting scared: freeze briefly, then run
+            if near_beam && !was_scared {
+                entity.frozen_timer = rng.gen_range(3..10); // freeze 3-10 frames
+                entity.panic_exclaim = 12; // show ! for 12 frames
+            }
+
+            // Tick down panic indicators
+            if entity.panic_exclaim > 0 {
+                entity.panic_exclaim -= 1;
+            }
+
+            // Frozen: don't move
+            if entity.frozen_timer > 0 {
+                entity.frozen_timer -= 1;
+                continue;
+            }
+
             let speed = if entity.scared {
-                entity.base_speed * 3.0
+                entity.base_speed.abs() * 4.0 // run FASTER
             } else {
-                entity.base_speed
+                entity.base_speed.abs()
             };
 
-            // If scared, run away from nearest beam
+            // If scared, run OPPOSITE direction from nearest beam
             if entity.scared {
-                if let Some(nearest_bx) = beam_xs
-                    .iter()
-                    .min_by(|a, b| {
-                        (entity.x - **a)
-                            .abs()
-                            .partial_cmp(&(entity.x - **b).abs())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                {
+                if let Some(nearest_bx) = beam_xs.iter().min_by(|a, b| {
+                    (entity.x - **a)
+                        .abs()
+                        .partial_cmp(&(entity.x - **b).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }) {
                     let dir = if entity.x < *nearest_bx { -1.0 } else { 1.0 };
-                    entity.x += dir * speed.abs();
+                    entity.x += dir * speed;
                 }
             } else {
-                entity.x += speed;
+                let dir = if entity.base_speed >= 0.0 { 1.0 } else { -1.0 };
+                entity.x += dir * speed;
             }
 
             // Bounce at edges
@@ -479,13 +765,15 @@ impl Scene for RaidScene {
             }
         }
 
+        // ── Building destruction ────────────────────────────────────────
+        self.crumble_buildings(particles);
+
         // ── Turret firing ───────────────────────────────────────────────
         let fire_y = self.surface_top_y() as f32 - 1.0;
         for turret in &mut self.turrets {
             if turret.cooldown > 0 {
                 turret.cooldown -= 1;
             } else {
-                // Fire!
                 self.projectiles.push(TurretProjectile {
                     x: turret.x as f32,
                     y: fire_y,
@@ -496,20 +784,17 @@ impl Scene for RaidScene {
         }
 
         // ── Update turret projectiles ───────────────────────────────────
+        let ships = &mut self.ships;
         self.projectiles.retain_mut(|proj| {
             proj.y += proj.vy;
 
-            // Check hit against ships
-            for ship in &mut self.ships {
-                let bob = (t + ship.bob_offset).sin() * 0.5;
-                let ship_y = ship.base_y + bob;
+            for ship in ships.iter_mut() {
                 let dx = (proj.x - ship.x).abs();
-                let dy = (proj.y - ship_y).abs();
+                let dy = (proj.y - ship.current_y).abs();
                 if dx < 3.0 && dy < 1.5 {
                     ship.flash_frames = 6;
-                    // Small explosion particle
                     particles.explode(proj.x, proj.y, 4, Color::Red);
-                    return false; // consumed
+                    return false;
                 }
             }
 
@@ -532,13 +817,34 @@ impl Scene for RaidScene {
     fn render(&self, frame: &mut Frame, state: &GameState, particles: &ParticleSystem) {
         let area = frame.area();
         let buf = frame.buffer_mut();
-        let t = self.tick_count as f32 * 0.08;
         let surface_y = self.surface_top_y();
 
         // ── Draw terrain ────────────────────────────────────────────────
         let fg = self.planet_type.terrain_fg();
         let bg = self.planet_type.terrain_bg();
         let terrain_style = Style::default().fg(fg).bg(bg);
+
+        // For volcanic: lava pools glow with cycling color
+        let lava_glow = if self.planet_type == PlanetType::Volcanic {
+            if self.tick_count % 8 < 4 {
+                Color::LightRed
+            } else {
+                Color::Yellow
+            }
+        } else {
+            fg
+        };
+
+        // For ocean: water shifts subtly
+        let water_fg = if self.planet_type == PlanetType::Ocean {
+            if self.tick_count % 10 < 5 {
+                Color::Blue
+            } else {
+                Color::LightBlue
+            }
+        } else {
+            fg
+        };
 
         for (row_idx, row) in self.terrain.iter().enumerate() {
             let y = surface_y + row_idx as u16;
@@ -552,12 +858,89 @@ impl Scene for RaidScene {
                 }
                 let cell = &mut buf[(area.x + x, area.y + y)];
                 if ch == ' ' {
-                    // Degraded — show gap with just background
                     cell.set_char(' ');
                     cell.set_style(Style::default().bg(bg));
                 } else {
                     cell.set_char(ch);
-                    cell.set_style(terrain_style);
+                    match self.planet_type {
+                        PlanetType::Volcanic if ch == '~' => {
+                            cell.set_style(Style::default().fg(lava_glow).bg(bg));
+                        }
+                        PlanetType::Ocean if ch == '≈' || ch == '∼' || ch == '~' => {
+                            cell.set_style(Style::default().fg(water_fg).bg(bg));
+                        }
+                        PlanetType::Desert if ch == 'ψ' => {
+                            cell.set_style(Style::default().fg(Color::Green).bg(bg));
+                        }
+                        PlanetType::Ocean if ch == '▓' => {
+                            // Island
+                            cell.set_style(
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .bg(Color::Indexed(94)),
+                            );
+                        }
+                        PlanetType::Ice if ch == '∙' => {
+                            cell.set_style(Style::default().fg(Color::White).bg(bg));
+                        }
+                        _ => {
+                            cell.set_style(terrain_style);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Draw buildings (urban) ──────────────────────────────────────
+        if self.planet_type == PlanetType::Urban {
+            for bld in &self.buildings {
+                if bld.destroyed {
+                    // Rubble
+                    let rubble_y = surface_y;
+                    for dx in 0..bld.width as u16 {
+                        let bx = bld.x + dx;
+                        if bx < area.width && rubble_y < area.height {
+                            let cell = &mut buf[(area.x + bx, area.y + rubble_y)];
+                            let rubble_chars = ['.', ':', '.'];
+                            cell.set_char(
+                                rubble_chars[(bx as usize + self.tick_count as usize / 10)
+                                    % rubble_chars.len()],
+                            );
+                            cell.set_fg(Color::DarkGray);
+                        }
+                    }
+                    continue;
+                }
+                // Draw building columns
+                for h in 0..bld.height as u16 {
+                    let by = surface_y.saturating_sub(h + 1);
+                    for dx in 0..bld.width as u16 {
+                        let bx = bld.x + dx;
+                        if bx < area.width && by < area.height && by > 0 {
+                            let cell = &mut buf[(area.x + bx, area.y + by)];
+                            // Outer vs inner
+                            if h == bld.height as u16 - 1 {
+                                cell.set_char('▓');
+                            } else {
+                                // Flickering windows
+                                let is_window = (bx as usize + h as usize) % 2 == 0;
+                                let window_on = is_window
+                                    && ((self.tick_count as usize / 6 + bx as usize + h as usize)
+                                        % 7
+                                        != 0);
+                                if window_on {
+                                    cell.set_char('▪');
+                                    cell.set_fg(Color::LightYellow);
+                                } else {
+                                    cell.set_char('█');
+                                    cell.set_fg(Color::Gray);
+                                }
+                            }
+                            if h == bld.height as u16 - 1 {
+                                cell.set_fg(Color::DarkGray);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -574,6 +957,16 @@ impl Scene for RaidScene {
                 } else {
                     entity.kind.color()
                 });
+
+                // Exclamation mark above panicking entities
+                if entity.panic_exclaim > 0 || (entity.scared && entity.frozen_timer > 0) {
+                    let ey = entity_y.saturating_sub(1);
+                    if ey > 0 && ey < area.height && ex < area.width {
+                        let exclaim_cell = &mut buf[(area.x + ex, area.y + ey)];
+                        exclaim_cell.set_char('!');
+                        exclaim_cell.set_fg(Color::LightRed);
+                    }
+                }
             }
         }
 
@@ -599,7 +992,7 @@ impl Scene for RaidScene {
             }
         }
 
-        // ── Draw tractor beams ──────────────────────────────────────────
+        // ── Draw tractor beams with color gradient ──────────────────────
         for beam in &self.beams {
             if !beam.active {
                 continue;
@@ -608,27 +1001,45 @@ impl Scene for RaidScene {
             if x >= area.width {
                 continue;
             }
+            let beam_len = beam.surface_y.saturating_sub(beam.ship_y).max(1) as f32;
             for y in beam.ship_y..beam.surface_y {
                 if y >= area.height {
                     break;
                 }
-                // Cycling animation: offset by row to create a flowing effect
                 let anim_idx =
                     (beam.frame as usize + y as usize) % BEAM_CHARS.len();
                 let ch = BEAM_CHARS[anim_idx];
                 let cell = &mut buf[(area.x + x, area.y + y)];
                 cell.set_char(ch);
-                // Fade beam color: brighter near surface
-                let progress =
-                    (y - beam.ship_y) as f32 / (beam.surface_y - beam.ship_y).max(1) as f32;
-                let color = if progress > 0.7 {
-                    Color::LightGreen
-                } else if progress > 0.3 {
-                    Color::Green
+
+                // Gradient: bright cyan at ship → dim blue at surface
+                let progress = (y - beam.ship_y) as f32 / beam_len;
+                let color = if progress < 0.2 {
+                    Color::LightCyan
+                } else if progress < 0.4 {
+                    Color::Cyan
+                } else if progress < 0.65 {
+                    Color::Blue
+                } else if progress < 0.85 {
+                    Color::Indexed(25) // dim blue
                 } else {
                     Color::DarkGray
                 };
-                cell.set_fg(color);
+                // Cycle: shift the gradient based on frame
+                let cycle_offset = (beam.frame as f32 * 0.1).sin() * 0.15;
+                let adj_progress = (progress + cycle_offset).clamp(0.0, 1.0);
+                let final_color = if adj_progress < 0.2 {
+                    Color::LightCyan
+                } else if adj_progress < 0.4 {
+                    Color::Cyan
+                } else if adj_progress < 0.65 {
+                    Color::Blue
+                } else if adj_progress < 0.85 {
+                    Color::Indexed(25)
+                } else {
+                    color // fallback to original
+                };
+                cell.set_fg(final_color);
             }
         }
 
@@ -638,8 +1049,7 @@ impl Scene for RaidScene {
                 break;
             }
             let hover = &self.ships[i];
-            let bob = (t + hover.bob_offset).sin() * 0.5;
-            let draw_y = hover.base_y + bob;
+            let draw_y = hover.current_y;
 
             let is_flashing = hover.flash_frames > 0 && hover.flash_frames % 2 == 0;
             let ship_color = if is_flashing {
@@ -678,11 +1088,21 @@ impl Scene for RaidScene {
 
         // ── HUD: status bar at bottom ───────────────────────────────────
         let status_y = area.height.saturating_sub(1);
+        let res_char = self.planet_type.resource_char();
+        let planet_label = match self.planet_type {
+            PlanetType::Desert => "DESERT",
+            PlanetType::Urban => "URBAN",
+            PlanetType::Ice => "ICE",
+            PlanetType::Volcanic => "VOLCANIC",
+            PlanetType::Ocean => "OCEAN",
+        };
         let status = format!(
-            " RAID │ Sector {} │ {:.0}s │ +{}◇ +{}₿ │ Fleet: {} │ Lv.{} ",
+            " RAID │ {} │ Sector {} │ {:.0}s │ +{}{} +{}₿ │ Fleet: {} │ Lv.{} ",
+            planet_label,
             state.sector,
             state.phase_timer.max(0.0),
             self.scrap_gained,
+            res_char,
             self.credits_gained,
             state.fleet.len(),
             state.level,
