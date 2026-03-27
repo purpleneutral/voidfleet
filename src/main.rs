@@ -14,6 +14,7 @@ use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 
 use engine::achievements::check_achievements;
+use engine::events::{EventBus, process_events};
 use rendering::particles::ParticleSystem;
 use scenes::{Scene, SceneAction};
 use scenes::battle::BattleScene;
@@ -24,6 +25,7 @@ use scenes::title::TitleScreen;
 use scenes::travel::TravelScene;
 use scenes::bridge::BridgeScene;
 use scenes::inventory::InventoryScreen;
+use scenes::crew::CrewScreen;
 use scenes::upgrades::UpgradeScreen;
 use scenes::map::MapScreen;
 use state::{GamePhase, GameState};
@@ -63,12 +65,16 @@ fn main() -> io::Result<()> {
     // Particle system (shared across scenes)
     let mut particles = ParticleSystem::new();
 
+    // Event bus (decouples game systems)
+    let mut event_bus = EventBus::new();
+
     // Overlay screens
     let mut upgrades = UpgradeScreen::new();
     let mut stats = StatsScreen::new();
     let mut bridge = BridgeScene::new();
     let mut inventory = InventoryScreen::new();
     let mut map_screen = MapScreen::new();
+    let mut crew_screen = CrewScreen::new();
 
     // Achievement popup display
     let mut popup_text: Option<String> = None;
@@ -142,6 +148,8 @@ fn main() -> io::Result<()> {
                                     KeyCode::Esc => inventory.toggle(),
                                     other => inventory.handle_input(other, &mut state),
                                 }
+                            } else if crew_screen.open {
+                                crew_screen.handle_input(key.code, &mut state);
                             } else if bridge.open {
                                 bridge.handle_input(key.code, &mut state);
                             } else if travel.has_active_event() {
@@ -154,6 +162,7 @@ fn main() -> io::Result<()> {
                                     KeyCode::Tab => stats.toggle(),
                                     KeyCode::Char('b') | KeyCode::Char('B') => bridge.toggle(&mut state),
                                     KeyCode::Char('i') | KeyCode::Char('I') => inventory.toggle(),
+                                    KeyCode::Char('c') | KeyCode::Char('C') => crew_screen.toggle(&state),
                                     KeyCode::Char('m') | KeyCode::Char('M') => map_screen.toggle(&state),
                                     KeyCode::Char('p') | KeyCode::Char('P') => {
                                         if state.prestige() {
@@ -207,7 +216,7 @@ fn main() -> io::Result<()> {
                 let action = get_scene_mut(
                     &mut travel, &mut battle, &mut raid, &mut loot, state.phase,
                 )
-                .tick(&mut state, &mut particles);
+                .tick(&mut state, &mut particles, &mut event_bus);
 
                 // Handle scene transitions
                 if let SceneAction::TransitionTo(next_phase) = action {
@@ -216,14 +225,7 @@ fn main() -> io::Result<()> {
                         state.highest_sector = state.sector;
                     }
 
-                    // Notify Pip of transitions
-                    if state.phase == GamePhase::Battle && next_phase == GamePhase::Loot {
-                        if state.fleet_total_hp() == 0 {
-                            bridge.notify_battle_loss(&mut state);
-                        } else {
-                            bridge.notify_battle_win(&mut state);
-                        }
-                    }
+                    // Pip loot notification (battle win/loss handled via events)
                     if next_phase == GamePhase::Loot {
                         bridge.notify_loot();
                     }
@@ -251,10 +253,18 @@ fn main() -> io::Result<()> {
                     let new_achievements = check_achievements(&state);
                     for ach in new_achievements {
                         state.achievements_unlocked.push(ach.id.to_string());
-                        popup_text = Some(format!("{} Achievement: {} — {}", ach.icon, ach.name, ach.description));
-                        popup_timer = 60; // 3 seconds at 20fps
-                        bridge.notify_achievement(&mut state);
+                        event_bus.emit(engine::events::GameEvent::AchievementUnlocked {
+                            id: ach.id.to_string(),
+                            name: format!("{} — {}", ach.name, ach.description),
+                            icon: ach.icon,
+                        });
                     }
+                }
+
+                // Process queued events (central hub for cross-system effects)
+                if event_bus.has_pending() {
+                    let events = event_bus.drain();
+                    process_events(&events, &mut state, &mut bridge, &mut popup_text, &mut popup_timer);
                 }
 
                 // Render
@@ -284,6 +294,8 @@ fn main() -> io::Result<()> {
                     // Determine active overlay for context-aware HUD
                     let active_overlay = if inventory.open {
                         "inventory"
+                    } else if crew_screen.open {
+                        "crew"
                     } else if bridge.open {
                         "bridge"
                     } else if upgrades.open {
@@ -308,6 +320,9 @@ fn main() -> io::Result<()> {
                     // Overlays
                     if inventory.open {
                         inventory.render(frame, &state);
+                    }
+                    if crew_screen.open {
+                        crew_screen.render(frame, &state);
                     }
                     if bridge.open {
                         bridge.render(frame, &state);
@@ -374,6 +389,10 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
     };
 
     let controls = match overlay {
+        "crew" => format!(
+            " CREW │ {}/{} │ \u{20bf}{} │ [\u{2191}\u{2193}]Navigate [Tab]Tabs [Enter]Assign [D]Dismiss [Esc]Close ",
+            state.crew_roster.len(), state.crew_capacity, state.credits
+        ),
         "inventory" => format!(
             " INVENTORY │ {}/{} items │ ◇{} │ [↑↓]Navigate [←→/Tab]Tabs [Enter]Equip [D]Salvage [Esc]Close ",
             state.inventory.len(), state.inventory_capacity, state.scrap
@@ -391,7 +410,7 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
         "event" => " EVENT │ [↑↓]Select [Enter]Choose ".to_string(),
         _ => {
             let mut hud = format!(
-                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [I]nventory [B]ridge [M]ap [Tab]Stats [Space]Skip ",
+                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [I]nventory [C]rew [B]ridge [M]ap [Tab]Stats [Space]Skip ",
                 phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
             );
             if state.sector >= 30 {
@@ -404,6 +423,7 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
 
     // Determine label color based on context
     let (label, label_color) = match overlay {
+        "crew" => ("CREW", Color::Magenta),
         "inventory" => ("INVENTORY", Color::Yellow),
         "bridge" => ("BRIDGE", Color::Magenta),
         "upgrades" => ("UPGRADES", Color::Green),

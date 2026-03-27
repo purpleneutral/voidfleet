@@ -5,11 +5,13 @@ use rand::prelude::Distribution;
 use ratatui::Frame;
 use ratatui::style::{Color, Style};
 
+use crate::engine::crew::generate_crew;
 use crate::engine::equipment::{generate_equipment, Equipment, Rarity};
 use crate::engine::ship::{Ship, ShipType};
 use crate::rendering::particles::ParticleSystem;
 use crate::rendering::starfield::Starfield;
 use crate::state::{GamePhase, GameState};
+use crate::engine::events::EventBus;
 use super::{Scene, SceneAction};
 
 // ── Collectibles ──────────────────────────────────────────────
@@ -200,6 +202,8 @@ enum EventOutcome {
     BuyEquipment { item: Equipment, credit_cost: u64 },
     /// Trade scrap for equipment: deduct scrap, gain item.
     TradeEquipment { item: Equipment, scrap_cost: u64 },
+    /// Gain a crew member for free.
+    GainCrew,
 }
 
 struct TravelEvent {
@@ -242,10 +246,11 @@ enum EventType {
     DerelictStation,
     CosmicStorm,
     MysteriousTrader,
+    StrandedCrew,
 }
 
 impl EventType {
-    const ALL: [EventType; 8] = [
+    const ALL: [EventType; 9] = [
         EventType::DistressSignal,
         EventType::AbandonedWreck,
         EventType::TradingPost,
@@ -254,6 +259,7 @@ impl EventType {
         EventType::DerelictStation,
         EventType::CosmicStorm,
         EventType::MysteriousTrader,
+        EventType::StrandedCrew,
     ];
 }
 
@@ -324,6 +330,16 @@ fn event_weights(state: &GameState, last_event: Option<EventType>) -> Vec<(Event
                 if state.sector > 10 { w += 0.5; }
                 if state.credits > 500 || state.scrap > 300 { w += 0.5; }
                 w
+            }
+            EventType::StrandedCrew => {
+                // Only available if crew roster has room
+                if state.crew_roster.len() >= state.crew_capacity {
+                    0.0
+                } else if state.crew_roster.is_empty() {
+                    3.0 // high priority when no crew
+                } else {
+                    1.0
+                }
             }
         };
 
@@ -546,6 +562,19 @@ fn generate_random_event(state: &GameState, last_event: Option<EventType>) -> (T
                         },
                     ),
                     ("Decline".into(), EventOutcome::Nothing),
+                ],
+            )
+        }
+        EventType::StrandedCrew => {
+            let crew = generate_crew(state.sector);
+            let name = crew.name.clone();
+            let class = crew.class.name();
+            TravelEvent::new(
+                "\u{1f6f8} Stranded Crew",
+                "A lone escape pod drifts nearby. Sensors detect\na single life sign. They're signaling for help.",
+                vec![
+                    (format!("Rescue ({}, {})", name, class), EventOutcome::GainCrew),
+                    ("Ignore and continue".into(), EventOutcome::Nothing),
                 ],
             )
         }
@@ -1024,6 +1053,16 @@ fn apply_event_outcome(outcome: EventOutcome, state: &mut GameState, _label: &st
                 "Not enough scrap!".to_string()
             }
         }
+        EventOutcome::GainCrew => {
+            let crew = generate_crew(state.sector);
+            let name = crew.name.clone();
+            let class = crew.class.name().to_string();
+            if state.add_crew(crew) {
+                format!("{} ({}) joined your crew!", name, class)
+            } else {
+                "Crew roster is full!".to_string()
+            }
+        }
     }
 }
 
@@ -1049,7 +1088,7 @@ impl Scene for TravelScene {
         // Note: last_event_type is intentionally NOT reset — prevents repeats across sectors
     }
 
-    fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem) -> SceneAction {
+    fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem, events: &mut EventBus) -> SceneAction {
         self.tick_count += 1;
         self.sector_name_fade_tick = self.sector_name_fade_tick.saturating_add(1);
 
@@ -1076,6 +1115,13 @@ impl Scene for TravelScene {
             && event.showing_result() {
                 event.result_timer -= 1;
                 if event.result_timer == 0 {
+                    // Emit event resolved
+                    if let Some(ref result) = event.result_text {
+                        events.emit(crate::engine::events::GameEvent::EventResolved {
+                            event_type: event.title.clone(),
+                            outcome: result.clone(),
+                        });
+                    }
                     // Check if this was a battle trigger
                     let start_battle = event.result_text.as_deref()
                         == Some("Pirates attack! Brace for combat!");
@@ -1174,6 +1220,10 @@ impl Scene for TravelScene {
                     let scrap_value = (base_value as f32 * (1.0 + state.prestige_bonus_scrap)) as u64;
                     state.scrap += scrap_value;
                     state.total_scrap += scrap_value;
+                    events.emit(crate::engine::events::GameEvent::ScrapGained {
+                        amount: scrap_value,
+                        source: "collectible".to_string(),
+                    });
                     particles.sparkle(col.x, col.y, col.kind.color());
                     collected_indices.push(ci);
                     break;

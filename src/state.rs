@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::engine::crew::CrewMember;
 use crate::engine::equipment::{Equipment, SetBonus, SET_BONUSES};
 use crate::engine::ship::{Ship, ShipType};
 
@@ -91,6 +92,14 @@ pub struct GameState {
     #[serde(default = "default_next_item_id")]
     pub next_item_id: u64,
 
+    // Crew
+    #[serde(default)]
+    pub crew_roster: Vec<CrewMember>,
+    #[serde(default = "default_crew_capacity")]
+    pub crew_capacity: usize,
+    #[serde(default)]
+    pub next_crew_id: u64,
+
     // Transient (not saved)
     #[serde(skip)]
     pub pending_popups: Vec<String>,
@@ -100,6 +109,7 @@ pub struct GameState {
 
 fn default_inventory_capacity() -> usize { 20 }
 fn default_next_item_id() -> u64 { 1 }
+fn default_crew_capacity() -> usize { 5 }
 
 fn default_pip_hunger() -> u8 { 80 }
 fn default_pip_energy() -> u8 { 80 }
@@ -157,6 +167,9 @@ impl GameState {
             inventory: Vec::new(),
             inventory_capacity: 20,
             next_item_id: 1,
+            crew_roster: Vec::new(),
+            crew_capacity: 5,
+            next_crew_id: 1,
             pending_popups: Vec::new(),
             pending_loot: Vec::new(),
         }
@@ -381,7 +394,88 @@ impl GameState {
         self.phase = GamePhase::Travel;
         self.phase_timer = 45.0;
         self.inventory.clear();
-        // Keep: achievements, deaths, highest_sector, prestige_level, totals, time_played, inventory_capacity
+        self.crew_roster.clear();
+        self.next_crew_id = 1;
+        // Keep: achievements, deaths, highest_sector, prestige_level, totals, time_played, inventory_capacity, crew_capacity
+        true
+    }
+
+    // ── Crew management methods ────────────────────────────────────
+
+    /// Add a crew member to the roster. Returns false if at capacity.
+    pub fn add_crew(&mut self, mut crew: CrewMember) -> bool {
+        if self.crew_roster.len() >= self.crew_capacity {
+            return false;
+        }
+        crew.id = self.next_crew_id;
+        self.next_crew_id += 1;
+        self.crew_roster.push(crew);
+        true
+    }
+
+    /// Assign a crew member to a ship. Unassigns them from any previous ship first.
+    /// Returns false if crew_id or ship_index is invalid, or ship already has crew.
+    pub fn assign_crew(&mut self, crew_id: u64, ship_index: usize) -> bool {
+        if ship_index >= self.fleet.len() {
+            return false;
+        }
+        // Check ship doesn't already have a different crew assigned
+        if let Some(existing_id) = self.fleet[ship_index].crew_id {
+            if existing_id != crew_id {
+                return false;
+            }
+        }
+        // Find crew member
+        let crew_idx = match self.crew_roster.iter().position(|c| c.id == crew_id) {
+            Some(idx) => idx,
+            None => return false,
+        };
+        // Unassign from previous ship if any
+        if let Some(old_ship) = self.crew_roster[crew_idx].assigned_ship {
+            if old_ship < self.fleet.len() {
+                self.fleet[old_ship].crew_id = None;
+            }
+        }
+        // Assign
+        self.crew_roster[crew_idx].assigned_ship = Some(ship_index);
+        self.fleet[ship_index].crew_id = Some(crew_id);
+        true
+    }
+
+    /// Unassign a crew member from their ship. Returns false if crew_id not found.
+    pub fn unassign_crew(&mut self, crew_id: u64) -> bool {
+        let crew_idx = match self.crew_roster.iter().position(|c| c.id == crew_id) {
+            Some(idx) => idx,
+            None => return false,
+        };
+        if let Some(ship_idx) = self.crew_roster[crew_idx].assigned_ship {
+            if ship_idx < self.fleet.len() {
+                self.fleet[ship_idx].crew_id = None;
+            }
+        }
+        self.crew_roster[crew_idx].assigned_ship = None;
+        true
+    }
+
+    /// Get the crew member assigned to a specific ship.
+    pub fn get_ship_crew(&self, ship_index: usize) -> Option<&CrewMember> {
+        let crew_id = self.fleet.get(ship_index)?.crew_id?;
+        self.crew_roster.iter().find(|c| c.id == crew_id)
+    }
+
+    /// Dismiss a crew member from the roster. Unassigns them first.
+    pub fn dismiss_crew(&mut self, crew_id: u64) -> bool {
+        let crew_idx = match self.crew_roster.iter().position(|c| c.id == crew_id) {
+            Some(idx) => idx,
+            None => return false,
+        };
+        // Unassign from ship first
+        if let Some(ship_idx) = self.crew_roster[crew_idx].assigned_ship {
+            if ship_idx < self.fleet.len() {
+                self.fleet[ship_idx].crew_id = None;
+            }
+        }
+        self.crew_roster.remove(crew_idx);
         true
     }
 

@@ -8,8 +8,10 @@ pub mod bridge;
 pub mod stats;
 pub mod map;
 pub mod inventory;
+pub mod crew;
 
 use ratatui::Frame;
+use crate::engine::events::EventBus;
 use crate::rendering::particles::ParticleSystem;
 use crate::state::GameState;
 
@@ -25,7 +27,7 @@ pub trait Scene {
     fn enter(&mut self, state: &GameState, width: u16, height: u16);
 
     /// Update scene state (called every tick ~50ms).
-    fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem) -> SceneAction;
+    fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem, events: &mut EventBus) -> SceneAction;
 
     /// Render the scene to the terminal frame.
     fn render(&self, frame: &mut Frame, state: &GameState, particles: &ParticleSystem);

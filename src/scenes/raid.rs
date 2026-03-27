@@ -5,6 +5,7 @@ use ratatui::Frame;
 use crate::rendering::particles::{Particle, ParticleSystem};
 use crate::state::{GamePhase, GameState};
 
+use crate::engine::events::EventBus;
 use super::{Scene, SceneAction};
 
 // ── Planet types ────────────────────────────────────────────────────────
@@ -610,7 +611,7 @@ impl Scene for RaidScene {
         self.spawn_turrets(state.sector);
     }
 
-    fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem) -> SceneAction {
+    fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem, events: &mut EventBus) -> SceneAction {
         self.tick_count += 1;
         self.elapsed += TICK_DT;
 
@@ -832,7 +833,10 @@ impl Scene for RaidScene {
         // ── Phase timer ─────────────────────────────────────────────────
         state.phase_timer -= TICK_DT;
         if state.phase_timer <= 0.0 {
-            state.total_raids += 1;
+            events.emit(crate::engine::events::GameEvent::RaidCompleted {
+                scrap: self.scrap_gained,
+                credits: self.credits_gained,
+            });
             return SceneAction::TransitionTo(GamePhase::Loot);
         }
 

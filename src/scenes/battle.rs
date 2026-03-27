@@ -9,6 +9,7 @@ use crate::engine::ship::{Ship, ShipAbility, ShipType};
 use crate::rendering::particles::{Particle, ParticleSystem};
 use crate::state::{GamePhase, GameState};
 
+use crate::engine::events::EventBus;
 use super::{Scene, SceneAction};
 
 // ---------------------------------------------------------------------------
@@ -724,9 +725,10 @@ impl BattleScene {
                 continue;
             }
 
-            // Speed-scaled dodge effectiveness
+            // Speed-scaled dodge effectiveness + crew piloting bonus
             let speed_mult = fleet[i].speed() / 10.0;
-            let dodge_strength = base_dodge_strength * speed_mult;
+            let crew_dodge = crate::engine::crew::crew_dodge_modifier(None); // TODO: pass actual crew when state is accessible
+            let dodge_strength = base_dodge_strength * speed_mult * crew_dodge;
 
             // Find nearest threatening enemy projectile
             let mut nearest_dy: Option<f32> = None;
@@ -1249,7 +1251,7 @@ impl Scene for BattleScene {
             .collect();
     }
 
-    fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem) -> SceneAction {
+    fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem, events: &mut EventBus) -> SceneAction {
         self.tick_count += 1;
 
         // ── Slide-in phase ─────────────────────────────────────────────
@@ -1283,7 +1285,17 @@ impl Scene for BattleScene {
         if let BattlePhase::Freeze(ref mut frames) = self.phase {
             if *frames == 0 {
                 if self.player_won {
-                    state.total_battles += 1;
+                    let fleet_hp_pct = if state.fleet_max_hp() > 0 {
+                        state.fleet_total_hp() as f32 / state.fleet_max_hp() as f32
+                    } else { 0.0 };
+                    let enemy_count = self.enemies.len() as u32;
+                    let has_boss = self.enemies.iter().any(|e| e.tier >= 3);
+                    events.emit(crate::engine::events::GameEvent::BattleWon {
+                        sector: self.sector,
+                        enemies_killed: enemy_count,
+                        fleet_hp_pct,
+                        was_boss: has_boss,
+                    });
                     // Transfer equipment drops to state for loot scene
                     state.pending_loot = std::mem::take(&mut self.pending_drops);
                     return SceneAction::TransitionTo(GamePhase::Loot);
@@ -1470,7 +1482,11 @@ impl Scene for BattleScene {
                                         Self::chain_explosion(particles, cx, ey, false);
                                         enemy.death_exploded = true;
                                     }
-                                    state.enemies_destroyed += 1;
+                                    events.emit(crate::engine::events::GameEvent::EnemyKilled {
+                                        sector: self.sector,
+                                        enemy_tier: enemy.tier,
+                                        is_boss: enemy.tier >= 3,
+                                    });
                                     killed_enemy_tiers.push(enemy.tier);
                                 }
                             }
@@ -1700,8 +1716,10 @@ impl Scene for BattleScene {
                     _ => 1.2 + ship.speed() * 0.08,
                 };
 
-                // Tech-aware damage + pip combat bonus
-                let dmg = (effective_damage(ship, tech_lasers) as f32 * pip_bonus) as u32;
+                // Tech-aware damage + pip combat bonus + crew modifier
+                let crew = state.get_ship_crew(i);
+                let crew_mod = crate::engine::crew::crew_damage_modifier(crew);
+                let dmg = (effective_damage(ship, tech_lasers) as f32 * pip_bonus * crew_mod) as u32;
 
                 // Smart targeting: aim toward selected enemy
                 let target_idx = Self::player_select_target(ship, &self.enemies);
@@ -1777,7 +1795,14 @@ impl Scene for BattleScene {
                     &positions,
                     &mut self.player_states,
                 );
-                state.enemies_destroyed += 1 + destroyed;
+                // Bomber itself + any ships it destroyed
+                events.emit(crate::engine::events::GameEvent::EnemyKilled {
+                    sector: self.sector,
+                    enemy_tier: e.tier,
+                    is_boss: e.tier >= 3,
+                });
+                // Note: player ships destroyed by bomber are not enemy kills
+                let _ = destroyed;
                 killed_enemy_tiers.push(e.tier);
                 continue;
             }
@@ -1923,8 +1948,20 @@ impl Scene for BattleScene {
                             Self::chain_explosion(particles, center_x, enemy.y, false);
                             enemy.death_exploded = true;
                         }
-                        state.enemies_destroyed += 1;
+                        events.emit(crate::engine::events::GameEvent::EnemyKilled {
+                            sector: self.sector,
+                            enemy_tier: enemy.tier,
+                            is_boss: enemy.tier >= 3,
+                        });
                         killed_enemy_tiers.push(enemy.tier);
+                    }
+
+                    // Emit crit event for cross-system tracking
+                    if is_crit {
+                        events.emit(crate::engine::events::GameEvent::CriticalHit {
+                            ship_index: 0, // fleet-level crit, not per-ship
+                            damage: effective_dmg,
+                        });
                     }
                     break;
                 }
@@ -1955,7 +1992,11 @@ impl Scene for BattleScene {
                             Self::chain_explosion(particles, cx, enemy.y, false);
                             enemy.death_exploded = true;
                         }
-                        state.enemies_destroyed += 1;
+                        events.emit(crate::engine::events::GameEvent::EnemyKilled {
+                            sector: self.sector,
+                            enemy_tier: enemy.tier,
+                            is_boss: enemy.tier >= 3,
+                        });
                         killed_enemy_tiers.push(enemy.tier);
                     }
                 }
@@ -2051,7 +2092,15 @@ impl Scene for BattleScene {
 
         // ── Roll equipment drops for enemies killed this tick ─────────
         for tier in killed_enemy_tiers {
+            let before = self.pending_drops.len();
             Self::roll_enemy_drop(&mut self.pending_drops, tier, self.sector);
+            // Emit events for any new drops
+            for drop in &self.pending_drops[before..] {
+                events.emit(crate::engine::events::GameEvent::EquipmentDropped {
+                    rarity: drop.rarity.name().to_string(),
+                    name: drop.name.clone(),
+                });
+            }
         }
 
         // ── Win / lose check ───────────────────────────────────────────
@@ -2075,12 +2124,14 @@ impl Scene for BattleScene {
         if Self::player_alive_count(&state.fleet) == 0 {
             self.player_won = false;
 
-            // enemies_destroyed already incremented inline during combat for each kill.
             // Apply death penalty (loses scrap/credits, pushes back sectors, heals fleet).
             // handle_fleet_death increments state.deaths internally.
-            let _penalty = state.handle_fleet_death();
+            let penalty = state.handle_fleet_death();
 
-            state.total_battles += 1;
+            events.emit(crate::engine::events::GameEvent::BattleLost {
+                sector: self.sector,
+                penalty_description: penalty,
+            });
             Self::projectiles_to_particles(&mut self.projectiles, particles);
             self.phase = BattlePhase::Freeze(10);
             return SceneAction::Continue;
@@ -2090,7 +2141,17 @@ impl Scene for BattleScene {
         state.phase_timer -= 0.05;
         if state.phase_timer <= 0.0 {
             self.player_won = true;
-            state.total_battles += 1;
+            let fleet_hp_pct = if state.fleet_max_hp() > 0 {
+                state.fleet_total_hp() as f32 / state.fleet_max_hp() as f32
+            } else { 0.0 };
+            let enemy_count = self.enemies.iter().filter(|e| e.hp == 0).count() as u32;
+            let has_boss = self.enemies.iter().any(|e| e.tier >= 3);
+            events.emit(crate::engine::events::GameEvent::BattleWon {
+                sector: self.sector,
+                enemies_killed: enemy_count,
+                fleet_hp_pct,
+                was_boss: has_boss,
+            });
             state.pending_loot = std::mem::take(&mut self.pending_drops);
             return SceneAction::TransitionTo(GamePhase::Loot);
         }

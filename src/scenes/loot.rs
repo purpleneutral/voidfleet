@@ -7,6 +7,7 @@ use crate::engine::equipment::Rarity;
 use crate::rendering::particles::ParticleSystem;
 use crate::state::GameState;
 
+use crate::engine::events::EventBus;
 use super::{Scene, SceneAction};
 
 /// Pre-computed loot data snapshot taken at scene entry.
@@ -220,7 +221,7 @@ impl Scene for LootScene {
         self.xp_anim = xp_start_ratio;
     }
 
-    fn tick(&mut self, state: &mut GameState, _particles: &mut ParticleSystem) -> SceneAction {
+    fn tick(&mut self, state: &mut GameState, _particles: &mut ParticleSystem, events: &mut EventBus) -> SceneAction {
         self.tick_count += 1;
 
         // Award loot on first tick (state mutation happens here)
@@ -257,6 +258,30 @@ impl Scene for LootScene {
                             if idx < self.loot.equipment_drops.len() {
                                 self.loot.equipment_drops[idx].salvaged_for = salvage_value;
                             }
+                        }
+                    }
+                }
+
+                // Emit level-up event if applicable
+                if self.loot.level_up {
+                    events.emit(crate::engine::events::GameEvent::LevelUp {
+                        new_level: self.loot.new_level,
+                    });
+                }
+
+                // Emit sector cleared event
+                events.emit(crate::engine::events::GameEvent::SectorCleared {
+                    sector: self.loot.sector_cleared,
+                });
+
+                // Emit equipment drop events for successfully collected items
+                for drop_info in &self.loot.equipment_drops {
+                    if drop_info.salvaged_for == 0 {
+                        if let Some(rarity) = drop_info.rarity {
+                            events.emit(crate::engine::events::GameEvent::EquipmentDropped {
+                                rarity: rarity.name().to_string(),
+                                name: drop_info.name.clone(),
+                            });
                         }
                     }
                 }

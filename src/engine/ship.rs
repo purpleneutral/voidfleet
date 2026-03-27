@@ -158,6 +158,10 @@ pub struct Ship {
     #[serde(default)]
     pub special: Option<Equipment>,
 
+    // Crew assignment
+    #[serde(default)]
+    pub crew_id: Option<u64>, // ID of assigned crew member
+
     // Runtime position (not saved, set by scene)
     #[serde(skip)]
     pub x: f32,
@@ -176,6 +180,7 @@ impl Ship {
             shield: None,
             engine_mod: None,
             special: None,
+            crew_id: None,
             x: 0.0,
             y: 0.0,
         }
