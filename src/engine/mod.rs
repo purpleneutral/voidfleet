@@ -10,3 +10,4 @@ pub mod missions;
 pub mod procedural;
 pub mod ship;
 pub mod trade;
+pub mod voyage;

@@ -8,6 +8,7 @@ use ratatui::{
 
 use crate::engine::achievements::ACHIEVEMENTS;
 use crate::engine::factions::Faction;
+use crate::engine::voyage::VoyageInfo;
 use crate::rendering::layout::centered_rect;
 use crate::state::GameState;
 
@@ -108,6 +109,30 @@ impl StatsScreen {
             let rep = state.faction_reputation.get(faction);
             let tier = state.faction_reputation.tier(faction);
             lines.push(faction_row(faction.icon(), faction.name(), rep, tier.color()));
+        }
+
+        // ── Voyage ────────────────────────────────────────────────────
+        lines.push(Line::from(""));
+        lines.push(section_header("Voyage"));
+        let voyage_info = VoyageInfo::for_voyage(state.voyage);
+        lines.push(stat_row(
+            "Current Voyage",
+            &format!("{} ({})", state.voyage, voyage_info.name),
+        ));
+        lines.push(stat_row("Voyages Completed", &format_num(state.voyages_completed as u64)));
+        lines.push(stat_row("Target Sector", &format_num(voyage_info.target_sector as u64)));
+        if state.voyages_completed > 0 {
+            let b = &state.voyage_bonuses;
+            lines.push(Line::from(vec![
+                Span::styled("  Permanent Bonuses:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        "DMG +{:.0}%  HP +{:.0}%  SPD +{:.0}%  CRIT +{:.0}%",
+                        b.damage_pct, b.hull_hp_pct, b.speed_pct, b.crit_pct
+                    ),
+                    Style::default().fg(Color::Rgb(255, 215, 0)),
+                ),
+            ]));
         }
 
         // ── Achievements ────────────────────────────────────────────────

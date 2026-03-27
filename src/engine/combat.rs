@@ -3,21 +3,33 @@
 
 use crate::engine::ship::{Ship, ShipType};
 
-/// Calculate effective damage for a ship considering tech bonuses and equipment.
+/// Calculate effective damage for a ship considering tech bonuses, equipment,
+/// and voyage permanent bonuses.
 pub fn effective_damage(ship: &Ship, tech_lasers: u8) -> u32 {
+    effective_damage_with_voyage(ship, tech_lasers, 0.0)
+}
+
+/// Calculate effective damage including voyage permanent damage bonus.
+pub fn effective_damage_with_voyage(ship: &Ship, tech_lasers: u8, voyage_bonus: f32) -> u32 {
     let base = ship.damage();
     let tech_bonus = (base as f32 * tech_lasers as f32 * 0.1) as u32;
     let (flat, pct) = ship.total_damage_bonus();
-    let before_flat = (base + tech_bonus) as f32 * (1.0 + pct);
+    let before_flat = (base + tech_bonus) as f32 * (1.0 + pct + voyage_bonus);
     (before_flat + flat as f32).max(0.0) as u32
 }
 
-/// Calculate effective max HP considering tech bonuses and equipment.
+/// Calculate effective max HP considering tech bonuses, equipment,
+/// and voyage permanent bonuses.
 pub fn effective_hp(ship: &Ship, tech_shields: u8) -> u32 {
+    effective_hp_with_voyage(ship, tech_shields, 0.0)
+}
+
+/// Calculate effective max HP including voyage permanent HP bonus.
+pub fn effective_hp_with_voyage(ship: &Ship, tech_shields: u8, voyage_bonus: f32) -> u32 {
     let base = ship.max_hp();
     let tech_bonus = (base as f32 * tech_shields as f32 * 0.12) as u32;
     let (flat, pct) = ship.total_hp_bonus();
-    let before_flat = (base + tech_bonus) as f32 * (1.0 + pct);
+    let before_flat = (base + tech_bonus) as f32 * (1.0 + pct + voyage_bonus);
     (before_flat + flat as f32).max(1.0) as u32
 }
 

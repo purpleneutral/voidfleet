@@ -2,6 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::canvas::{Canvas, Context};
+use crate::engine::voyage::VoyageInfo;
 use crate::rendering::starfield::Starfield;
 use crate::state::GameState;
 
@@ -98,28 +99,30 @@ impl TitleScreen {
 
         // ── Save info / prompt ────────────────────────────────
         let info_y = subtitle_y + 3;
-        if info_y < area.y + area.height {
-            let info_text = if has_save {
-                format!(
-                    "Continue — Sector {}, Level {}, {} ships",
-                    state.sector,
-                    state.level,
-                    state.fleet.len(),
-                )
-            } else {
-                "New Game".to_string()
-            };
-            let info_len = info_text.len() as u16;
-            let x = area.x + area.width.saturating_sub(info_len) / 2;
-            let buf = frame.buffer_mut();
-            for (i, ch) in info_text.chars().enumerate() {
-                let col = x + i as u16;
-                if col < area.x + area.width {
-                    buf[(col, info_y)].set_char(ch).set_style(
-                        Style::default().fg(Color::White),
-                    );
-                }
+        if info_y < area.y + area.height && has_save {
+            let voyage_info = VoyageInfo::for_voyage(state.voyage);
+            let voyage_line = format!(
+                "Voyage {}: {}",
+                voyage_info.number, voyage_info.name
+            );
+            self.draw_centered_line(frame, area, info_y, &voyage_line, Color::Rgb(255, 215, 0));
+
+            let detail_line = format!(
+                "Sector {} | Level {} | {} ships",
+                state.sector, state.level, state.fleet.len()
+            );
+            if info_y + 1 < area.y + area.height {
+                self.draw_centered_line(frame, area, info_y + 1, &detail_line, Color::White);
             }
+
+            // Show permanent bonuses if any
+            let bonus_str = state.voyage_bonuses.hud_string();
+            if !bonus_str.is_empty() && info_y + 2 < area.y + area.height {
+                let bonus_line = format!("Permanent: {}", bonus_str);
+                self.draw_centered_line(frame, area, info_y + 2, &bonus_line, Color::Rgb(160, 160, 180));
+            }
+        } else if info_y < area.y + area.height {
+            self.draw_centered_line(frame, area, info_y, "New Game", Color::White);
         }
 
         // ── Blinking prompt ───────────────────────────────────
@@ -158,6 +161,21 @@ impl TitleScreen {
                         Style::default().fg(Color::DarkGray),
                     );
                 }
+            }
+        }
+    }
+
+    /// Draw a centered line of text at a given row.
+    fn draw_centered_line(&self, frame: &mut Frame, area: Rect, y: u16, text: &str, color: Color) {
+        let text_len = text.len() as u16;
+        let x = area.x + area.width.saturating_sub(text_len) / 2;
+        let buf = frame.buffer_mut();
+        for (i, ch) in text.chars().enumerate() {
+            let col = x + i as u16;
+            if col < area.x + area.width {
+                buf[(col, y)].set_char(ch).set_style(
+                    Style::default().fg(color),
+                );
             }
         }
     }

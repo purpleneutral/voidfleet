@@ -4,6 +4,7 @@
 use crate::state::GameState;
 
 use crate::engine::factions::Faction;
+use crate::engine::voyage::VoyageInfo;
 
 /// Template for a generated enemy ship.
 #[derive(Debug, Clone)]
@@ -122,8 +123,17 @@ pub fn generate_enemy_fleet(sector: u32) -> Vec<EnemyTemplate> {
 
 /// Generate an enemy fleet with adaptive difficulty applied.
 /// `modifier` is the combined difficulty_modifier * post_death_modifier.
+/// Voyage scaling is applied on top of sector scaling.
 pub fn generate_enemy_fleet_adaptive(sector: u32, modifier: f32) -> Vec<EnemyTemplate> {
+    generate_enemy_fleet_for_voyage(sector, modifier, 1)
+}
+
+/// Generate an enemy fleet scaled for a specific voyage.
+/// Voyage affects enemy HP/damage via `enemy_scale` and fleet composition
+/// at higher voyages (elite variants, void wraiths, swarm drones).
+pub fn generate_enemy_fleet_for_voyage(sector: u32, modifier: f32, voyage: u32) -> Vec<EnemyTemplate> {
     let is_boss_sector = sector.is_multiple_of(10) && sector > 0;
+    let voyage_info = VoyageInfo::for_voyage(voyage);
 
     let mut fleet = Vec::new();
 
@@ -143,16 +153,22 @@ pub fn generate_enemy_fleet_adaptive(sector: u32, modifier: f32) -> Vec<EnemyTem
         }
     } else {
         let composition = pick_composition(sector);
-        let enemies = match composition {
+        let mut enemies = match composition {
             FleetComposition::Standard => generate_standard_fleet(sector),
             FleetComposition::FighterSwarm => generate_fighter_swarm(sector),
             FleetComposition::HeavyEscort => generate_heavy_escort_fleet(sector),
         };
+
+        // Voyage 2+: mix in voyage-specific enemy types
+        if voyage >= 2 {
+            inject_voyage_enemies(&mut enemies, sector, voyage);
+        }
+
         fleet.extend(enemies);
     }
 
-    // Apply sector scaling + adaptive difficulty to all enemies
-    let scale = sector_scale(sector) * modifier;
+    // Apply sector scaling + adaptive difficulty + voyage scaling to all enemies
+    let scale = sector_scale(sector) * modifier * voyage_info.enemy_scale;
     for enemy in &mut fleet {
         enemy.hp = ((enemy.hp as f32 * scale) as u32).max(1);
         enemy.damage = ((enemy.damage as f32 * scale) as u32).max(1);
@@ -161,11 +177,63 @@ pub fn generate_enemy_fleet_adaptive(sector: u32, modifier: f32) -> Vec<EnemyTem
     fleet
 }
 
+/// Inject voyage-specific enemy types into an existing fleet based on voyage number.
+fn inject_voyage_enemies(fleet: &mut Vec<EnemyTemplate>, sector: u32, voyage: u32) {
+    let roll = pseudo_random(sector, 200, 10);
+
+    if voyage >= 2 && roll < 3 {
+        // Elite variant: tougher stats
+        fleet.push(EnemyTemplate {
+            name: "Elite Variant",
+            hp: 60,
+            damage: 18,
+            speed: 5.5,
+            sprite: crate::engine::voyage::SPRITE_ELITE_VARIANT,
+            is_boss: false,
+            faction: Faction::Independent,
+        });
+    }
+
+    if voyage >= 3 && roll < 5 {
+        // Void Wraith: fast, evasive
+        fleet.push(EnemyTemplate {
+            name: "Void Wraith",
+            hp: 35,
+            damage: 12,
+            speed: 10.0,
+            sprite: crate::engine::voyage::SPRITE_VOID_WRAITH,
+            is_boss: false,
+            faction: Faction::Independent,
+        });
+    }
+
+    if voyage >= 4 && roll < 4 {
+        // Swarm drones: tiny, many
+        let count = 2 + pseudo_random(sector, 210, 3) as usize;
+        for _ in 0..count {
+            fleet.push(EnemyTemplate {
+                name: "Swarm Drone",
+                hp: 10,
+                damage: 5,
+                speed: 12.0,
+                sprite: crate::engine::voyage::SPRITE_SWARM_DRONE,
+                is_boss: false,
+                faction: Faction::Independent,
+            });
+        }
+    }
+}
+
 /// Generate an enemy fleet with faction assignment based on sector.
 /// Uses `encounter_faction` to determine the faction, then stamps all ships.
 pub fn generate_enemy_fleet_faction(sector: u32, modifier: f32, encounter_seed: u32) -> Vec<EnemyTemplate> {
+    generate_enemy_fleet_faction_voyage(sector, modifier, encounter_seed, 1)
+}
+
+/// Generate a faction-assigned enemy fleet scaled for a specific voyage.
+pub fn generate_enemy_fleet_faction_voyage(sector: u32, modifier: f32, encounter_seed: u32, voyage: u32) -> Vec<EnemyTemplate> {
     let faction = crate::engine::factions::encounter_faction(sector, encounter_seed);
-    let mut fleet = generate_enemy_fleet_adaptive(sector, modifier);
+    let mut fleet = generate_enemy_fleet_for_voyage(sector, modifier, voyage);
 
     // Stamp all ships with the encounter faction
     for enemy in &mut fleet {

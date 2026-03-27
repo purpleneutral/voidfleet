@@ -10,6 +10,7 @@ use crate::engine::factions::{FactionMission, FactionReputation};
 use crate::engine::missions::Mission;
 use crate::engine::ship::{Ship, ShipType};
 use crate::engine::trade::{TradeGood, TradeRecord};
+use crate::engine::voyage::{VoyageBonuses, VOYAGE_DAMAGE_BONUS, VOYAGE_HP_BONUS, VOYAGE_SPEED_BONUS, VOYAGE_CRIT_BONUS, VOYAGE_STARTING_CREDITS};
 
 fn default_route_modifier() -> f32 {
     1.0
@@ -52,7 +53,7 @@ pub struct GameState {
     pub time_played_secs: u64,
     pub achievements_unlocked: Vec<String>,
 
-    // Prestige
+    // Prestige (legacy — kept for save compat, no longer used)
     #[serde(default)]
     pub prestige_level: u32,
     #[serde(default)]
@@ -65,6 +66,32 @@ pub struct GameState {
     pub lifetime_sectors: u64,
     #[serde(default)]
     pub lifetime_credits: u64,
+
+    // Voyage system
+    #[serde(default = "default_voyage")]
+    pub voyage: u32,
+    #[serde(default)]
+    pub voyage_permanent_dmg: f32,
+    #[serde(default)]
+    pub voyage_permanent_hp: f32,
+    #[serde(default)]
+    pub voyage_permanent_speed: f32,
+    #[serde(default)]
+    pub voyage_permanent_crit: f32,
+    #[serde(default)]
+    pub voyages_completed: u32,
+    #[serde(default)]
+    pub highest_sector_ever: u32,
+    #[serde(default)]
+    pub voyage_bonuses: VoyageBonuses,
+    #[serde(default)]
+    pub voyage_ships_built: u64,
+    #[serde(default)]
+    pub voyage_equipment_found: u64,
+    #[serde(default)]
+    pub voyage_crew_recruited: u64,
+    #[serde(default)]
+    pub voyage_credits_earned: u64,
 
     // Sector map route
     #[serde(default = "default_route_modifier")]
@@ -138,8 +165,13 @@ pub struct GameState {
     pub pending_popups: Vec<String>,
     #[serde(skip)]
     pub pending_loot: Vec<Equipment>,
+    /// Set to true when a voyage boss is defeated (before complete_voyage is called).
+    /// Main loop uses this to trigger the voyage cinematic screen.
+    #[serde(skip)]
+    pub voyage_boss_defeated: bool,
 }
 
+fn default_voyage() -> u32 { 1 }
 fn default_cargo_capacity() -> u32 { 20 }
 fn default_next_mission_id() -> u64 { 1 }
 fn default_inventory_capacity() -> usize { 20 }
@@ -182,6 +214,18 @@ impl GameState {
             prestige_bonus_scrap: 0.0,
             lifetime_sectors: 0,
             lifetime_credits: 0,
+            voyage: 1,
+            voyage_permanent_dmg: 0.0,
+            voyage_permanent_hp: 0.0,
+            voyage_permanent_speed: 0.0,
+            voyage_permanent_crit: 0.0,
+            voyages_completed: 0,
+            highest_sector_ever: 0,
+            voyage_bonuses: VoyageBonuses::default(),
+            voyage_ships_built: 0,
+            voyage_equipment_found: 0,
+            voyage_crew_recruited: 0,
+            voyage_credits_earned: 0,
             current_route_modifier: 1.0,
             total_battles: 0,
             total_raids: 0,
@@ -218,6 +262,7 @@ impl GameState {
             next_mission_id: 1,
             pending_popups: Vec::new(),
             pending_loot: Vec::new(),
+            voyage_boss_defeated: false,
         }
     }
 
@@ -313,6 +358,9 @@ impl GameState {
         if self.sector > self.highest_sector {
             self.highest_sector = self.sector;
         }
+        if self.sector > self.highest_sector_ever {
+            self.highest_sector_ever = self.sector;
+        }
     }
 
     /// Check for new achievements and queue popup messages.
@@ -407,31 +455,50 @@ impl GameState {
             .collect()
     }
 
-    /// Reset progression and gain permanent prestige bonuses.
-    /// Requires sector 30+ to activate.
-    pub fn prestige(&mut self) -> bool {
-        if self.sector < 30 {
-            return false;
-        }
+    /// Complete the current voyage: accumulate permanent bonuses and reset progression.
+    /// Returns the bonuses earned from this voyage.
+    pub fn complete_voyage(&mut self) -> VoyageBonuses {
+        let earned = VoyageBonuses::for_completion(self.voyage);
 
-        self.prestige_level += 1;
-        self.prestige_bonus_xp = self.prestige_level as f32 * 0.10;
-        self.prestige_bonus_credits = self.prestige_level as f32 * 0.05;
-        self.prestige_bonus_scrap = self.prestige_level as f32 * 0.05;
+        // Record stats
+        self.voyages_completed += 1;
+        if self.sector > self.highest_sector_ever {
+            self.highest_sector_ever = self.sector;
+        }
 
         // Track lifetime stats
         self.lifetime_sectors += self.sector as u64;
         self.lifetime_credits += self.credits;
 
-        // Reset progression but keep prestige bonuses
-        self.scrap = 0;
-        self.credits = 0;
-        self.blueprints = 0;
+        // Apply permanent bonuses
+        self.voyage_permanent_dmg += VOYAGE_DAMAGE_BONUS;
+        self.voyage_permanent_hp += VOYAGE_HP_BONUS;
+        self.voyage_permanent_speed += VOYAGE_SPEED_BONUS;
+        self.voyage_permanent_crit += VOYAGE_CRIT_BONUS;
+        self.voyage_bonuses.accumulate(&earned);
+
+        // Advance voyage
+        self.voyage += 1;
+
+        // Reset progression (keep permanents, pip, achievements, stats)
         self.sector = 1;
         self.level = 1;
         self.xp = 0;
         self.xp_to_next = 100;
+        self.scrap = 0;
+        self.credits = VOYAGE_STARTING_CREDITS;
+        self.blueprints = 0;
         self.fleet = vec![Ship::new(ShipType::Scout)];
+        self.inventory.clear();
+        self.crew_roster.clear();
+        self.crew_bonds.clear();
+        self.next_crew_id = 1;
+        self.active_missions.clear();
+        self.available_missions.clear();
+        self.next_mission_id = 1;
+        self.cargo.clear();
+        self.cargo_capacity = 20;
+        self.trade_history.clear();
         self.tech_lasers = 1;
         self.tech_shields = 0;
         self.tech_engines = 1;
@@ -439,20 +506,41 @@ impl GameState {
         self.current_route_modifier = 1.0;
         self.phase = GamePhase::Travel;
         self.phase_timer = 45.0;
-        self.inventory.clear();
-        self.crew_roster.clear();
-        self.crew_bonds.clear();
-        self.next_crew_id = 1;
         self.faction_reputation = FactionReputation::default();
         self.pending_faction_mission = None;
-        self.active_missions.clear();
-        self.available_missions.clear();
-        self.next_mission_id = 1;
-        self.cargo.clear();
-        self.cargo_capacity = 20;
-        self.trade_history.clear();
-        // Keep: achievements, deaths, highest_sector, prestige_level, totals, time_played, inventory_capacity, crew_capacity
+
+        // Reset per-voyage stat trackers
+        self.voyage_ships_built = 0;
+        self.voyage_equipment_found = 0;
+        self.voyage_crew_recruited = 0;
+        self.voyage_credits_earned = 0;
+
+        // Keep: pip stats, achievements, deaths, highest_sector, time_played,
+        //       enemies_destroyed, total_battles, voyage_permanent_* bonuses,
+        //       voyages_completed, highest_sector_ever
+
+        earned
+    }
+
+    /// Legacy prestige — replaced by voyage system. Kept for save compat.
+    /// Now redirects to complete_voyage if voyage target is reached.
+    pub fn prestige(&mut self) -> bool {
+        let target = crate::engine::voyage::voyage_target_sector(self.voyage);
+        if self.sector < target {
+            return false;
+        }
+        self.complete_voyage();
         true
+    }
+
+    /// Check if the current sector is the voyage boss sector.
+    pub fn is_voyage_boss_sector(&self) -> bool {
+        crate::engine::voyage::is_voyage_boss_sector(self.sector, self.voyage)
+    }
+
+    /// Get the target sector for the current voyage.
+    pub fn voyage_target_sector(&self) -> u32 {
+        crate::engine::voyage::voyage_target_sector(self.voyage)
     }
 
     // ── Crew management methods ────────────────────────────────────
@@ -753,5 +841,150 @@ impl GameState {
         self.cargo.remove(good.key());
         // Deduct fine (can't go below 0)
         self.credits = self.credits.saturating_sub(fine);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_state_defaults() {
+        let state = GameState::new();
+        assert_eq!(state.voyage, 1);
+        assert!((state.voyage_permanent_dmg - 0.0).abs() < f32::EPSILON);
+        assert!((state.voyage_permanent_hp - 0.0).abs() < f32::EPSILON);
+        assert!((state.voyage_permanent_speed - 0.0).abs() < f32::EPSILON);
+        assert!((state.voyage_permanent_crit - 0.0).abs() < f32::EPSILON);
+        assert_eq!(state.voyages_completed, 0);
+        assert_eq!(state.highest_sector_ever, 0);
+    }
+
+    #[test]
+    fn test_complete_voyage_increments() {
+        let mut state = GameState::new();
+        state.sector = 100;
+        state.credits = 5000;
+        state.scrap = 3000;
+        state.level = 20;
+
+        let earned = state.complete_voyage();
+        assert!(earned.damage_pct > 0.0);
+        assert_eq!(state.voyage, 2);
+        assert_eq!(state.voyages_completed, 1);
+        assert!((state.voyage_permanent_dmg - 0.05).abs() < f32::EPSILON);
+        assert!((state.voyage_permanent_hp - 0.05).abs() < f32::EPSILON);
+        assert!((state.voyage_permanent_speed - 0.03).abs() < f32::EPSILON);
+        assert!((state.voyage_permanent_crit - 0.02).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_complete_voyage_resets_progression() {
+        let mut state = GameState::new();
+        state.sector = 100;
+        state.credits = 5000;
+        state.scrap = 3000;
+        state.level = 20;
+        state.xp = 500;
+        state.tech_lasers = 5;
+        state.tech_shields = 3;
+        state.fleet.push(Ship::new(ShipType::Fighter));
+
+        state.complete_voyage();
+
+        assert_eq!(state.sector, 1);
+        assert_eq!(state.level, 1);
+        assert_eq!(state.xp, 0);
+        assert_eq!(state.scrap, 0);
+        assert_eq!(state.credits, VOYAGE_STARTING_CREDITS);
+        assert_eq!(state.tech_lasers, 1);
+        assert_eq!(state.tech_shields, 0);
+        assert_eq!(state.fleet.len(), 1);
+        assert!(state.inventory.is_empty());
+    }
+
+    #[test]
+    fn test_complete_voyage_keeps_pip() {
+        let mut state = GameState::new();
+        state.sector = 100;
+        state.pip_level = 5;
+        state.pip_xp = 100;
+        state.pip_bond = 50;
+        state.pip_appearance = 3;
+
+        state.complete_voyage();
+
+        assert_eq!(state.pip_level, 5);
+        assert_eq!(state.pip_xp, 100);
+        assert_eq!(state.pip_bond, 50);
+        assert_eq!(state.pip_appearance, 3);
+    }
+
+    #[test]
+    fn test_complete_voyage_keeps_stats() {
+        let mut state = GameState::new();
+        state.sector = 100;
+        state.total_battles = 50;
+        state.enemies_destroyed = 200;
+        state.deaths = 3;
+        state.time_played_secs = 3600;
+        state.achievements_unlocked.push("first_blood".to_string());
+
+        state.complete_voyage();
+
+        assert_eq!(state.total_battles, 50);
+        assert_eq!(state.enemies_destroyed, 200);
+        assert_eq!(state.deaths, 3);
+        assert_eq!(state.time_played_secs, 3600);
+        assert_eq!(state.achievements_unlocked.len(), 1);
+    }
+
+    #[test]
+    fn test_complete_voyage_tracks_highest_sector() {
+        let mut state = GameState::new();
+        state.sector = 150;
+
+        state.complete_voyage();
+
+        assert_eq!(state.highest_sector_ever, 150);
+    }
+
+    #[test]
+    fn test_complete_multiple_voyages() {
+        let mut state = GameState::new();
+
+        // Complete voyage 1
+        state.sector = 100;
+        state.complete_voyage();
+        assert_eq!(state.voyage, 2);
+        assert_eq!(state.voyages_completed, 1);
+
+        // Complete voyage 2
+        state.sector = 200;
+        state.complete_voyage();
+        assert_eq!(state.voyage, 3);
+        assert_eq!(state.voyages_completed, 2);
+        assert!((state.voyage_permanent_dmg - 0.10).abs() < f32::EPSILON);
+        assert!((state.voyage_permanent_hp - 0.10).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_is_voyage_boss_sector() {
+        let mut state = GameState::new();
+        state.sector = 100;
+        assert!(state.is_voyage_boss_sector());
+
+        state.sector = 99;
+        assert!(!state.is_voyage_boss_sector());
+
+        state.voyage = 3;
+        state.sector = 300;
+        assert!(state.is_voyage_boss_sector());
+    }
+
+    #[test]
+    fn test_voyage_target_sector() {
+        let state = GameState::new();
+        assert_eq!(state.voyage_target_sector(), 100);
     }
 }

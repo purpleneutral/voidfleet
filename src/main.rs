@@ -15,6 +15,7 @@ use ratatui::prelude::*;
 
 use engine::achievements::check_achievements;
 use engine::events::{EventBus, pip_commentary, process_events};
+use engine::voyage::VoyageStats;
 use engine::{missions, trade};
 use rendering::particles::ParticleSystem;
 use scenes::{Scene, SceneAction};
@@ -33,6 +34,7 @@ use scenes::missions::MissionScreen;
 use scenes::upgrades::UpgradeScreen;
 use scenes::map::MapScreen;
 use scenes::gamelog::GameLogScreen;
+use scenes::voyage::VoyageScreen;
 use state::{GamePhase, GameState};
 
 const TICK_RATE: Duration = Duration::from_millis(50); // 20 fps
@@ -84,6 +86,7 @@ fn main() -> io::Result<()> {
     let mut trade_screen = TradeScreen::new();
     let mut mission_screen = MissionScreen::new();
     let mut gamelog = GameLogScreen::new();
+    let mut voyage_screen = VoyageScreen::new();
 
     // Achievement popup display
     let mut popup_text: Option<String> = None;
@@ -144,7 +147,11 @@ fn main() -> io::Result<()> {
                             }
                         }
                         AppMode::Playing => {
-                            if gamelog.open {
+                            if voyage_screen.active {
+                                if key.code == KeyCode::Enter {
+                                    voyage_screen.handle_enter();
+                                }
+                            } else if gamelog.open {
                                 match key.code {
                                     KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('L') => gamelog.toggle(),
                                     other => gamelog.handle_input(other),
@@ -199,25 +206,13 @@ fn main() -> io::Result<()> {
                                     KeyCode::Char('j') | KeyCode::Char('J') => mission_screen.toggle(&mut state),
                                     KeyCode::Char('l') | KeyCode::Char('L') => gamelog.toggle(),
                                     KeyCode::Char('p') | KeyCode::Char('P') => {
-                                        if state.prestige() {
-                                            // Prestige resets state, re-enter travel scene
-                                            let size = terminal.size()?;
-                                            particles.particles.clear();
-                                            get_scene_mut(
-                                                &mut travel, &mut battle, &mut raid, &mut loot,
-                                                state.phase,
-                                            )
-                                            .enter(&state, size.width, size.height);
-                                            popup_text = Some(format!(
-                                                "★ PRESTIGE {} ★ — XP +{}% Credits +{}% Scrap +{}%",
-                                                state.prestige_level,
-                                                (state.prestige_bonus_xp * 100.0) as u32,
-                                                (state.prestige_bonus_credits * 100.0) as u32,
-                                                (state.prestige_bonus_scrap * 100.0) as u32,
-                                            ));
-                                            popup_timer = 80;
-                                            state.save();
-                                        }
+                                        // Voyage info display
+                                        let info = crate::engine::voyage::VoyageInfo::for_voyage(state.voyage);
+                                        popup_text = Some(format!(
+                                            "◈ Voyage {}: {} — Target: Sector {} (Current: {})",
+                                            state.voyage, info.display_name(), info.target_sector, state.sector,
+                                        ));
+                                        popup_timer = 60;
                                     }
                                     KeyCode::Char(' ') => {
                                         state.phase_timer = 0.1;
@@ -243,6 +238,34 @@ fn main() -> io::Result<()> {
             AppMode::Playing => {
                 tick_count += 1;
 
+                // ── Voyage cinematic (blocks normal gameplay when active) ──
+                if voyage_screen.active {
+                    let completed = voyage_screen.tick();
+                    if completed {
+                        // Voyage cinematic finished — reset game state
+                        state.complete_voyage();
+                        let size = terminal.size()?;
+                        particles.particles.clear();
+                        get_scene_mut(
+                            &mut travel, &mut battle, &mut raid, &mut loot,
+                            state.phase,
+                        )
+                        .enter(&state, size.width, size.height);
+                        state.save();
+                    }
+                    // Render only the voyage screen
+                    terminal.draw(|frame| {
+                        voyage_screen.render(frame);
+                    })?;
+
+                    // Frame rate control
+                    let elapsed = tick_start.elapsed();
+                    if elapsed < TICK_RATE {
+                        std::thread::sleep(TICK_RATE - elapsed);
+                    }
+                    continue;
+                }
+
                 // Tick particles
                 particles.tick();
 
@@ -262,6 +285,32 @@ fn main() -> io::Result<()> {
                     // Pip loot notification (battle win/loss handled via events)
                     if next_phase == GamePhase::Loot {
                         bridge.notify_loot();
+                    }
+
+                    // ── Voyage boss defeated → activate cinematic ──────
+                    if state.phase == GamePhase::Loot && next_phase == GamePhase::Travel && state.voyage_boss_defeated {
+                        state.voyage_boss_defeated = false;
+                        let size = terminal.size()?;
+                        let stats = VoyageStats {
+                            sectors_cleared: state.sector.saturating_sub(1),
+                            battles_won: state.total_battles,
+                            enemies_destroyed: state.enemies_destroyed,
+                            ships_built: state.voyage_ships_built,
+                            crew_recruited: state.voyage_crew_recruited,
+                            equipment_found: state.voyage_equipment_found,
+                            credits_earned: state.voyage_credits_earned,
+                            time_played_secs: state.time_played_secs,
+                        };
+                        voyage_screen.activate(
+                            state.voyage,
+                            stats,
+                            &state.voyage_bonuses,
+                            size.width,
+                            size.height,
+                        );
+                        // Don't proceed with the normal Loot→Travel transition;
+                        // the voyage cinematic will handle complete_voyage() when done
+                        continue;
                     }
 
                     // ── Sector transition logic (Loot → Travel) ──────────
@@ -572,14 +621,12 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
         "log" => " SHIP LOG │ [↑↓]Scroll [PgUp/PgDn]Page [Esc]Close ".to_string(),
         "event" => " EVENT │ [↑↓]Select [Enter]Choose ".to_string(),
         _ => {
-            let mut hud = format!(
-                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [I]nventory [C]rew [F]actions [T]rade [J]ournal [L]og [B]ridge [M]ap [Tab]Stats [Space]Skip ",
-                phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
+            let voyage_target = crate::engine::voyage::voyage_target_sector(state.voyage);
+            let hud = format!(
+                " V{} {} │ Sec:{}/{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pg [I]nv [C]rew [F]act [T]rade [J]ournal [L]og [B]ridge [M]ap [Tab]Stats [Space]Skip [Q]uit ",
+                state.voyage, phase_name, state.sector, voyage_target,
+                state.level, state.scrap, state.credits, state.fleet.len()
             );
-            if state.sector >= 30 {
-                hud.push_str("[P]restige ");
-            }
-            hud.push_str("[Q]uit ");
             hud
         }
     };

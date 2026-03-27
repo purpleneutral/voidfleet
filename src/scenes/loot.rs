@@ -135,7 +135,7 @@ impl Scene for LootScene {
         };
         let loot = calculate_loot(state, performance);
 
-        // Apply prestige bonuses
+        // Apply prestige bonuses (legacy) + voyage bonuses
         let credit_mult = 1.0 + state.prestige_bonus_credits;
         let scrap_mult = 1.0 + state.prestige_bonus_scrap;
         let xp_mult = 1.0 + state.prestige_bonus_xp;

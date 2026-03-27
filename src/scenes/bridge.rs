@@ -17,6 +17,7 @@ pub enum Mood {
     Excited,
     Dancing,
     Lonely,
+    Alarmed,
 }
 
 // ── Pip sprites ─────────────────────────────────────────────────────────
@@ -36,6 +37,7 @@ impl Mood {
             Mood::Excited => "(★★)",
             Mood::Dancing => "(◕‿◕)",
             Mood::Lonely => "(◕._◕)",
+            Mood::Alarmed => "(◉◉)",
         }
     }
 
@@ -49,6 +51,7 @@ impl Mood {
             Mood::Sad => "",
             Mood::Lonely => "...",
             Mood::Idle => "",
+            Mood::Alarmed => "⚠",
         }
     }
 
@@ -60,6 +63,7 @@ impl Mood {
             Mood::Eating => Color::Cyan,
             Mood::Sleeping => Color::DarkGray,
             Mood::Idle => Color::White,
+            Mood::Alarmed => Color::Red,
         }
     }
 }
@@ -257,6 +261,16 @@ impl BridgeScene {
                 self.pip_mood = Mood::Dancing;
                 self.pip_mood_timer = 200;
                 self.say("A new beginning!");
+            }
+            GameEvent::VoyageCompleted { .. } => {
+                self.pip_mood = Mood::Dancing;
+                self.pip_mood_timer = 300;
+                self.say("We did it! A whole new voyage!");
+            }
+            GameEvent::VoyageBossSpawned { .. } => {
+                self.pip_mood = Mood::Alarmed;
+                self.pip_mood_timer = 200;
+                self.say("That's... HUGE!");
             }
             _ => {}
         }
@@ -715,6 +729,7 @@ impl BridgeScene {
             Mood::Excited => "Wow!",
             Mood::Dancing => "Dance",
             Mood::Lonely => "Lonely",
+            Mood::Alarmed => "Alert!",
         }
     }
 

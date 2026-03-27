@@ -67,6 +67,10 @@ pub enum GameEvent {
     MissionAccepted { title: String, faction: String },
     MissionCompleted { title: String, reward_credits: u64, reward_rep: i32 },
     MissionFailed { title: String, reason: String },
+
+    // Voyage
+    VoyageCompleted { voyage: u32, next_name: String },
+    VoyageBossSpawned { voyage: u32, boss_name: String },
 }
 
 // ── Event → Log Entry conversion ────────────────────────────────────────────
@@ -326,6 +330,27 @@ pub fn event_to_log_entries(event: &GameEvent, state: &GameState) -> Vec<LogEntr
                 color: Color::Magenta,
             }]
         }
+        GameEvent::VoyageCompleted { voyage, next_name } => {
+            vec![LogEntry {
+                sector: state.sector,
+                icon: '◈',
+                title: format!("VOYAGE {} COMPLETE!", voyage),
+                details: vec![
+                    format!("Beginning {}", next_name),
+                    "Permanent bonuses gained!".into(),
+                ],
+                color: Color::Magenta,
+            }]
+        }
+        GameEvent::VoyageBossSpawned { voyage, boss_name } => {
+            vec![LogEntry {
+                sector: state.sector,
+                icon: '☠',
+                title: format!("VOYAGE {} BOSS: {}", voyage, boss_name),
+                details: vec!["Defeat the boss to complete this voyage!".into()],
+                color: Color::Red,
+            }]
+        }
         // Events that are too granular for the log (per-tick combat events, etc.)
         _ => vec![],
     }
@@ -460,6 +485,12 @@ pub fn pip_commentary(event: &GameEvent, state: &GameState) -> Option<String> {
         }
         GameEvent::PrestigeCompleted { level } => {
             Some(format!("Prestige {}! A fresh start!", level))
+        }
+        GameEvent::VoyageCompleted { voyage, next_name } => {
+            Some(format!("Voyage {} done! {} awaits!", voyage, next_name))
+        }
+        GameEvent::VoyageBossSpawned { boss_name, .. } => {
+            Some(format!("{}?! This is it!!", boss_name))
         }
         GameEvent::ContrabandDetected { .. } => {
             Some("Busted! Run!!".into())
@@ -710,6 +741,22 @@ pub fn process_events(
             GameEvent::MissionFailed { title, reason } => {
                 *popup_text = Some(format!("❌ Mission failed: {} — {}", title, reason));
                 *popup_timer = 60;
+            }
+            GameEvent::VoyageCompleted { voyage, next_name } => {
+                *popup_text = Some(format!(
+                    "◈ VOYAGE {} COMPLETE ◈ — {} awaits!",
+                    voyage, next_name
+                ));
+                *popup_timer = 100;
+                bridge.react_to_event(event, state);
+            }
+            GameEvent::VoyageBossSpawned { voyage, boss_name } => {
+                *popup_text = Some(format!(
+                    "☠ VOYAGE {} BOSS: {} ☠",
+                    voyage, boss_name
+                ));
+                *popup_timer = 80;
+                bridge.react_to_event(event, state);
             }
             // Other events are logged to history but don't trigger cross-system effects yet.
             _ => {}

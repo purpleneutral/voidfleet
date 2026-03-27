@@ -6,7 +6,7 @@ use crate::engine::abilities::{AbilityContext, AbilityEffect};
 use crate::engine::combat::{effective_damage, effective_hp, fire_rate};
 use crate::engine::crew::CrewClass;
 use crate::engine::equipment::{generate_equipment, Equipment, Rarity};
-use crate::engine::procedural::{generate_enemy_fleet_adaptive, difficulty_modifier, post_death_modifier};
+use crate::engine::procedural::{generate_enemy_fleet_for_voyage, difficulty_modifier, post_death_modifier};
 use crate::engine::ship::{Ship, ShipAbility, ShipType};
 use crate::rendering::particles::{Particle, ParticleSystem};
 use crate::state::{GamePhase, GameState};
@@ -27,6 +27,128 @@ enum AIStrategy {
     Flanker,    // move to top/bottom edges, attack from angles
     Retreater,  // stay far right, pull back when HP < 30%
     Bomber,     // slow approach, massive damage, suicide run
+}
+
+// ---------------------------------------------------------------------------
+// Battle Phase AI — adaptive enemy behavior across battle duration
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BattlePhaseAI {
+    Opening,    // first ~100 ticks: probe, assess, spread out
+    Engaged,    // normal combat with full coordination
+    Desperate,  // fleet HP < 30%: all-in aggression, +50% fire rate
+    Retreating, // last enemy alive: tries to flee right, fires backward
+}
+
+// ---------------------------------------------------------------------------
+// Fleet Formation — auto-determined by player fleet composition
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FleetFormation {
+    Defensive,  // tight group, overlapping shields: +15% HP, -10% damage
+    Offensive,  // spread out, maximize DPS: +15% damage, -10% HP
+    Echelon,    // diagonal line, partial cover: +10% dodge
+    Screening,  // fighters front, heavies back: fighters absorb, heavies deal more
+}
+
+impl FleetFormation {
+    /// Determine formation from fleet composition.
+    fn from_fleet(fleet: &[Ship]) -> Self {
+        let alive: Vec<&Ship> = fleet.iter().filter(|s| s.is_alive()).collect();
+        if alive.is_empty() {
+            return FleetFormation::Defensive;
+        }
+
+        let fighters = alive.iter().filter(|s| matches!(s.ship_type, ShipType::Scout | ShipType::Fighter)).count();
+        let has_capital = alive.iter().any(|s| matches!(s.ship_type, ShipType::Capital | ShipType::Carrier));
+        let frigates = alive.iter().filter(|s| matches!(s.ship_type, ShipType::Frigate | ShipType::Destroyer)).count();
+        let total = alive.len();
+
+        if has_capital && fighters > 0 {
+            FleetFormation::Screening
+        } else if fighters as f32 / total as f32 > 0.6 {
+            FleetFormation::Offensive
+        } else if frigates as f32 / total as f32 > 0.5 {
+            FleetFormation::Defensive
+        } else {
+            FleetFormation::Echelon
+        }
+    }
+
+    /// Damage multiplier from formation.
+    fn damage_mult(&self) -> f32 {
+        match self {
+            Self::Defensive => 0.90,
+            Self::Offensive => 1.15,
+            Self::Echelon => 1.0,
+            Self::Screening => 1.0, // heavies get bonus separately
+        }
+    }
+
+    /// HP/survivability multiplier from formation.
+    fn hp_mult(&self) -> f32 {
+        match self {
+            Self::Defensive => 1.15,
+            Self::Offensive => 0.90,
+            Self::Echelon => 1.0,
+            Self::Screening => 1.0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Battle Momentum — rewards sustained accuracy
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct BattleMomentum {
+    player_streak: u32,
+    enemy_streak: u32,
+    player_momentum: f32, // 1.0 base, up to 1.5
+    enemy_momentum: f32,
+}
+
+impl BattleMomentum {
+    fn new() -> Self {
+        Self {
+            player_streak: 0,
+            enemy_streak: 0,
+            player_momentum: 1.0,
+            enemy_momentum: 1.0,
+        }
+    }
+
+    fn player_hit(&mut self) {
+        self.player_streak += 1;
+        self.player_momentum = (self.player_momentum + 0.02).min(1.5);
+    }
+
+    fn player_miss(&mut self) {
+        self.player_streak = 0;
+        self.player_momentum = (self.player_momentum - 0.05).max(1.0);
+    }
+
+    fn enemy_hit(&mut self) {
+        self.enemy_streak += 1;
+        self.enemy_momentum = (self.enemy_momentum + 0.02).min(1.5);
+    }
+
+    fn enemy_miss(&mut self) {
+        self.enemy_streak = 0;
+        self.enemy_momentum = (self.enemy_momentum - 0.05).max(1.0);
+    }
+
+    fn on_ship_destroyed(&mut self, friendly: bool) {
+        if friendly {
+            self.enemy_momentum = 1.0;
+            self.enemy_streak = 0;
+        } else {
+            self.player_momentum = 1.0;
+            self.player_streak = 0;
+        }
+    }
 }
 
 impl AIStrategy {
@@ -407,6 +529,20 @@ pub struct BattleScene {
     ability_texts: Vec<AbilityText>,
     /// Faction controlling the enemy fleet in this battle.
     battle_faction: Faction,
+    /// Adaptive enemy AI phase — changes mid-battle based on conditions.
+    ai_phase: BattlePhaseAI,
+    /// Player fleet formation — auto-determined by composition.
+    formation: FleetFormation,
+    /// Battle momentum — rewards sustained accuracy.
+    momentum: BattleMomentum,
+    /// Visual: coordination lines from enemies to their focus target (x1,y1,x2,y2,life).
+    coord_lines: Vec<(f32, f32, f32, f32, u8)>,
+    /// Visual: desperate mode flash timer (ticks remaining).
+    desperate_flash: u8,
+    /// Whether this is a voyage boss battle (for post-victory voyage completion).
+    is_voyage_boss_battle: bool,
+    /// Pending voyage boss event to emit on first tick (voyage, boss_name).
+    pending_voyage_boss: Option<(u32, String)>,
 }
 
 /// Floating ability trigger text that drifts upward and fades.
@@ -443,6 +579,13 @@ impl BattleScene {
             revive_used: false,
             ability_texts: Vec::new(),
             battle_faction: Faction::Independent,
+            ai_phase: BattlePhaseAI::Opening,
+            formation: FleetFormation::Defensive,
+            momentum: BattleMomentum::new(),
+            coord_lines: Vec::new(),
+            desperate_flash: 0,
+            is_voyage_boss_battle: false,
+            pending_voyage_boss: None,
         }
     }
 
@@ -809,8 +952,6 @@ impl BattleScene {
         projectiles: &[Projectile],
         enemies: &mut [EnemyShip],
     ) {
-        let dodge_range = 3.0_f32;
-        let dodge_strength = 0.6_f32;
         let decay = 0.8_f32;
 
         for e in enemies.iter_mut() {
@@ -818,13 +959,42 @@ impl BattleScene {
                 continue;
             }
 
+            // Strategy/tier-aware dodge parameters:
+            // Flankers dodge best, big ships dodge poorly, bombers don't dodge
+            let (dodge_x_range, dodge_y_range, dodge_strength) = match e.strategy {
+                AIStrategy::Flanker => (8.0_f32, 2.5, 0.9),   // excellent dodgers
+                AIStrategy::Aggressive => (6.0, 2.0, 0.6),     // decent
+                AIStrategy::Bomber => (3.0, 1.0, 0.2),         // barely dodges (on a mission)
+                _ => {
+                    // Big ships dodge less effectively
+                    if e.is_big() {
+                        (4.0, 1.5, 0.3)
+                    } else {
+                        (6.0, 2.0, 0.6)
+                    }
+                }
+            };
+
             let mut nearest_dy: Option<f32> = None;
+            let base_y = e.y - e.dodge_offset;
             for p in projectiles.iter() {
                 if !p.friendly {
                     continue;
                 }
-                let dy = p.y - (e.y - e.dodge_offset);
-                if dy.abs() < dodge_range {
+                // Check x proximity: projectile must be heading toward us
+                let dx = p.x - e.x;
+                if dx.abs() > dodge_x_range || dx > 0.0 {
+                    // Projectile must be to our left (heading right toward us) and close
+                    // Actually friendly projectiles move right (vx > 0), so dx < 0 means
+                    // projectile is to our left and approaching
+                    continue;
+                }
+                // Also check projectiles approaching from any direction
+                if dx.abs() > dodge_x_range {
+                    continue;
+                }
+                let dy = p.y - base_y;
+                if dy.abs() < dodge_y_range {
                     match nearest_dy {
                         None => nearest_dy = Some(dy),
                         Some(prev) => {
@@ -842,7 +1012,8 @@ impl BattleScene {
                 } else {
                     dodge_strength
                 };
-                e.dodge_offset = (e.dodge_offset + dodge_dir).clamp(-2.0, 2.0);
+                let max_offset = if e.is_big() { 1.5 } else { 2.5 };
+                e.dodge_offset = (e.dodge_offset + dodge_dir).clamp(-max_offset, max_offset);
             } else {
                 e.dodge_offset *= decay;
                 if e.dodge_offset.abs() < 0.05 {
@@ -856,14 +1027,91 @@ impl BattleScene {
     // AI: Utility-based target selection for enemies
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // AI: Threat assessment — score each player ship by danger level
+    // -----------------------------------------------------------------------
+
+    fn assess_threats(
+        fleet: &[Ship],
+        positions: &[(f32, f32)],
+        enemy_x: f32,
+        enemy_y: f32,
+        player_states: &[PlayerShipState],
+    ) -> Vec<(usize, f32)> {
+        let mut threats: Vec<(usize, f32)> = Vec::new();
+
+        for (i, ship) in fleet.iter().enumerate() {
+            if !ship.is_alive() || i >= positions.len() {
+                continue;
+            }
+            let (px, py) = positions[i];
+            let dist = ((enemy_x - px).powi(2) + (enemy_y - py).powi(2)).sqrt().max(1.0);
+
+            // Base threat = damage output * 2 + remaining HP * 0.5
+            let mut threat = ship.damage() as f32 * 2.0 + ship.current_hp as f32 * 0.5;
+
+            // Distance penalty
+            threat -= dist * 0.1;
+
+            // Capital ships = high base threat
+            if matches!(ship.ship_type, ShipType::Capital | ShipType::Carrier | ShipType::Destroyer) {
+                threat += 40.0;
+            }
+
+            // Low HP = reduced threat (don't waste shots on dying ships — unless kill confirm)
+            let hp_ratio = ship.current_hp as f32 / ship.max_hp().max(1) as f32;
+            if hp_ratio < 0.15 {
+                // Kill confirm exception: VERY low HP ships are high priority
+                threat += 30.0;
+            } else if hp_ratio < 0.3 {
+                threat *= 0.7;
+            }
+
+            // Ships with active abilities (shield, beam charging) = +30% threat
+            if i < player_states.len() {
+                if player_states[i].shield_timer > 0 || player_states[i].beam_charge > 0 || player_states[i].beam_active > 0 {
+                    threat *= 1.3;
+                }
+            }
+
+            threats.push((i, threat));
+        }
+
+        // Sort by threat descending
+        threats.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        threats
+    }
+
     fn enemy_select_target(
         strategy: AIStrategy,
+        enemy_x: f32,
         enemy_y: f32,
         fleet: &[Ship],
         positions: &[(f32, f32)],
         all_enemy_ys: &[f32],
+        ai_phase: BattlePhaseAI,
+        player_states: &[PlayerShipState],
     ) -> i32 {
         if fleet.is_empty() {
+            return -1;
+        }
+
+        // In desperate/retreating phase, always target weakest (kill confirm)
+        if ai_phase == BattlePhaseAI::Desperate || ai_phase == BattlePhaseAI::Retreating {
+            let mut weakest_idx: i32 = -1;
+            let mut weakest_hp = u32::MAX;
+            for (i, ship) in fleet.iter().enumerate() {
+                if ship.is_alive() && ship.current_hp < weakest_hp {
+                    weakest_hp = ship.current_hp;
+                    weakest_idx = i as i32;
+                }
+            }
+            return weakest_idx;
+        }
+
+        // Use threat assessment for intelligent strategies
+        let threats = Self::assess_threats(fleet, positions, enemy_x, enemy_y, player_states);
+        if threats.is_empty() {
             return -1;
         }
 
@@ -875,58 +1123,65 @@ impl BattleScene {
                 continue;
             }
 
+            // Get threat rank for this ship (lower = more threatening)
+            let threat_rank = threats.iter().position(|(idx, _)| *idx == i).unwrap_or(threats.len());
+            let threat_score = threats.iter().find(|(idx, _)| *idx == i).map(|(_, s)| *s).unwrap_or(0.0);
+
             let score = match strategy {
                 AIStrategy::FocusWeak => {
-                    if ship.current_hp == 0 {
+                    // Kill confirm: enemy below 15% HP gets massive priority
+                    let hp_ratio = ship.current_hp as f32 / ship.max_hp().max(1) as f32;
+                    if hp_ratio < 0.15 {
+                        1000.0
+                    } else if ship.current_hp == 0 {
                         f32::NEG_INFINITY
                     } else {
                         1.0 / ship.current_hp as f32
                     }
                 }
-                AIStrategy::FocusDPS => ship.damage() as f32,
+                AIStrategy::FocusDPS => {
+                    // Use threat assessment — pick highest threat
+                    threat_score
+                }
                 AIStrategy::Aggressive => {
                     let (px, py) = positions[i];
-                    let dist =
-                        ((enemy_y - py).powi(2) + (px - 30.0).powi(2)).sqrt();
-                    if dist < 0.01 {
-                        1000.0
-                    } else {
-                        1.0 / dist
-                    }
+                    let dist = ((enemy_y - py).powi(2) + (enemy_x - px).powi(2)).sqrt();
+                    // Blend proximity with threat
+                    let proximity = if dist < 0.01 { 1000.0 } else { 100.0 / dist };
+                    proximity + threat_score * 0.3
                 }
                 AIStrategy::Flanker => {
-                    // Prefer targets far from other enemies' y positions
+                    // Prefer targets far from other enemies (isolated targets)
                     let (_, py) = positions[i];
                     let min_enemy_dist = all_enemy_ys
                         .iter()
-                        .filter(|&&ey| (ey - enemy_y).abs() > 1.0) // exclude self
+                        .filter(|&&ey| (ey - enemy_y).abs() > 1.0)
                         .map(|&ey| (ey - py).abs())
                         .fold(f32::INFINITY, f32::min);
-                    // Higher score = farther from other enemies
-                    if min_enemy_dist.is_infinite() {
-                        1.0 // only enemy, pick anyone
-                    } else {
-                        min_enemy_dist
-                    }
+                    let isolation = if min_enemy_dist.is_infinite() { 1.0 } else { min_enemy_dist };
+                    isolation + threat_score * 0.2
                 }
                 AIStrategy::Retreater => {
-                    // Prefer closest (minimize waste on retreating shots)
                     let (_, py) = positions[i];
                     let dist = (enemy_y - py).abs();
-                    if dist < 0.01 {
-                        1000.0
-                    } else {
-                        1.0 / dist
-                    }
+                    let proximity = if dist < 0.01 { 1000.0 } else { 1.0 / dist };
+                    proximity
                 }
                 AIStrategy::Bomber => {
-                    // Target highest HP (most value from suicide)
-                    ship.current_hp as f32
+                    // Target highest HP (most value from suicide), but also consider threat
+                    ship.current_hp as f32 + threat_score * 0.5
                 }
             };
 
-            if score > best_score {
-                best_score = score;
+            // Opening phase: prefer top-threat targets (probing)
+            let phase_adjusted = if ai_phase == BattlePhaseAI::Opening {
+                score + if threat_rank == 0 { 20.0 } else { 0.0 }
+            } else {
+                score
+            };
+
+            if phase_adjusted > best_score {
+                best_score = phase_adjusted;
                 best_idx = i as i32;
             }
         }
@@ -940,7 +1195,11 @@ impl BattleScene {
 
     fn player_select_target(
         ship: &Ship,
+        ship_x: f32,
+        ship_y: f32,
         enemies: &[EnemyShip],
+        crew: Option<&crate::engine::crew::CrewMember>,
+        formation: FleetFormation,
     ) -> i32 {
         let mut best_idx: i32 = -1;
         let mut best_score: f32 = f32::NEG_INFINITY;
@@ -949,6 +1208,13 @@ impl BattleScene {
             ship.ship_type,
             ShipType::Capital | ShipType::Destroyer | ShipType::Carrier
         );
+        let is_fighter = matches!(
+            ship.ship_type,
+            ShipType::Scout | ShipType::Fighter
+        );
+
+        let is_gunner = crew.map_or(false, |c| c.class == CrewClass::Gunner);
+        let is_navigator = crew.map_or(false, |c| matches!(c.class, CrewClass::Navigator | CrewClass::Pilot));
 
         for (i, enemy) in enemies.iter().enumerate() {
             if !enemy.is_alive() {
@@ -956,23 +1222,56 @@ impl BattleScene {
             }
 
             let mut score: f32 = 0.0;
+            let dist = ((enemy.x - ship_x).powi(2) + (enemy.y - ship_y).powi(2)).sqrt().max(1.0);
 
-            // Threat priority: aggressive and bomber enemies are highest priority
-            match enemy.strategy {
-                AIStrategy::Bomber => score += 50.0,
-                AIStrategy::Aggressive => score += 30.0,
-                _ => {}
+            // Priority 1: Kill confirm — enemy below 15% HP (finish it off!)
+            let hp_ratio = enemy.hp as f32 / enemy.max_hp.max(1) as f32;
+            if hp_ratio < 0.15 {
+                score += 80.0;
             }
 
-            // Capital ships prefer enemy big ships
+            // Priority 2: Charging bomber (existential threat)
+            if enemy.strategy == AIStrategy::Bomber {
+                // Threat increases as bomber gets closer
+                let bomber_threat = 60.0 + (1.0 / dist.max(0.1)) * 20.0;
+                score += bomber_threat;
+            }
+
+            // Priority 3: Highest DPS enemy (reduce incoming damage)
+            if enemy.strategy == AIStrategy::Aggressive {
+                score += 35.0;
+            }
+            // FocusDPS enemies are also dangerous
+            if enemy.strategy == AIStrategy::FocusDPS {
+                score += 25.0;
+            }
+
+            // Priority 4: Distance (accuracy falloff)
+            score += 20.0 / dist;
+
+            // Capital ships prefer big targets
             if is_capital && enemy.is_big() {
-                score += 20.0;
+                score += 25.0;
             }
 
-            // Secondary: lowest HP enemy (finish kills)
+            // Fighters in Screening formation: prioritize closest threats
+            if is_fighter && formation == FleetFormation::Screening {
+                score += 30.0 / dist;
+            }
+
+            // Damage done: prefer nearly-dead enemies to secure kills
             if enemy.max_hp > 0 {
-                let hp_ratio = enemy.hp as f32 / enemy.max_hp as f32;
                 score += (1.0 - hp_ratio) * 15.0;
+            }
+
+            // Navigator crew: bonus to targeting accuracy (prefer nearer targets)
+            if is_navigator {
+                score += 15.0 / dist;
+            }
+
+            // Gunner crew: prefer highest-value target regardless of distance
+            if is_gunner {
+                score += enemy.damage as f32 * 0.5 + if enemy.is_big() { 20.0 } else { 0.0 };
             }
 
             if score > best_score {
@@ -988,7 +1287,7 @@ impl BattleScene {
     // AI: Focus fire coordination
     // -----------------------------------------------------------------------
 
-    fn update_focus_fire(&mut self, fleet: &[Ship]) {
+    fn update_focus_fire(&mut self, fleet: &[Ship], positions: &[(f32, f32)]) {
         if self.focus_fire_cooldown > 0 {
             self.focus_fire_cooldown -= 1;
             return;
@@ -997,41 +1296,114 @@ impl BattleScene {
         self.focus_fire_cooldown = 20; // re-evaluate every 20 ticks
         let alive_enemies = self.enemy_alive_count();
 
-        if alive_enemies < 3 {
+        // Desperate/retreating: always coordinate on weakest
+        if self.ai_phase == BattlePhaseAI::Desperate || self.ai_phase == BattlePhaseAI::Retreating {
+            let mut weakest_idx: i32 = -1;
+            let mut weakest_hp = u32::MAX;
+            for (i, ship) in fleet.iter().enumerate() {
+                if ship.is_alive() && ship.current_hp < weakest_hp {
+                    weakest_hp = ship.current_hp;
+                    weakest_idx = i as i32;
+                }
+            }
+            self.focus_fire_target = weakest_idx;
+            // Add coordination lines visual
+            self.update_coord_lines(fleet, positions);
+            return;
+        }
+
+        if alive_enemies < 2 {
+            self.focus_fire_target = -1;
+            return;
+        }
+
+        // Opening phase: no coordination (probing)
+        if self.ai_phase == BattlePhaseAI::Opening {
             self.focus_fire_target = -1;
             return;
         }
 
         let mut rng = rand::thread_rng();
 
-        // 60% chance enemies coordinate on same target
-        if !rng.gen_bool(0.6) {
+        // 70% chance enemies coordinate (up from 60%)
+        if !rng.gen_bool(0.7) {
             self.focus_fire_target = -1;
             return;
         }
 
-        // Check if any player ship is below 25% HP — all switch to finish it
+        // Kill confirm: any player ship below 20% HP — ALL enemies focus it
         for (i, ship) in fleet.iter().enumerate() {
             if !ship.is_alive() {
                 continue;
             }
             let ratio = ship.current_hp as f32 / ship.max_hp() as f32;
-            if ratio < 0.25 {
+            if ratio < 0.20 {
                 self.focus_fire_target = i as i32;
+                self.update_coord_lines(fleet, positions);
                 return;
             }
         }
 
-        // Otherwise pick the weakest alive ship
-        let mut weakest_idx: i32 = -1;
-        let mut weakest_hp = u32::MAX;
-        for (i, ship) in fleet.iter().enumerate() {
-            if ship.is_alive() && ship.current_hp < weakest_hp {
-                weakest_hp = ship.current_hp;
-                weakest_idx = i as i32;
-            }
+        // Use threat assessment from fleet center
+        let enemy_center_x = self.enemies.iter().filter(|e| e.is_alive()).map(|e| e.x).sum::<f32>()
+            / alive_enemies.max(1) as f32;
+        let enemy_center_y = self.enemies.iter().filter(|e| e.is_alive()).map(|e| e.y).sum::<f32>()
+            / alive_enemies.max(1) as f32;
+        let threats = Self::assess_threats(fleet, positions, enemy_center_x, enemy_center_y, &self.player_states);
+
+        if let Some(&(idx, _)) = threats.first() {
+            self.focus_fire_target = idx as i32;
+            self.update_coord_lines(fleet, positions);
+        } else {
+            self.focus_fire_target = -1;
         }
-        self.focus_fire_target = weakest_idx;
+    }
+
+    /// Generate visual coordination lines from enemies to the focus target.
+    fn update_coord_lines(&mut self, fleet: &[Ship], positions: &[(f32, f32)]) {
+        self.coord_lines.clear();
+        if self.focus_fire_target < 0 {
+            return;
+        }
+        let tidx = self.focus_fire_target as usize;
+        if tidx >= positions.len() || tidx >= fleet.len() || !fleet[tidx].is_alive() {
+            return;
+        }
+        let (tx, ty) = positions[tidx];
+        for e in &self.enemies {
+            if !e.is_alive() {
+                continue;
+            }
+            self.coord_lines.push((e.x, e.y, tx, ty, 8)); // 8 tick lifetime
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // AI: Update battle phase based on conditions
+    // -----------------------------------------------------------------------
+
+    fn update_ai_phase(&mut self) {
+        let alive = self.enemy_alive_count();
+        let total_hp = self.enemy_total_hp();
+        let max_hp = self.enemy_max_hp();
+        let hp_ratio = if max_hp > 0 { total_hp as f32 / max_hp as f32 } else { 0.0 };
+
+        let old_phase = self.ai_phase;
+
+        if alive <= 1 && total_hp > 0 && hp_ratio < 0.5 {
+            self.ai_phase = BattlePhaseAI::Retreating;
+        } else if hp_ratio < 0.30 {
+            self.ai_phase = BattlePhaseAI::Desperate;
+        } else if self.tick_count < 100 {
+            self.ai_phase = BattlePhaseAI::Opening;
+        } else {
+            self.ai_phase = BattlePhaseAI::Engaged;
+        }
+
+        // Trigger desperate flash on transition
+        if old_phase != BattlePhaseAI::Desperate && self.ai_phase == BattlePhaseAI::Desperate {
+            self.desperate_flash = 10;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1041,28 +1413,73 @@ impl BattleScene {
     fn update_enemy_movement(&mut self) {
         let height = self.height as f32;
         let quarter = height / 4.0;
+        let ai_phase = self.ai_phase;
 
         for e in self.enemies.iter_mut() {
             if !e.is_alive() {
                 continue;
             }
 
+            // Phase overrides:
+            match ai_phase {
+                BattlePhaseAI::Opening => {
+                    // Spread out, don't advance — probe positioning
+                    let target_y = if e.base_y < height / 2.0 {
+                        e.base_y - 1.0 // drift slightly apart
+                    } else {
+                        e.base_y + 1.0
+                    };
+                    let dy = target_y - (e.base_y + e.tactical_y_offset);
+                    e.tactical_y_offset += dy.clamp(-0.05, 0.05);
+                    e.tactical_y_offset = e.tactical_y_offset.clamp(-height / 3.0, height / 3.0);
+                    continue; // skip strategy-specific movement during opening
+                }
+                BattlePhaseAI::Desperate => {
+                    // All enemies charge forward aggressively
+                    e.tactical_x_offset -= 0.2;
+                    let max_advance = e.x - 10.0;
+                    if e.tactical_x_offset < -max_advance {
+                        e.tactical_x_offset = -max_advance;
+                    }
+                    // Also try to spread out to avoid AOE
+                    if !e.is_big() {
+                        let spread = if e.base_y < height / 2.0 { -0.08 } else { 0.08 };
+                        e.tactical_y_offset += spread;
+                        e.tactical_y_offset = e.tactical_y_offset.clamp(-height / 3.0, height / 3.0);
+                    }
+                    continue;
+                }
+                BattlePhaseAI::Retreating => {
+                    // Last enemy: flee right, move faster
+                    e.tactical_x_offset += 0.25;
+                    let max_retreat = (self.width as f32 - e.x - 2.0).max(0.0);
+                    if e.tactical_x_offset > max_retreat {
+                        e.tactical_x_offset = max_retreat;
+                    }
+                    // Juke vertically to be harder to hit
+                    let juke = ((self.tick_count as f32 * 0.15).sin() * 0.3).clamp(-0.3, 0.3);
+                    e.tactical_y_offset += juke;
+                    e.tactical_y_offset = e.tactical_y_offset.clamp(-height / 3.0, height / 3.0);
+                    continue;
+                }
+                BattlePhaseAI::Engaged => {
+                    // Fall through to strategy-specific movement
+                }
+            }
+
             match e.strategy {
                 AIStrategy::Flanker => {
-                    // Move to top or bottom quarter of screen
                     let target_y = if e.base_y < height / 2.0 {
-                        quarter // top quarter
+                        quarter
                     } else {
-                        height - quarter // bottom quarter
+                        height - quarter
                     };
                     let dy = target_y - (e.base_y + e.tactical_y_offset);
                     e.tactical_y_offset += dy.clamp(-0.15, 0.15);
                     e.tactical_y_offset = e.tactical_y_offset.clamp(-height / 3.0, height / 3.0);
                 }
                 AIStrategy::Aggressive => {
-                    // Drift left toward player fleet
                     e.tactical_x_offset -= 0.1;
-                    // Clamp so they don't go past midscreen
                     let max_advance = e.x - 15.0;
                     if e.tactical_x_offset < -max_advance {
                         e.tactical_x_offset = -max_advance;
@@ -1070,7 +1487,6 @@ impl BattleScene {
                 }
                 AIStrategy::Retreater => {
                     if e.hp_ratio() < 0.3 {
-                        // Retreat: drift right
                         e.tactical_x_offset += 0.15;
                         let max_retreat = (self.width as f32 - e.x - 2.0).max(0.0);
                         if e.tactical_x_offset > max_retreat {
@@ -1079,16 +1495,15 @@ impl BattleScene {
                     }
                 }
                 AIStrategy::Bomber => {
-                    // Charge forward at 0.3/tick
+                    // Charge forward
                     e.tactical_x_offset -= 0.3;
-                    // If reached player fleet x range, it will "explode" in tick
                     let max_advance = e.x - 8.0;
                     if e.tactical_x_offset < -max_advance {
                         e.tactical_x_offset = -max_advance;
                     }
                 }
                 _ => {
-                    // FocusWeak, FocusDPS: gentle drift toward target y
+                    // FocusWeak, FocusDPS: gentle drift toward target y position
                     // (handled by gentle oscillation only)
                 }
             }
@@ -1103,7 +1518,10 @@ impl BattleScene {
         fleet: &[Ship],
         enemies: &[EnemyShip],
         states: &mut [PlayerShipState],
+        formation: FleetFormation,
     ) {
+        let alive_count = fleet.iter().filter(|s| s.is_alive()).count();
+
         for (i, ship) in fleet.iter().enumerate() {
             if !ship.is_alive() || i >= states.len() {
                 continue;
@@ -1113,35 +1531,70 @@ impl BattleScene {
                 ship.ship_type,
                 ShipType::Scout | ShipType::Fighter
             );
+            let is_heavy = matches!(
+                ship.ship_type,
+                ShipType::Capital | ShipType::Carrier | ShipType::Destroyer
+            );
 
-            if is_fighter {
-                // Fighters drift toward nearest alive enemy's y position
-                let mut nearest_enemy_y: Option<f32> = None;
-                let mut nearest_dist = f32::INFINITY;
-                for e in enemies.iter() {
-                    if !e.is_alive() {
-                        continue;
-                    }
-                    let ey = e.y + e.tactical_y_offset;
-                    // We don't have exact player y here, but formation offset pulls toward enemy
-                    let dist = ey.abs(); // rough proxy
-                    if dist < nearest_dist {
-                        nearest_dist = dist;
-                        nearest_enemy_y = Some(ey);
+            match formation {
+                FleetFormation::Screening => {
+                    if is_fighter {
+                        // Fighters push forward and drift toward nearest enemy
+                        let mut nearest_enemy_y: Option<f32> = None;
+                        let mut nearest_dist = f32::INFINITY;
+                        for e in enemies.iter() {
+                            if !e.is_alive() { continue; }
+                            let ey = e.y + e.tactical_y_offset;
+                            let dist = ey.abs();
+                            if dist < nearest_dist {
+                                nearest_dist = dist;
+                                nearest_enemy_y = Some(ey);
+                            }
+                        }
+                        if let Some(ey) = nearest_enemy_y {
+                            let target_offset = (ey - 12.0).clamp(-4.0, 4.0) * 0.3;
+                            let diff = target_offset - states[i].formation_offset;
+                            states[i].formation_offset += diff.clamp(-0.1, 0.1);
+                        }
+                    } else if is_heavy {
+                        // Heavies stay back center
+                        states[i].formation_offset *= 0.92;
+                        if states[i].formation_offset.abs() < 0.05 {
+                            states[i].formation_offset = 0.0;
+                        }
+                    } else {
+                        // Mid-weight: slight drift toward action
+                        states[i].formation_offset *= 0.95;
                     }
                 }
-
-                if let Some(ey) = nearest_enemy_y {
-                    // Pull formation offset toward enemy y (relative to base position)
-                    let target_offset = (ey - 12.0).clamp(-4.0, 4.0) * 0.3;
+                FleetFormation::Offensive => {
+                    // All ships spread out, each drifts toward a different enemy
+                    if !enemies.is_empty() {
+                        // Assign each ship a different enemy target by index
+                        let alive_enemies: Vec<f32> = enemies.iter()
+                            .filter(|e| e.is_alive())
+                            .map(|e| e.y + e.tactical_y_offset)
+                            .collect();
+                        if !alive_enemies.is_empty() {
+                            let target_ey = alive_enemies[i % alive_enemies.len()];
+                            let target_offset = (target_ey - 12.0).clamp(-5.0, 5.0) * 0.25;
+                            let diff = target_offset - states[i].formation_offset;
+                            states[i].formation_offset += diff.clamp(-0.12, 0.12);
+                        }
+                    }
+                }
+                FleetFormation::Defensive => {
+                    // Tight group: pull toward center
+                    let target_offset = 0.0;
                     let diff = target_offset - states[i].formation_offset;
-                    states[i].formation_offset += diff.clamp(-0.1, 0.1);
+                    states[i].formation_offset += diff.clamp(-0.15, 0.15);
                 }
-            } else {
-                // Capital/heavy ships: stay center, decay formation offset
-                states[i].formation_offset *= 0.95;
-                if states[i].formation_offset.abs() < 0.05 {
-                    states[i].formation_offset = 0.0;
+                FleetFormation::Echelon => {
+                    // Diagonal: each ship slightly offset based on index
+                    let alive_idx = fleet.iter().take(i).filter(|s| s.is_alive()).count();
+                    let echelon_offset = (alive_idx as f32 - alive_count as f32 / 2.0) * 0.8;
+                    let diff = echelon_offset - states[i].formation_offset;
+                    states[i].formation_offset += diff.clamp(-0.08, 0.08);
                 }
             }
         }
@@ -1245,10 +1698,22 @@ impl Scene for BattleScene {
             s.is_alive() && s.ship_type.ability() == Some(ShipAbility::Scan)
         });
 
-        // Generate enemy fleet using procedural generator (adaptive difficulty + boss encounters)
+        // Generate enemy fleet using procedural generator (adaptive difficulty + voyage scaling)
         let mut rng = rand::thread_rng();
         let modifier = difficulty_modifier(state) * post_death_modifier(state);
-        let templates = generate_enemy_fleet_adaptive(state.sector, modifier);
+
+        // Check if this is a voyage boss sector — use special boss fleet
+        let templates = if state.is_voyage_boss_sector() {
+            let boss_fleet = crate::engine::voyage::generate_voyage_boss(state.voyage);
+            // Store pending voyage boss event — emitted in first tick
+            self.pending_voyage_boss = Some((state.voyage, boss_fleet.iter()
+                .find(|e| e.is_boss)
+                .map(|e| e.name.to_string())
+                .unwrap_or_else(|| "Unknown".to_string())));
+            boss_fleet
+        } else {
+            generate_enemy_fleet_for_voyage(state.sector, modifier, state.voyage)
+        };
         let route_mod = state.current_route_modifier;
         self.enemies.clear();
         for tmpl in &templates {
@@ -1291,12 +1756,30 @@ impl Scene for BattleScene {
         self.revive_used = false;
         self.ability_texts.clear();
 
+        // Initialize advanced AI systems
+        self.ai_phase = BattlePhaseAI::Opening;
+        self.formation = FleetFormation::from_fleet(&state.fleet);
+        self.momentum = BattleMomentum::new();
+        self.coord_lines.clear();
+        self.desperate_flash = 0;
+
         // Determine enemy faction for this battle
         self.battle_faction = factions::encounter_faction(state.sector, state.total_battles as u32);
+
+        // Track if this is a voyage boss battle
+        self.is_voyage_boss_battle = state.is_voyage_boss_sector();
     }
 
     fn tick(&mut self, state: &mut GameState, particles: &mut ParticleSystem, events: &mut EventBus) -> SceneAction {
         self.tick_count += 1;
+
+        // ── Emit pending voyage boss event ────────────────────────────
+        if let Some((voyage, boss_name)) = self.pending_voyage_boss.take() {
+            events.emit(crate::engine::events::GameEvent::VoyageBossSpawned {
+                voyage,
+                boss_name,
+            });
+        }
 
         // ── Slide-in phase ─────────────────────────────────────────────
         if let BattlePhase::SlideIn = self.phase {
@@ -1353,6 +1836,15 @@ impl Scene for BattleScene {
                             faction: self.battle_faction.name().to_string(),
                             amount: rep_penalty,
                             reason: format!("destroyed {} ships", enemy_count),
+                        });
+                    }
+                    // Voyage boss defeated — flag for cinematic, emit event
+                    if self.is_voyage_boss_battle {
+                        state.voyage_boss_defeated = true;
+                        let next_info = crate::engine::voyage::VoyageInfo::for_voyage(state.voyage + 1);
+                        events.emit(crate::engine::events::GameEvent::VoyageCompleted {
+                            voyage: state.voyage,
+                            next_name: next_info.display_name(),
                         });
                     }
                     // Transfer equipment drops to state for loot scene
@@ -1624,10 +2116,32 @@ impl Scene for BattleScene {
             }
         }
 
-        // ── Focus fire coordination ────────────────────────────────────
-        self.update_focus_fire(&state.fleet);
+        // ── Update AI phase (adaptive behavior) ───────────────────────
+        self.update_ai_phase();
 
-        // ── Enemy AI: target selection (every 30 ticks) ────────────────
+        // ── Update formation (may change as ships die) ─────────────────
+        if self.tick_count.is_multiple_of(40) {
+            self.formation = FleetFormation::from_fleet(&state.fleet);
+        }
+
+        // ── Update coordination line lifetimes ─────────────────────────
+        self.coord_lines.retain_mut(|(_, _, _, _, life)| {
+            *life = life.saturating_sub(1);
+            *life > 0
+        });
+
+        // ── Desperate flash countdown ──────────────────────────────────
+        if self.desperate_flash > 0 {
+            self.desperate_flash -= 1;
+        }
+
+        // ── Focus fire coordination ────────────────────────────────────
+        {
+            let positions = self.player_positions(&state.fleet);
+            self.update_focus_fire(&state.fleet, &positions);
+        }
+
+        // ── Enemy AI: target selection (every 30 ticks, faster when desperate) ──
         let positions = self.player_positions(&state.fleet);
         let all_enemy_ys: Vec<f32> = self
             .enemies
@@ -1636,12 +2150,21 @@ impl Scene for BattleScene {
             .map(|e| e.y + e.tactical_y_offset)
             .collect();
 
+        let retarget_interval = match self.ai_phase {
+            BattlePhaseAI::Opening => 40,    // slow retarget during probing
+            BattlePhaseAI::Engaged => 25,    // normal
+            BattlePhaseAI::Desperate => 10,  // fast retarget when desperate
+            BattlePhaseAI::Retreating => 15,
+        };
+
+        let ai_phase = self.ai_phase;
+        let player_states_ref = &self.player_states;
         for e in self.enemies.iter_mut() {
             if !e.is_alive() {
                 continue;
             }
             if e.retarget_cooldown == 0 {
-                e.retarget_cooldown = 30;
+                e.retarget_cooldown = retarget_interval;
 
                 // If focus fire is active and this enemy is eligible, use it
                 if self.focus_fire_target >= 0
@@ -1652,10 +2175,13 @@ impl Scene for BattleScene {
                 } else {
                     e.target_idx = Self::enemy_select_target(
                         e.strategy,
+                        e.x + e.tactical_x_offset,
                         e.y + e.tactical_y_offset,
                         &state.fleet,
                         &positions,
                         &all_enemy_ys,
+                        ai_phase,
+                        player_states_ref,
                     );
                 }
             } else {
@@ -1695,7 +2221,7 @@ impl Scene for BattleScene {
         }
 
         // ── Player fleet formation AI ──────────────────────────────────
-        Self::update_player_formation(&state.fleet, &self.enemies, &mut self.player_states);
+        Self::update_player_formation(&state.fleet, &self.enemies, &mut self.player_states, self.formation);
 
         // ── Ship special abilities ─────────────────────────────────────
         {
@@ -1964,6 +2490,8 @@ impl Scene for BattleScene {
         let pip_bonus = state.pip_combat_bonus();
         let tech_lasers = state.tech_lasers;
         let tech_engines = state.tech_engines;
+        let formation = self.formation;
+        let player_momentum = self.momentum.player_momentum;
         for (i, ship) in state.fleet.iter().enumerate() {
             if !ship.is_alive() || i >= self.player_states.len() {
                 continue;
@@ -1979,14 +2507,28 @@ impl Scene for BattleScene {
                     _ => 1.2 + ship.speed() * 0.08,
                 };
 
-                // Tech-aware damage + pip combat bonus + crew modifier + rally
+                // Tech-aware damage + pip combat bonus + crew modifier + rally + formation + momentum
                 let crew = state.get_ship_crew(i);
                 let crew_mod = crate::engine::crew::crew_damage_modifier(crew);
                 let rally_mult = 1.0 + self.rally_bonus;
-                let dmg = (effective_damage(ship, tech_lasers) as f32 * pip_bonus * crew_mod * rally_mult) as u32;
+                let formation_dmg = formation.damage_mult();
+                // Screening: heavies deal +20% damage
+                let screening_bonus = if formation == FleetFormation::Screening
+                    && matches!(ship.ship_type, ShipType::Capital | ShipType::Carrier | ShipType::Destroyer)
+                {
+                    1.20
+                } else {
+                    1.0
+                };
+                let dmg = (effective_damage(ship, tech_lasers) as f32
+                    * pip_bonus * crew_mod * rally_mult * formation_dmg
+                    * screening_bonus * player_momentum) as u32;
 
-                // Smart targeting: aim toward selected enemy
-                let target_idx = Self::player_select_target(ship, &self.enemies);
+                // Frigate flak: fire 3 projectiles in a cone
+                let is_frigate_flak = ship.ship_type == ShipType::Frigate && kind == ProjectileKind::FrigateLaser;
+
+                // Smart targeting: aim toward selected enemy (crew-aware)
+                let target_idx = Self::player_select_target(ship, px, py, &self.enemies, crew, formation);
                 let vy = if target_idx >= 0 {
                     let tidx = target_idx as usize;
                     if tidx < self.enemies.len() && self.enemies[tidx].is_alive() {
@@ -2024,16 +2566,33 @@ impl Scene for BattleScene {
                     dmg
                 };
 
-                self.projectiles.push(Projectile {
-                    x: muzzle_x,
-                    y: py,
-                    vx: speed,
-                    vy,
-                    damage: lock_on_dmg,
-                    friendly: true,
-                    kind,
-                    homing_target_y: homing_y,
-                });
+                // Frigate flak: fire 3 projectiles in a cone (good against small targets)
+                if is_frigate_flak {
+                    let flak_offsets = [-0.12_f32, 0.0, 0.12];
+                    for &y_off in &flak_offsets {
+                        self.projectiles.push(Projectile {
+                            x: muzzle_x,
+                            y: py + y_off * 2.0,
+                            vx: speed,
+                            vy: vy + y_off,
+                            damage: lock_on_dmg / 3 + 1, // split damage across 3 shots
+                            friendly: true,
+                            kind,
+                            homing_target_y: -1.0,
+                        });
+                    }
+                } else {
+                    self.projectiles.push(Projectile {
+                        x: muzzle_x,
+                        y: py,
+                        vx: speed,
+                        vy,
+                        damage: lock_on_dmg,
+                        friendly: true,
+                        kind,
+                        homing_target_y: homing_y,
+                    });
+                }
 
                 // Check for barrage extra shots (crew ability — EveryNShots)
                 if i < self.player_states.len() {
@@ -2124,11 +2683,27 @@ impl Scene for BattleScene {
                 continue;
             }
 
+            // Opening phase: enemies fire slowly (probing)
+            let phase_fire_skip = match self.ai_phase {
+                BattlePhaseAI::Opening => self.tick_count % 3 != 0, // fire every 3rd tick opportunity
+                _ => false,
+            };
+            if phase_fire_skip {
+                if e.fire_cooldown > 0 { e.fire_cooldown -= 1; }
+                continue;
+            }
+
             if e.fire_cooldown == 0 {
                 let kind = Self::enemy_projectile_kind(e.tier);
                 let speed = match kind {
                     ProjectileKind::EnemyHeavy => 0.6 + e.speed * 0.04,
                     _ => 0.8 + e.speed * 0.06,
+                };
+                // Retreating: fire backward (vx positive = toward right where they're fleeing FROM)
+                let vx_dir = if self.ai_phase == BattlePhaseAI::Retreating {
+                    -speed * 0.8 // still fire left but slower
+                } else {
+                    -speed
                 };
                 let muzzle_x = e.x - 1.0;
 
@@ -2146,12 +2721,15 @@ impl Scene for BattleScene {
                     0.0
                 };
 
+                // Enemy momentum affects damage
+                let momentum_dmg = (e.damage as f32 * self.momentum.enemy_momentum) as u32;
+
                 self.projectiles.push(Projectile {
                     x: muzzle_x,
                     y: e.y,
-                    vx: -speed,
+                    vx: vx_dir,
                     vy,
-                    damage: e.damage,
+                    damage: momentum_dmg,
                     friendly: false,
                     kind,
                     homing_target_y: -1.0,
@@ -2159,13 +2737,15 @@ impl Scene for BattleScene {
 
                 Self::emit_muzzle_flash(particles, muzzle_x, e.y, false);
 
-                // Aggressive enemies fire faster
-                let rate_mult = if e.strategy == AIStrategy::Aggressive {
-                    0.7
-                } else {
-                    1.0
+                // Fire rate modifiers: strategy + AI phase
+                let strategy_mult = if e.strategy == AIStrategy::Aggressive { 0.7 } else { 1.0 };
+                let phase_mult = match self.ai_phase {
+                    BattlePhaseAI::Desperate => 0.65,   // +50% fire rate (lower cooldown)
+                    BattlePhaseAI::Retreating => 0.80,  // slightly faster when fleeing
+                    BattlePhaseAI::Opening => 1.3,      // slower during probing
+                    BattlePhaseAI::Engaged => 1.0,
                 };
-                e.fire_cooldown = ((e.fire_rate as f32 * rate_mult) as u32).max(2);
+                e.fire_cooldown = ((e.fire_rate as f32 * strategy_mult * phase_mult) as u32).max(2);
             } else {
                 e.fire_cooldown -= 1;
             }
@@ -2176,10 +2756,12 @@ impl Scene for BattleScene {
             p.x += p.vx;
             p.y += p.vy;
 
-            // Homing: bomber missiles adjust vy toward target
+            // Homing: bomber missiles gently track toward target y
             if p.kind == ProjectileKind::BomberMissile && p.homing_target_y >= 0.0 {
                 let dy = p.homing_target_y - p.y;
-                p.vy += dy.clamp(-0.02, 0.02);
+                // Gentle homing: slight vy adjustment each tick
+                let homing_strength = dy.clamp(-0.15, 0.15) * 0.05;
+                p.vy += homing_strength;
                 p.vy = p.vy.clamp(-0.4, 0.4);
             }
 
@@ -2197,6 +2779,8 @@ impl Scene for BattleScene {
 
         // ── Hit detection: friendly projectiles → enemies ──────────────
         let mut to_remove_proj: Vec<usize> = Vec::new();
+        let mut player_hits_this_tick: u32 = 0;
+        let mut enemy_hits_this_tick: u32 = 0;
         // Collect AOE hits to process after the loop (avoids borrow issues)
         let mut aoe_hits: Vec<(f32, f32, u32)> = Vec::new(); // (x, y, damage)
 
@@ -2222,6 +2806,9 @@ impl Scene for BattleScene {
                 let hit_x = proj.x >= enemy.x && proj.x <= enemy.x + sprite_w;
                 let hit_y = (proj.y - enemy.y).abs() < (enemy.height() as f32 * 0.5 + 0.5);
                 if hit_x && hit_y {
+                    // Momentum: player hit
+                    player_hits_this_tick += 1;
+
                     // Crit check
                     let is_crit = rng_crit.gen_range(0.0..1.0f32) < fleet_crit_chance;
                     let effective_dmg = if is_crit { proj.damage * 2 } else { proj.damage };
@@ -2341,15 +2928,37 @@ impl Scene for BattleScene {
                 let hit_x = proj.x >= sx && proj.x <= sx + sprite_w;
                 let hit_y = (proj.y - sy).abs() < (sprite_h * 0.5 + 0.5);
                 if hit_x && hit_y {
+                    // Momentum: enemy hit
+                    enemy_hits_this_tick += 1;
+
                     // Shield damage reduction
                     let raw_dmg = proj.damage;
-                    let effective_dmg = if si < self.player_states.len()
+                    let mut effective_dmg = if si < self.player_states.len()
                         && self.player_states[si].shield_timer > 0
                     {
                         raw_dmg / 2 // 50% reduction
                     } else {
                         raw_dmg
                     };
+                    // Formation HP modifier (defensive = take less damage)
+                    effective_dmg = (effective_dmg as f32 / formation.hp_mult()) as u32;
+                    // Echelon: +10% dodge means 10% chance to negate hit entirely
+                    if formation == FleetFormation::Echelon {
+                        let mut rng_dodge = rand::thread_rng();
+                        if rng_dodge.gen_range(0.0..1.0f32) < 0.10 {
+                            // Dodged! Skip damage
+                            if !to_remove_proj.contains(&pi) {
+                                to_remove_proj.push(pi);
+                            }
+                            // Miss spark
+                            particles.emit(Particle::new(
+                                proj.x, proj.y, 0.0, 0.0, 2, '·', Color::DarkGray,
+                            ));
+                            break;
+                        }
+                    }
+                    // Screening: fighters take hits for capital ships
+                    // (handled implicitly by formation positioning)
                     let dmg = effective_dmg.min(ship.current_hp);
                     ship.current_hp -= dmg;
                     if !to_remove_proj.contains(&pi) {
@@ -2445,9 +3054,38 @@ impl Scene for BattleScene {
             }
         }
 
+        // ── Update momentum ────────────────────────────────────────────
+        if player_hits_this_tick > 0 {
+            for _ in 0..player_hits_this_tick {
+                self.momentum.player_hit();
+            }
+        }
+        if enemy_hits_this_tick > 0 {
+            for _ in 0..enemy_hits_this_tick {
+                self.momentum.enemy_hit();
+            }
+        }
+        // Count projectiles that left screen without hitting (misses)
+        let offscreen_friendly = self.projectiles.iter()
+            .filter(|p| p.friendly && p.x > self.width as f32 + 2.0).count() as u32;
+        let offscreen_enemy = self.projectiles.iter()
+            .filter(|p| !p.friendly && p.x < -2.0).count() as u32;
+        for _ in 0..offscreen_friendly {
+            self.momentum.player_miss();
+        }
+        for _ in 0..offscreen_enemy {
+            self.momentum.enemy_miss();
+        }
+
         // ── Decrement flash timers ─────────────────────────────────────
         for ps in self.player_states.iter_mut() {
             ps.flash = ps.flash.saturating_sub(1);
+        }
+
+        // ── Momentum reset on kills ──────────────────────────────────
+        if !killed_enemy_tiers.is_empty() {
+            // Enemy destroyed: reset player momentum (start fresh streak)
+            self.momentum.on_ship_destroyed(false);
         }
 
         // ── Roll equipment drops for enemies killed this tick ─────────
@@ -2519,6 +3157,14 @@ impl Scene for BattleScene {
                     faction: self.battle_faction.name().to_string(),
                     amount: rep_penalty,
                     reason: format!("destroyed {} ships", enemy_count),
+                });
+            }
+            // Voyage boss defeated via timeout — emit event
+            if self.is_voyage_boss_battle {
+                let next_info = crate::engine::voyage::VoyageInfo::for_voyage(state.voyage + 1);
+                events.emit(crate::engine::events::GameEvent::VoyageCompleted {
+                    voyage: state.voyage,
+                    next_name: next_info.display_name(),
                 });
             }
             state.pending_loot = std::mem::take(&mut self.pending_drops);
@@ -2924,6 +3570,118 @@ impl Scene for BattleScene {
             }
         }
 
+        // ── Coordination lines (enemies → focus target) ───────────────
+        for &(x1, y1, x2, y2, life) in &self.coord_lines {
+            // Draw a brief red dotted line from enemy to target
+            if life > 4 {
+                let steps = 5;
+                for s in 0..steps {
+                    let t = s as f32 / steps as f32;
+                    let lx = (x1 + (x2 - x1) * t) as u16;
+                    let ly = (y1 + (y2 - y1) * t) as u16;
+                    if lx < area.width && ly < area.height {
+                        let cell = &mut buf[(area.x + lx, area.y + ly)];
+                        cell.set_char('·');
+                        cell.set_fg(Color::Rgb(180, 40, 40));
+                    }
+                }
+            }
+        }
+
+        // ── Desperate mode flash (enemies flash red) ──────────────────
+        if self.desperate_flash > 0 && self.desperate_flash % 2 == 0 {
+            for enemy in &self.enemies {
+                if !enemy.is_alive() { continue; }
+                for (row, line) in enemy.sprite.iter().enumerate() {
+                    let sy = (enemy.y + row as f32) as u16;
+                    for (col, _) in line.chars().enumerate() {
+                        let sx = (enemy.x + col as f32) as u16;
+                        if sx < area.width && sy < area.height {
+                            let cell = &mut buf[(area.x + sx, area.y + sy)];
+                            cell.set_fg(Color::LightRed);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Momentum indicator ────────────────────────────────────────
+        if self.momentum.player_momentum > 1.1 {
+            let streak_text = format!("🔥 x{:.0}%", (self.momentum.player_momentum - 1.0) * 100.0);
+            let mx = 1u16;
+            let my = 2u16;
+            if my < area.height {
+                let intensity = ((self.momentum.player_momentum - 1.0) * 510.0).min(255.0) as u8;
+                let color = Color::Rgb(255, 200_u8.saturating_sub(intensity / 2), 50);
+                for (i, ch) in streak_text.chars().enumerate() {
+                    let x = mx + i as u16;
+                    if x < area.width {
+                        let cell = &mut buf[(area.x + x, area.y + my)];
+                        cell.set_char(ch);
+                        cell.set_fg(color);
+                    }
+                }
+            }
+        }
+
+        // ── AI Phase indicator (subtle, top right) ────────────────────
+        {
+            let phase_text = match self.ai_phase {
+                BattlePhaseAI::Opening => "◇ PROBING",
+                BattlePhaseAI::Engaged => "",
+                BattlePhaseAI::Desperate => "◈ DESPERATE",
+                BattlePhaseAI::Retreating => "◁ RETREATING",
+            };
+            if !phase_text.is_empty() {
+                let phase_color = match self.ai_phase {
+                    BattlePhaseAI::Opening => Color::DarkGray,
+                    BattlePhaseAI::Desperate => Color::LightRed,
+                    BattlePhaseAI::Retreating => Color::Yellow,
+                    _ => Color::DarkGray,
+                };
+                let px = area.width.saturating_sub(phase_text.len() as u16 + 2);
+                let py = 2u16;
+                if py < area.height {
+                    for (i, ch) in phase_text.chars().enumerate() {
+                        let x = px + i as u16;
+                        if x < area.width {
+                            let cell = &mut buf[(area.x + x, area.y + py)];
+                            cell.set_char(ch);
+                            cell.set_fg(phase_color);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Formation indicator (subtle, below momentum) ──────────────
+        {
+            let form_text = match self.formation {
+                FleetFormation::Defensive => "▣ DEF",
+                FleetFormation::Offensive => "▷ ATK",
+                FleetFormation::Echelon => "◇ ECH",
+                FleetFormation::Screening => "▥ SCR",
+            };
+            let fx = 1u16;
+            let fy = if self.momentum.player_momentum > 1.1 { 3u16 } else { 2u16 };
+            if fy < area.height {
+                let form_color = match self.formation {
+                    FleetFormation::Defensive => Color::Rgb(80, 180, 255),
+                    FleetFormation::Offensive => Color::Rgb(255, 140, 80),
+                    FleetFormation::Echelon => Color::Rgb(180, 180, 100),
+                    FleetFormation::Screening => Color::Rgb(120, 200, 120),
+                };
+                for (i, ch) in form_text.chars().enumerate() {
+                    let x = fx + i as u16;
+                    if x < area.width {
+                        let cell = &mut buf[(area.x + x, area.y + fy)];
+                        cell.set_char(ch);
+                        cell.set_fg(form_color);
+                    }
+                }
+            }
+        }
+
         // ── Health bars at bottom ──────────────────────────────────────
         let bar_y = area.height.saturating_sub(2);
         let bar_width = (area.width / 2).saturating_sub(4) as usize;
@@ -2954,7 +3712,17 @@ impl Scene for BattleScene {
                 let cell = &mut buf[(area.x + x, area.y + bar_y)];
                 if i < player_filled {
                     cell.set_char('█');
-                    cell.set_fg(Color::Green);
+                    // Momentum visual: bar shifts from green toward gold when momentum is high
+                    let bar_color = if self.momentum.player_momentum > 1.1 {
+                        let t = ((self.momentum.player_momentum - 1.0) * 2.0).min(1.0);
+                        let r = (0.0 + t * 255.0) as u8;
+                        let g = (200.0 - t * 80.0) as u8;
+                        let b = (50.0 * t) as u8;
+                        Color::Rgb(r, g, b)
+                    } else {
+                        Color::Green
+                    };
+                    cell.set_fg(bar_color);
                 } else {
                     cell.set_char('░');
                     cell.set_fg(Color::DarkGray);

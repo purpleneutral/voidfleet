@@ -250,10 +250,11 @@ impl MapScreen {
         let area = centered_rect(70, 70, frame.area());
         frame.render_widget(Clear, area);
 
-        let title = if state.prestige_level > 0 {
+        let title = if state.voyage > 1 {
+            let info = crate::engine::voyage::VoyageInfo::for_voyage(state.voyage);
             format!(
-                " ◈ SECTOR MAP ◈  [Prestige {}] ",
-                state.prestige_level
+                " ◈ SECTOR MAP ◈  [Voyage {}: {}] ",
+                state.voyage, info.display_name()
             )
         } else {
             " ◈ SECTOR MAP ◈ ".to_string()
