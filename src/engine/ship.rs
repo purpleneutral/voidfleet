@@ -164,8 +164,10 @@ pub struct Ship {
 
     // Runtime position (not saved, set by scene)
     #[serde(skip)]
+    #[allow(dead_code)]
     pub x: f32,
     #[serde(skip)]
+    #[allow(dead_code)]
     pub y: f32,
 }
 

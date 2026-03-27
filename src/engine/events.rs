@@ -718,6 +718,11 @@ pub fn process_events(
                     quantity, good, revenue, profit_color, profit
                 ));
                 *popup_timer = 40;
+                // Trading gives small rep boost with sector faction (same as buying)
+                let sector_faction = state.sector_faction(state.sector);
+                if sector_faction != crate::engine::factions::Faction::Independent {
+                    state.change_reputation(sector_faction, crate::engine::factions::ReputationChange::TRADE);
+                }
             }
             GameEvent::ContrabandDetected { good, faction, fine } => {
                 // Apply fine and confiscate goods
@@ -776,8 +781,20 @@ pub fn process_events(
                 *popup_timer = 80;
                 bridge.react_to_event(event, state);
             }
-            // Other events are logged to history but don't trigger cross-system effects yet.
-            _ => {}
+            // Granular combat/UI events — state changes happen at source, logged to history.
+            GameEvent::BattleStarted { .. } => {}
+            GameEvent::ShipDamaged { .. } => {}
+            GameEvent::CreditsGained { .. } => {} // amount applied at source
+            GameEvent::ItemSalvaged { .. } => {} // scrap applied at source
+            GameEvent::EventEncountered { .. } => {} // logged to history
+            GameEvent::RouteChosen { .. } => {} // applied in travel scene
+            GameEvent::ShipBuilt { .. } => {} // already handled in upgrades
+            GameEvent::ShipUpgraded { .. } => {} // applied at source
+            GameEvent::EquipmentChanged { .. } => {} // applied at source
+            GameEvent::PipFed => {} // applied in bridge scene
+            GameEvent::PipPetted => {} // applied in bridge scene
+            GameEvent::RaidStarted { .. } => {} // logged to history
+            GameEvent::CrewAbilityTriggered { .. } => {} // logged to history + pip commentary
         }
     }
 }

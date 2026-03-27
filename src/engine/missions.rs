@@ -1,8 +1,8 @@
-/// Mission / Contract system — procedurally generated missions from factions.
-///
-/// Missions are offered at stations based on the dominant faction in the current sector.
-/// Players accept missions, track progress across sector transitions, and receive
-/// rewards (credits, reputation, equipment) on completion.
+//! Mission / Contract system — procedurally generated missions from factions.
+//!
+//! Missions are offered at stations based on the dominant faction in the current sector.
+//! Players accept missions, track progress across sector transitions, and receive
+//! rewards (credits, reputation, equipment) on completion.
 
 use serde::{Deserialize, Serialize};
 
@@ -348,7 +348,7 @@ const EXPIRY_BUFFER: u32 = 20;
 /// Check progress of active missions after a sector transition.
 /// Returns updates for any missions that changed state.
 pub fn check_mission_progress(
-    missions: &mut Vec<Mission>,
+    missions: &mut [Mission],
     current_sector: u32,
     _battle_won_in_sector: bool,
     boss_killed_in_sector: bool,
@@ -526,7 +526,7 @@ pub fn check_mission_progress(
 }
 
 /// Mark all missions that have exceeded the expiry buffer as expired.
-pub fn fail_expired_missions(missions: &mut Vec<Mission>, current_sector: u32) -> Vec<MissionUpdate> {
+pub fn fail_expired_missions(missions: &mut [Mission], current_sector: u32) -> Vec<MissionUpdate> {
     let mut updates = Vec::new();
 
     for mission in missions.iter_mut() {

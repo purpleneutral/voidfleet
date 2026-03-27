@@ -1,7 +1,7 @@
-/// Voyage system — escalating prestige with themed cycles.
-///
-/// Each voyage represents a full run through an expanding universe.
-/// Completing a voyage grants permanent bonuses and resets progression.
+//! Voyage system — escalating prestige with themed cycles.
+//!
+//! Each voyage represents a full run through an expanding universe.
+//! Completing a voyage grants permanent bonuses and resets progression.
 
 use serde::{Deserialize, Serialize};
 

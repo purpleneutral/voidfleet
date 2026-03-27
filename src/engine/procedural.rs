@@ -1,5 +1,5 @@
-/// Procedural generation — sector-scaled enemy fleet generation with boss encounters.
-/// Includes adaptive difficulty (rubber banding) and fleet composition variety.
+//! Procedural generation — sector-scaled enemy fleet generation with boss encounters.
+//! Includes adaptive difficulty (rubber banding) and fleet composition variety.
 
 use crate::state::GameState;
 
@@ -15,6 +15,7 @@ pub struct EnemyTemplate {
     pub speed: f32,
     pub sprite: &'static [&'static str],
     pub is_boss: bool,
+    #[allow(dead_code)] // Faction stamped on enemies for future faction-aware combat
     pub faction: Faction,
 }
 
@@ -115,19 +116,6 @@ fn pick_composition(sector: u32) -> FleetComposition {
 
 // -- Fleet generation --------------------------------------------------------
 
-/// Generate an enemy fleet for a given sector (original signature, no state needed).
-/// Uses base difficulty only (no adaptive rubber banding).
-pub fn generate_enemy_fleet(sector: u32) -> Vec<EnemyTemplate> {
-    generate_enemy_fleet_adaptive(sector, 1.0)
-}
-
-/// Generate an enemy fleet with adaptive difficulty applied.
-/// `modifier` is the combined difficulty_modifier * post_death_modifier.
-/// Voyage scaling is applied on top of sector scaling.
-pub fn generate_enemy_fleet_adaptive(sector: u32, modifier: f32) -> Vec<EnemyTemplate> {
-    generate_enemy_fleet_for_voyage(sector, modifier, 1)
-}
-
 /// Generate an enemy fleet scaled for a specific voyage.
 /// Voyage affects enemy HP/damage via `enemy_scale` and fleet composition
 /// at higher voyages (elite variants, void wraiths, swarm drones).
@@ -224,24 +212,7 @@ fn inject_voyage_enemies(fleet: &mut Vec<EnemyTemplate>, sector: u32, voyage: u3
     }
 }
 
-/// Generate an enemy fleet with faction assignment based on sector.
-/// Uses `encounter_faction` to determine the faction, then stamps all ships.
-pub fn generate_enemy_fleet_faction(sector: u32, modifier: f32, encounter_seed: u32) -> Vec<EnemyTemplate> {
-    generate_enemy_fleet_faction_voyage(sector, modifier, encounter_seed, 1)
-}
 
-/// Generate a faction-assigned enemy fleet scaled for a specific voyage.
-pub fn generate_enemy_fleet_faction_voyage(sector: u32, modifier: f32, encounter_seed: u32, voyage: u32) -> Vec<EnemyTemplate> {
-    let faction = crate::engine::factions::encounter_faction(sector, encounter_seed);
-    let mut fleet = generate_enemy_fleet_for_voyage(sector, modifier, voyage);
-
-    // Stamp all ships with the encounter faction
-    for enemy in &mut fleet {
-        enemy.faction = faction;
-    }
-
-    fleet
-}
 
 /// Sector difficulty multiplier — gradual power curve.
 fn sector_scale(sector: u32) -> f32 {
@@ -562,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_early_sector_fleet_size() {
-        let fleet = generate_enemy_fleet(3);
+        let fleet = generate_enemy_fleet_for_voyage(3, 1.0, 1);
         assert!(!fleet.is_empty());
         assert!(fleet.len() <= 2);
         assert!(fleet.iter().all(|e| !e.is_boss));
@@ -570,13 +541,13 @@ mod tests {
 
     #[test]
     fn test_boss_sector() {
-        let fleet = generate_enemy_fleet(10);
+        let fleet = generate_enemy_fleet_for_voyage(10, 1.0, 1);
         assert!(fleet.iter().any(|e| e.is_boss));
     }
 
     #[test]
     fn test_boss_has_escorts() {
-        let fleet = generate_enemy_fleet(20);
+        let fleet = generate_enemy_fleet_for_voyage(20, 1.0, 1);
         let bosses: Vec<_> = fleet.iter().filter(|e| e.is_boss).collect();
         let escorts: Vec<_> = fleet.iter().filter(|e| !e.is_boss).collect();
         assert_eq!(bosses.len(), 1);
@@ -585,8 +556,8 @@ mod tests {
 
     #[test]
     fn test_scaling_increases_stats() {
-        let early = generate_enemy_fleet(1);
-        let late = generate_enemy_fleet(30);
+        let early = generate_enemy_fleet_for_voyage(1, 1.0, 1);
+        let late = generate_enemy_fleet_for_voyage(30, 1.0, 1);
         // Late-game non-boss enemies should have more HP than early pirates
         let early_max_hp = early.iter().map(|e| e.hp).max().unwrap();
         let late_max_hp = late.iter().filter(|e| !e.is_boss).map(|e| e.hp).max().unwrap();

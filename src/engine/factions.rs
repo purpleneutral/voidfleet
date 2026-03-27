@@ -1,4 +1,4 @@
-/// Faction system — faction definitions, reputation tracking, rivalries, and sector control.
+//! Faction system — faction definitions, reputation tracking, rivalries, and sector control.
 
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
@@ -19,10 +19,7 @@ pub enum Faction {
 /// Type alias for backwards compatibility with scenes that use `FactionId`.
 pub type FactionId = Faction;
 
-/// Alias for `sector_dominant_faction` used by scene code.
-pub fn sector_faction(sector: u32) -> Faction {
-    sector_dominant_faction(sector)
-}
+
 
 impl Faction {
     pub const ALL: [Faction; 6] = [
@@ -391,7 +388,7 @@ impl ReputationChange {
 /// Uses the faction whose `controls_sectors` range contains the sector.
 /// If multiple factions overlap, picks the one whose range center is closest.
 /// Falls back to Independent for sectors outside all ranges.
-pub fn sector_dominant_faction(sector: u32) -> Faction {
+pub fn sector_faction(sector: u32) -> Faction {
     let mut best: Option<(Faction, u32)> = None;
 
     for info in FACTIONS {
@@ -416,7 +413,7 @@ pub fn sector_dominant_faction(sector: u32) -> Faction {
 /// 70% chance of the dominant faction, 30% chance of a random other faction.
 /// Uses deterministic pseudo-random based on sector + seed.
 pub fn encounter_faction(sector: u32, encounter_seed: u32) -> Faction {
-    let dominant = sector_dominant_faction(sector);
+    let dominant = sector_faction(sector);
 
     let mut h = sector.wrapping_mul(2654435761).wrapping_add(encounter_seed.wrapping_mul(40503));
     h ^= h >> 16;
@@ -654,29 +651,29 @@ mod tests {
 
     #[test]
     fn sector_1_is_pirate_territory() {
-        assert_eq!(sector_dominant_faction(1), Faction::PirateClan);
+        assert_eq!(sector_faction(1), Faction::PirateClan);
     }
 
     #[test]
     fn sector_5_overlap_resolved() {
-        let faction = sector_dominant_faction(5);
+        let faction = sector_faction(5);
         assert_eq!(faction, Faction::PirateClan);
     }
 
     #[test]
     fn high_sector_alien() {
-        let faction = sector_dominant_faction(45);
+        let faction = sector_faction(45);
         assert_eq!(faction, Faction::AlienCollective);
     }
 
     #[test]
     fn sector_beyond_all_ranges() {
-        assert_eq!(sector_dominant_faction(100), Faction::Independent);
+        assert_eq!(sector_faction(100), Faction::Independent);
     }
 
     #[test]
     fn sector_0_is_independent() {
-        assert_eq!(sector_dominant_faction(0), Faction::Independent);
+        assert_eq!(sector_faction(0), Faction::Independent);
     }
 
     // ── Encounter faction ──────────────────────────────────────────
@@ -699,7 +696,7 @@ mod tests {
 
     #[test]
     fn encounter_faction_mostly_dominant() {
-        let dominant = sector_dominant_faction(10);
+        let dominant = sector_faction(10);
         let mut dominant_count = 0u32;
         let total = 1000;
         for seed in 0..total {

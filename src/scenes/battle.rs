@@ -240,6 +240,7 @@ impl EnemyShip {
     }
 
     /// Ship is in death animation (hp=0, death_frame still playing).
+    #[allow(dead_code)] // Used for future death animation sequences
     fn is_dying(&self) -> bool {
         self.hp == 0 && self.death_frame > 0 && self.death_frame <= 15
     }
@@ -440,6 +441,7 @@ struct PlayerShipState {
     /// Crew ability: lock-on guaranteed crit for first projectile.
     lock_on_active: bool,
     /// Crew ability: number of barrage extra shots pending.
+    #[allow(dead_code)] // Reserved for crew barrage ability implementation
     barrage_pending: u8,
 }
 
@@ -1074,11 +1076,10 @@ impl BattleScene {
             }
 
             // Ships with active abilities (shield, beam charging) = +30% threat
-            if i < player_states.len() {
-                if player_states[i].shield_timer > 0 || player_states[i].beam_charge > 0 || player_states[i].beam_active > 0 {
+            if i < player_states.len()
+                && (player_states[i].shield_timer > 0 || player_states[i].beam_charge > 0 || player_states[i].beam_active > 0) {
                     threat *= 1.3;
                 }
-            }
 
             threats.push((i, threat));
         }
@@ -1088,6 +1089,7 @@ impl BattleScene {
         threats
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enemy_select_target(
         strategy: AIStrategy,
         enemy_x: f32,
@@ -1170,8 +1172,8 @@ impl BattleScene {
                 AIStrategy::Retreater => {
                     let (_, py) = positions[i];
                     let dist = (enemy_y - py).abs();
-                    let proximity = if dist < 0.01 { 1000.0 } else { 1.0 / dist };
-                    proximity
+                    
+                    if dist < 0.01 { 1000.0 } else { 1.0 / dist }
                 }
                 AIStrategy::Bomber => {
                     // Target highest HP (most value from suicide), but also consider threat
@@ -1219,8 +1221,8 @@ impl BattleScene {
             ShipType::Scout | ShipType::Fighter
         );
 
-        let is_gunner = crew.map_or(false, |c| c.class == CrewClass::Gunner);
-        let is_navigator = crew.map_or(false, |c| matches!(c.class, CrewClass::Navigator | CrewClass::Pilot));
+        let is_gunner = crew.is_some_and(|c| c.class == CrewClass::Gunner);
+        let is_navigator = crew.is_some_and(|c| matches!(c.class, CrewClass::Navigator | CrewClass::Pilot));
 
         for (i, enemy) in enemies.iter().enumerate() {
             if !enemy.is_alive() {
@@ -1727,6 +1729,24 @@ impl Scene for BattleScene {
         for tmpl in &templates {
             self.enemies.push(enemy_from_template(tmpl, state.sector, route_mod, &mut rng));
         }
+
+        // Apply faction hostility modifier — reputation affects enemy stats.
+        // Hostile factions send stronger fleets; allied factions go easy.
+        let battle_faction = factions::encounter_faction(state.sector, state.total_battles as u32);
+        let rep = state.get_reputation(battle_faction);
+        let hostility_mod: f32 = if rep <= -75 { 1.20 }   // Hostile: +20% enemy stats
+            else if rep <= -25 { 1.10 }                   // Unfriendly: +10%
+            else if rep <= 25 { 1.0 }                     // Neutral: normal
+            else if rep <= 75 { 0.90 }                    // Friendly: -10% (they go easy)
+            else { 0.85 };                                // Allied: -15%
+        if (hostility_mod - 1.0).abs() > f32::EPSILON {
+            for enemy in &mut self.enemies {
+                enemy.hp = (enemy.hp as f32 * hostility_mod) as u32;
+                enemy.max_hp = (enemy.max_hp as f32 * hostility_mod) as u32;
+                enemy.damage = (enemy.damage as f32 * hostility_mod) as u32;
+            }
+        }
+
         self.layout_enemies();
 
         // Player ship states — use combat.rs fire_rate with tech bonus
@@ -2605,15 +2625,15 @@ impl Scene for BattleScene {
                 // Check for barrage extra shots (crew ability — EveryNShots)
                 if i < self.player_states.len() {
                     // Record shot for EveryNShots tracking
-                    if let Some(crew_id) = ship.crew_id {
-                        if let Some(crew) = state.crew_roster.iter_mut().find(|c| c.id == crew_id) {
+                    if let Some(crew_id) = ship.crew_id
+                        && let Some(crew) = state.crew_roster.iter_mut().find(|c| c.id == crew_id) {
                             crew.record_shot();
                             // Check if barrage triggers
                             let barrage_abilities = crew.class.available_abilities(crew.level);
                             for ability in &barrage_abilities {
-                                if let AbilityEffect::Barrage { extra_shots } = &ability.effect {
-                                    if let crate::engine::abilities::AbilityTrigger::EveryNShots(n) = ability.trigger {
-                                        if n > 0 && crew.shot_counter % n as u32 == 0 {
+                                if let AbilityEffect::Barrage { extra_shots } = &ability.effect
+                                    && let crate::engine::abilities::AbilityTrigger::EveryNShots(n) = ability.trigger
+                                        && n > 0 && crew.shot_counter % n as u32 == 0 {
                                             // Fire extra projectiles at vy offsets
                                             let offsets = [-0.2_f32, 0.2];
                                             for (_si, &y_off) in offsets.iter().enumerate().take(*extra_shots as usize) {
@@ -2640,11 +2660,8 @@ impl Scene for BattleScene {
                                                 icon: '💥',
                                             });
                                         }
-                                    }
-                                }
                             }
                         }
-                    }
                 }
 
                 Self::emit_muzzle_flash(particles, muzzle_x, py, true);
@@ -2693,7 +2710,7 @@ impl Scene for BattleScene {
 
             // Opening phase: enemies fire slowly (probing)
             let phase_fire_skip = match self.ai_phase {
-                BattlePhaseAI::Opening => self.tick_count % 3 != 0, // fire every 3rd tick opportunity
+                BattlePhaseAI::Opening => !self.tick_count.is_multiple_of(3), // fire every 3rd tick opportunity
                 _ => false,
             };
             if phase_fire_skip {
@@ -3597,7 +3614,7 @@ impl Scene for BattleScene {
         }
 
         // ── Desperate mode flash (enemies flash red) ──────────────────
-        if self.desperate_flash > 0 && self.desperate_flash % 2 == 0 {
+        if self.desperate_flash > 0 && self.desperate_flash.is_multiple_of(2) {
             for enemy in &self.enemies {
                 if !enemy.is_alive() { continue; }
                 for (row, line) in enemy.sprite.iter().enumerate() {

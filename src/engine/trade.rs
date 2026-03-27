@@ -1,4 +1,4 @@
-/// Trade economy system — trade goods, sector markets, cargo management, and contraband risk.
+//! Trade economy system — trade goods, sector markets, cargo management, and contraband risk.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -686,7 +686,7 @@ mod tests {
                 let spread = price.buy_price as f64 - price.sell_price as f64;
                 let spread_pct = spread / price.buy_price as f64;
                 assert!(
-                    spread_pct >= 0.09 && spread_pct <= 0.21,
+                    (0.09..=0.21).contains(&spread_pct),
                     "{:?} {:?} spread {:.1}% out of expected 10-20% range (buy={}, sell={})",
                     faction, good, spread_pct * 100.0, price.buy_price, price.sell_price
                 );

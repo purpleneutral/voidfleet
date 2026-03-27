@@ -1,5 +1,5 @@
-/// Voyage completion cinematic — dramatic multi-phase screen shown when
-/// the voyage boss is defeated. Starfield background with sparkle effects.
+//! Voyage completion cinematic — dramatic multi-phase screen shown when
+//! the voyage boss is defeated. Starfield background with sparkle effects.
 
 use rand::Rng;
 use ratatui::style::Color;
@@ -139,7 +139,7 @@ impl VoyageScreen {
         });
 
         // Spawn sparkles during Bonuses phase
-        if self.phase == VoyagePhase::Bonuses && self.tick % 3 == 0 {
+        if self.phase == VoyagePhase::Bonuses && self.tick.is_multiple_of(3) {
             self.spawn_sparkles();
         }
 
@@ -368,7 +368,7 @@ impl VoyageScreen {
         self.draw_centered(buf, area, cy + 2, "New equipment tiers unlocked...", dim);
 
         // Blinking prompt
-        if (self.phase_tick / 15) % 2 == 0 {
+        if (self.phase_tick / 15).is_multiple_of(2) {
             self.draw_centered(
                 buf, area, cy + 4,
                 "Press [ENTER] to begin",
@@ -431,7 +431,7 @@ fn format_with_commas(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(ch);

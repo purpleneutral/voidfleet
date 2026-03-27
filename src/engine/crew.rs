@@ -439,11 +439,10 @@ impl CrewMember {
             }
 
             // Once-per-battle check
-            if matches!(ability.trigger, AbilityTrigger::OncePerBattle) {
-                if i < self.abilities_used.len() && self.abilities_used[i] {
+            if matches!(ability.trigger, AbilityTrigger::OncePerBattle)
+                && i < self.abilities_used.len() && self.abilities_used[i] {
                     continue;
                 }
-            }
 
             // Trigger condition check
             let should_trigger = match ability.trigger {
@@ -452,7 +451,7 @@ impl CrewMember {
                     context.ship_hp_percent * 100.0 < threshold as f32
                 }
                 AbilityTrigger::EveryNShots(n) => {
-                    context.shot_fired && n > 0 && self.shot_counter % n as u32 == 0
+                    context.shot_fired && n > 0 && self.shot_counter.is_multiple_of(n as u32)
                 }
                 AbilityTrigger::OnAllyDestroyed => context.ally_just_destroyed,
                 AbilityTrigger::OnEnemyKilled => context.enemy_just_killed,

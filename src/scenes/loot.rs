@@ -26,6 +26,7 @@ struct LootData {
     old_level: u32,
     new_level: u32,
     /// XP bar progress at scene start (before gain), 0.0–1.0
+    #[allow(dead_code)] // For future animated XP bar fill
     xp_start_ratio: f32,
     /// XP bar progress at scene end (after gain), 0.0–1.0
     xp_end_ratio: f32,
@@ -284,14 +285,13 @@ impl Scene for LootScene {
 
                 // Emit equipment drop events for successfully collected items
                 for drop_info in &self.loot.equipment_drops {
-                    if drop_info.salvaged_for == 0 {
-                        if let Some(rarity) = drop_info.rarity {
+                    if drop_info.salvaged_for == 0
+                        && let Some(rarity) = drop_info.rarity {
                             events.emit(crate::engine::events::GameEvent::EquipmentDropped {
                                 rarity: rarity.name().to_string(),
                                 name: drop_info.name.clone(),
                             });
                         }
-                    }
                 }
 
                 // Heal fleet
@@ -301,7 +301,7 @@ impl Scene for LootScene {
 
                 // Auto-loot trade goods from raids based on sector faction
                 if self.from_raid && state.cargo_space_remaining() > 0 {
-                    let faction = factions::sector_dominant_faction(self.raid_sector);
+                    let faction = factions::sector_faction(self.raid_sector);
                     let mut rng = rand::thread_rng();
                     let (good, qty_range) = match faction {
                         factions::Faction::PirateClan => (TradeGood::Weapons, 1..=2),

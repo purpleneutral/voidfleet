@@ -194,12 +194,10 @@ impl CrewScreen {
                                 // If ship already has crew, swap them
                                 if let Some(existing_crew_id) =
                                     state.fleet.get(ship_idx).and_then(|s| s.crew_id)
-                                {
-                                    if existing_crew_id != crew_id {
+                                    && existing_crew_id != crew_id {
                                         // Unassign existing crew first
                                         state.unassign_crew(existing_crew_id);
                                     }
-                                }
                                 // Unassign from old ship if any, then assign
                                 state.unassign_crew(crew_id);
                                 state.assign_crew(crew_id, ship_idx);
@@ -1029,7 +1027,7 @@ fn render_crew_detail<'a>(crew: &CrewMember, state: &GameState) -> Vec<Line<'a>>
         lines.push(Line::from(vec![
             Span::styled("  Bond: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{}", bond.bond_type.description()),
+                bond.bond_type.description().to_string(),
                 Style::default().fg(bond_color),
             ),
             Span::styled(

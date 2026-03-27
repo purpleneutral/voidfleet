@@ -1,5 +1,5 @@
-/// Combat utility functions — tech-aware damage, HP, and fire rate calculations.
-/// Equipment bonuses are layered on top of tech bonuses.
+//! Combat utility functions — tech-aware damage, HP, and fire rate calculations.
+//! Equipment bonuses are layered on top of tech bonuses.
 
 use crate::engine::ship::{Ship, ShipType};
 

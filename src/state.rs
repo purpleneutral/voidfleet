@@ -161,7 +161,9 @@ pub struct GameState {
     pub next_mission_id: u64,
 
     // Transient (not saved)
-    #[serde(skip)]
+    // Legacy field — kept for save compatibility, no longer actively used.
+    #[serde(default)]
+    #[allow(dead_code)]
     pub pending_popups: Vec<String>,
     #[serde(skip)]
     pub pending_loot: Vec<Equipment>,
@@ -300,8 +302,8 @@ impl GameState {
 
     pub fn load() -> Self {
         let path = Self::save_path();
-        if path.exists() {
-            if let Ok(data) = fs::read_to_string(&path) {
+        if path.exists()
+            && let Ok(data) = fs::read_to_string(&path) {
                 // Reject suspiciously large save files (> 1MB)
                 if data.len() > 1_000_000 {
                     return Self::new();
@@ -310,7 +312,6 @@ impl GameState {
                     return state;
                 }
             }
-        }
         Self::new()
     }
 
@@ -351,28 +352,6 @@ impl GameState {
             "Fleet destroyed! Lost {} scrap, {} credits. Pushed back {} sectors.",
             scrap_lost, credits_lost, sectors_lost
         )
-    }
-
-    /// Update highest_sector tracker when entering a new sector.
-    pub fn update_highest_sector(&mut self) {
-        if self.sector > self.highest_sector {
-            self.highest_sector = self.sector;
-        }
-        if self.sector > self.highest_sector_ever {
-            self.highest_sector_ever = self.sector;
-        }
-    }
-
-    /// Check for new achievements and queue popup messages.
-    pub fn check_achievements(&mut self) {
-        let newly_unlocked = crate::engine::achievements::check_achievements(self);
-        for achievement in newly_unlocked {
-            self.achievements_unlocked.push(achievement.id.to_string());
-            self.pending_popups.push(format!(
-                "{} Achievement Unlocked: {} — {}",
-                achievement.icon, achievement.name, achievement.description
-            ));
-        }
     }
 
     // ── Pip companion methods ──────────────────────────────────────────
@@ -433,6 +412,7 @@ impl GameState {
     }
 
     /// Check all ships' equipped items for matching set IDs and return active set bonuses.
+    #[allow(dead_code)] // For future equipment set bonus display
     pub fn active_set_bonuses(&self) -> Vec<&'static SetBonus> {
         // Count set pieces across all ships
         let mut set_counts: std::collections::HashMap<&str, u8> = std::collections::HashMap::new();
@@ -515,6 +495,11 @@ impl GameState {
         self.voyage_crew_recruited = 0;
         self.voyage_credits_earned = 0;
 
+        // Legacy prestige fields — zeroed to prevent double-stacking with voyage bonuses
+        self.prestige_bonus_xp = 0.0;
+        self.prestige_bonus_credits = 0.0;
+        self.prestige_bonus_scrap = 0.0;
+
         // Keep: pip stats, achievements, deaths, highest_sector, time_played,
         //       enemies_destroyed, total_battles, voyage_permanent_* bonuses,
         //       voyages_completed, highest_sector_ever
@@ -524,6 +509,7 @@ impl GameState {
 
     /// Legacy prestige — replaced by voyage system. Kept for save compat.
     /// Now redirects to complete_voyage if voyage target is reached.
+    #[allow(dead_code)] // Legacy prestige, voyage system is primary
     pub fn prestige(&mut self) -> bool {
         let target = crate::engine::voyage::voyage_target_sector(self.voyage);
         if self.sector < target {
@@ -539,6 +525,7 @@ impl GameState {
     }
 
     /// Get the target sector for the current voyage.
+    #[allow(dead_code)] // Convenience wrapper for future use
     pub fn voyage_target_sector(&self) -> u32 {
         crate::engine::voyage::voyage_target_sector(self.voyage)
     }
@@ -563,22 +550,20 @@ impl GameState {
             return false;
         }
         // Check ship doesn't already have a different crew assigned
-        if let Some(existing_id) = self.fleet[ship_index].crew_id {
-            if existing_id != crew_id {
+        if let Some(existing_id) = self.fleet[ship_index].crew_id
+            && existing_id != crew_id {
                 return false;
             }
-        }
         // Find crew member
         let crew_idx = match self.crew_roster.iter().position(|c| c.id == crew_id) {
             Some(idx) => idx,
             None => return false,
         };
         // Unassign from previous ship if any
-        if let Some(old_ship) = self.crew_roster[crew_idx].assigned_ship {
-            if old_ship < self.fleet.len() {
+        if let Some(old_ship) = self.crew_roster[crew_idx].assigned_ship
+            && old_ship < self.fleet.len() {
                 self.fleet[old_ship].crew_id = None;
             }
-        }
         // Assign
         self.crew_roster[crew_idx].assigned_ship = Some(ship_index);
         self.fleet[ship_index].crew_id = Some(crew_id);
@@ -591,11 +576,10 @@ impl GameState {
             Some(idx) => idx,
             None => return false,
         };
-        if let Some(ship_idx) = self.crew_roster[crew_idx].assigned_ship {
-            if ship_idx < self.fleet.len() {
+        if let Some(ship_idx) = self.crew_roster[crew_idx].assigned_ship
+            && ship_idx < self.fleet.len() {
                 self.fleet[ship_idx].crew_id = None;
             }
-        }
         self.crew_roster[crew_idx].assigned_ship = None;
         true
     }
@@ -613,11 +597,10 @@ impl GameState {
             None => return false,
         };
         // Unassign from ship first
-        if let Some(ship_idx) = self.crew_roster[crew_idx].assigned_ship {
-            if ship_idx < self.fleet.len() {
+        if let Some(ship_idx) = self.crew_roster[crew_idx].assigned_ship
+            && ship_idx < self.fleet.len() {
                 self.fleet[ship_idx].crew_id = None;
             }
-        }
         self.crew_roster.remove(crew_idx);
         true
     }
@@ -650,10 +633,11 @@ impl GameState {
 
     /// Get the dominant faction for a given sector.
     pub fn sector_faction(&self, sector: u32) -> crate::engine::factions::Faction {
-        crate::engine::factions::sector_dominant_faction(sector)
+        crate::engine::factions::sector_faction(sector)
     }
 
     /// Check if a faction is hostile to the player.
+    #[allow(dead_code)] // For future faction-aware UI
     pub fn is_hostile(&self, faction: crate::engine::factions::Faction) -> bool {
         self.faction_reputation.is_hostile(faction)
     }
@@ -722,7 +706,7 @@ impl GameState {
 
     /// Refresh available missions for the current sector.
     pub fn refresh_available_missions(&mut self, sector: u32) {
-        let faction = crate::engine::factions::sector_dominant_faction(sector);
+        let faction = crate::engine::factions::sector_faction(sector);
         let count = 3 + (sector as usize / 10).min(2); // 3-5 missions available
         self.available_missions = crate::engine::missions::generate_missions(
             sector,
@@ -811,6 +795,7 @@ impl GameState {
 
     /// Calculate profit/loss for a good based on trade history.
     /// Compares latest sell price per unit to the average buy price per unit.
+    #[allow(dead_code)] // For future trade profit display
     pub fn trade_profit(&self, good: TradeGood) -> Option<i64> {
         let buys: Vec<&TradeRecord> = self
             .trade_history

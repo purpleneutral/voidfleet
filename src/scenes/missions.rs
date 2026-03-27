@@ -67,6 +67,7 @@ impl MissionScreen {
     }
 
     /// Add a mission to the display log (called after completion/failure).
+    #[allow(dead_code)] // For future mission log display
     pub fn log_mission(&mut self, mission: Mission) {
         if self.log.len() >= 50 {
             self.log.remove(0);
@@ -123,11 +124,10 @@ impl MissionScreen {
             return;
         }
         let mission_id = state.available_missions[self.selected].id;
-        if state.accept_mission(mission_id) {
-            if self.selected > 0 && self.selected >= state.available_missions.len() {
+        if state.accept_mission(mission_id)
+            && self.selected > 0 && self.selected >= state.available_missions.len() {
                 self.selected = state.available_missions.len().saturating_sub(1);
             }
-        }
     }
 
     // ── Rendering ───────────────────────────────────────────────────

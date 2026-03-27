@@ -24,7 +24,9 @@ pub struct TitleScreen {
     starfield: Starfield,
     blink_timer: u32,
     blink_visible: bool,
+    #[allow(dead_code)] // Stored for future resize support
     width: u16,
+    #[allow(dead_code)]
     height: u16,
 }
 

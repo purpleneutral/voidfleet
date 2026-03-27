@@ -70,6 +70,7 @@ impl Mood {
 
 // ── Bridge furniture ────────────────────────────────────────────────────
 
+#[allow(dead_code)] // Bridge furniture for future interactive bridge rendering
 struct BridgeObject {
     x: u16,
     label: &'static str,
@@ -119,7 +120,9 @@ pub struct BridgeScene {
     speech_timer: u8,
 
     // Scene dimensions
+    #[allow(dead_code)] // Stored for future resize support
     width: u16,
+    #[allow(dead_code)]
     height: u16,
 
     // Idle timer — ticks since last player interaction
@@ -174,6 +177,7 @@ impl BridgeScene {
     }
 
     /// Notify Pip of game events (called from main loop)
+    #[allow(dead_code)] // Superseded by react_to_event, kept for potential direct-call use
     pub fn notify_battle_win(&mut self, state: &mut GameState) {
         state.pip_happiness = state.pip_happiness.saturating_add(10).min(100);
         state.add_pip_xp(10);
@@ -181,6 +185,7 @@ impl BridgeScene {
         self.pip_mood_timer = 40;
     }
 
+    #[allow(dead_code)]
     pub fn notify_battle_loss(&mut self, state: &mut GameState) {
         state.pip_happiness = state.pip_happiness.saturating_sub(15);
         self.pip_mood = Mood::Sad;
@@ -194,6 +199,7 @@ impl BridgeScene {
         }
     }
 
+    #[allow(dead_code)]
     pub fn notify_achievement(&mut self, state: &mut GameState) {
         state.add_pip_xp(20);
         self.pip_mood = Mood::Dancing;

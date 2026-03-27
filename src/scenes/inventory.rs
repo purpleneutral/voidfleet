@@ -762,7 +762,7 @@ impl InventoryScreen {
             .map(|item| item.salvage_value())
             .sum();
 
-        let title = format!(" Select items to salvage ");
+        let title = " Select items to salvage ".to_string();
         let list = List::new(items).block(
             Block::default()
                 .title(title)
@@ -999,8 +999,8 @@ fn render_item_detail(item: &Equipment) -> Vec<Line<'_>> {
     }
 
     // Set bonus
-    if let Some(ref set_id) = item.set_id {
-        if let Some(set) = SET_BONUSES.iter().find(|s| s.set_id == set_id) {
+    if let Some(ref set_id) = item.set_id
+        && let Some(set) = SET_BONUSES.iter().find(|s| s.set_id == set_id) {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("  Set: {} ({} pc)", set.set_name, set.pieces_required),
@@ -1011,7 +1011,6 @@ fn render_item_detail(item: &Equipment) -> Vec<Line<'_>> {
                 Style::default().fg(Color::DarkGray),
             )));
         }
-    }
 
     // Salvage value
     lines.push(Line::from(""));

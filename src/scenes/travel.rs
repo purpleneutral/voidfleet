@@ -954,7 +954,7 @@ fn generate_random_event(state: &GameState, last_event: Option<EventType>) -> (T
                 &format!("{} {}.\n\"Complete it within {} sectors for {}₿.\"",
                     faction.name(), mission_desc, sectors, reward),
                 vec![
-                    (format!("Accept mission (+20 rep on completion)"),
+                    ("Accept mission (+20 rep on completion)".to_string(),
                      EventOutcome::AcceptFactionMission {
                          faction,
                          sectors,
@@ -1497,11 +1497,10 @@ fn apply_event_outcome(outcome: EventOutcome, state: &mut GameState, _label: &st
                 let name = crew.name.clone();
                 crew.morale = 100;
                 // Temporarily unassign — they'll miss 1 battle
-                if let Some(ship_idx) = crew.assigned_ship.take() {
-                    if ship_idx < state.fleet.len() {
+                if let Some(ship_idx) = crew.assigned_ship.take()
+                    && ship_idx < state.fleet.len() {
                         state.fleet[ship_idx].crew_id = None;
                     }
-                }
                 format!("{} is taking shore leave. Morale restored!", name)
             } else {
                 "No effect.".to_string()
@@ -1511,11 +1510,10 @@ fn apply_event_outcome(outcome: EventOutcome, state: &mut GameState, _label: &st
             if let Some(idx) = state.crew_roster.iter().position(|c| c.id == crew_id) {
                 let name = state.crew_roster[idx].name.clone();
                 // Unassign from ship
-                if let Some(ship_idx) = state.crew_roster[idx].assigned_ship {
-                    if ship_idx < state.fleet.len() {
+                if let Some(ship_idx) = state.crew_roster[idx].assigned_ship
+                    && ship_idx < state.fleet.len() {
                         state.fleet[ship_idx].crew_id = None;
                     }
-                }
                 state.crew_roster.remove(idx);
                 // Also clean up bonds referencing this crew
                 state.crew_bonds.retain(|b| b.crew_a_id != crew_id && b.crew_b_id != crew_id);
@@ -1648,8 +1646,8 @@ impl Scene for TravelScene {
         if !self.faction_mission_checked {
             self.faction_mission_checked = true;
             // Tick the mission (decrement sectors_remaining)
-            if let Some(ref mut mission) = state.pending_faction_mission {
-                if mission.tick_sector() {
+            if let Some(ref mut mission) = state.pending_faction_mission
+                && mission.tick_sector() {
                     // Mission complete — collect rewards
                     let faction = mission.faction;
                     let credits = mission.reward_credits;
@@ -1666,7 +1664,6 @@ impl Scene for TravelScene {
                         ),
                     });
                 }
-            }
         }
 
         // ── Navigator shortcut check (once at start of travel) ─────

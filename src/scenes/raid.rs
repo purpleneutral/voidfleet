@@ -607,7 +607,7 @@ impl Scene for RaidScene {
 
         self.planet_type = PlanetType::pick(&mut rng);
         self.raid_duration = 15.0 + (state.sector as f32 * 0.5).min(15.0);
-        self.raid_faction = factions::sector_dominant_faction(state.sector);
+        self.raid_faction = factions::sector_faction(state.sector);
 
         self.generate_terrain();
         self.generate_buildings();

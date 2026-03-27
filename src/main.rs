@@ -1,4 +1,4 @@
-#![allow(dead_code)] // Game systems defined for future wiring — intentional
+ // Game systems defined for future wiring — intentional
 
 mod engine;
 mod rendering;
@@ -365,7 +365,7 @@ fn main() -> io::Result<()> {
                             state.sector,
                             &sector_faction,
                             &state.cargo,
-                            state.sector as u32 + state.total_battles as u32,
+                            state.sector + state.total_battles as u32,
                         );
                         for result in contraband_results {
                             event_bus.emit(engine::events::GameEvent::ContrabandDetected {

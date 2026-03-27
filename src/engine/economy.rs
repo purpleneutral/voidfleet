@@ -1,4 +1,4 @@
-/// Economy — cost calculations, unlock gates, dynamic loot, and catch-up mechanics.
+//! Economy — cost calculations, unlock gates, dynamic loot, and catch-up mechanics.
 
 use crate::engine::ship::ShipType;
 use crate::state::GameState;
