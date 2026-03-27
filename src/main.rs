@@ -70,6 +70,13 @@ fn main() -> io::Result<()> {
                             KeyCode::Char('q') | KeyCode::Char('Q') => break,
                             KeyCode::Esc => break,
                             KeyCode::Char('u') | KeyCode::Char('U') => upgrades.toggle(),
+                            KeyCode::Char(' ') => {
+                                // Space: skip current phase (speed up)
+                                state.phase_timer = 0.1;
+                            }
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                state.save();
+                            }
                             _ => {}
                         }
                     }
@@ -120,6 +127,47 @@ fn main() -> io::Result<()> {
                 GamePhase::Battle => battle.render(frame, &state, &particles),
                 GamePhase::Raid => raid.render(frame, &state, &particles),
                 GamePhase::Loot => loot.render(frame, &state, &particles),
+            }
+
+            // HUD bar at bottom
+            let area = frame.area();
+            let hud_y = area.height.saturating_sub(1);
+            let buf = frame.buffer_mut();
+
+            let phase_name = match phase {
+                GamePhase::Travel => "TRAVEL",
+                GamePhase::Battle => "BATTLE",
+                GamePhase::Raid => "RAID",
+                GamePhase::Loot => "LOOT",
+            };
+            let phase_color = match phase {
+                GamePhase::Travel => Color::Cyan,
+                GamePhase::Battle => Color::Red,
+                GamePhase::Raid => Color::Green,
+                GamePhase::Loot => Color::Yellow,
+            };
+            let hud = format!(
+                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [Space]Skip [Q]uit ",
+                phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
+            );
+            for (i, ch) in hud.chars().enumerate() {
+                let x = i as u16;
+                if x < area.width {
+                    let cell = &mut buf[(area.x + x, area.y + hud_y)];
+                    cell.set_char(ch);
+                    if i < phase_name.len() + 1 {
+                        cell.set_fg(phase_color);
+                    } else {
+                        cell.set_fg(Color::DarkGray);
+                    }
+                    cell.set_bg(Color::Rgb(20, 20, 30));
+                }
+            }
+            // Fill rest of HUD line
+            for x in hud.len() as u16..area.width {
+                let cell = &mut buf[(area.x + x, area.y + hud_y)];
+                cell.set_char(' ');
+                cell.set_bg(Color::Rgb(20, 20, 30));
             }
 
             // Upgrade overlay on top
