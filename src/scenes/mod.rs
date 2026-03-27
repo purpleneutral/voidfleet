@@ -5,6 +5,7 @@ pub mod raid;
 pub mod loot;
 pub mod upgrades;
 pub mod bridge;
+pub mod help;
 pub mod stats;
 pub mod map;
 pub mod inventory;

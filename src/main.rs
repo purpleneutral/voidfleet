@@ -33,6 +33,7 @@ use scenes::trade::TradeScreen;
 use scenes::missions::MissionScreen;
 use scenes::upgrades::UpgradeScreen;
 use scenes::map::MapScreen;
+use scenes::help::HelpScreen;
 use scenes::gamelog::GameLogScreen;
 use scenes::voyage::VoyageScreen;
 use state::{GamePhase, GameState};
@@ -87,6 +88,7 @@ fn main() -> io::Result<()> {
     let mut mission_screen = MissionScreen::new();
     let mut gamelog = GameLogScreen::new();
     let mut voyage_screen = VoyageScreen::new();
+    let mut help_screen = HelpScreen::new();
 
     // Achievement popup display
     let mut popup_text: Option<String> = None;
@@ -147,7 +149,9 @@ fn main() -> io::Result<()> {
                             }
                         }
                         AppMode::Playing => {
-                            if voyage_screen.active {
+                            if help_screen.open {
+                                help_screen.handle_input(key.code);
+                            } else if voyage_screen.active {
                                 if key.code == KeyCode::Enter {
                                     voyage_screen.handle_enter();
                                 }
@@ -205,6 +209,7 @@ fn main() -> io::Result<()> {
                                     KeyCode::Char('t') | KeyCode::Char('T') => trade_screen.toggle(&state),
                                     KeyCode::Char('j') | KeyCode::Char('J') => mission_screen.toggle(&mut state),
                                     KeyCode::Char('l') | KeyCode::Char('L') => gamelog.toggle(),
+                                    KeyCode::Char('?') => help_screen.toggle(),
                                     KeyCode::Char('p') | KeyCode::Char('P') => {
                                         // Voyage info display
                                         let info = crate::engine::voyage::VoyageInfo::for_voyage(state.voyage);
@@ -460,7 +465,9 @@ fn main() -> io::Result<()> {
 
                     // HUD bar
                     // Determine active overlay for context-aware HUD
-                    let active_overlay = if gamelog.open {
+                    let active_overlay = if help_screen.open {
+                        "help"
+                    } else if gamelog.open {
                         "log"
                     } else if trade_screen.open {
                         "trade"
@@ -530,6 +537,9 @@ fn main() -> io::Result<()> {
                     if stats.open {
                         stats.render(frame, &state);
                     }
+                    if help_screen.open {
+                        help_screen.render(frame);
+                    }
                 })?;
 
                 // Tick popup timer
@@ -592,42 +602,42 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
 
     let controls = match overlay {
         "trade" => format!(
-            " MARKET \u{2502} Cargo: {}/{} \u{2502} \u{20bf}{} \u{2502} [\u{2191}\u{2193}]Select [\u{2190}\u{2192}]Qty [Enter]Buy [S]Sell [Esc]Close ",
+            " MARKET │ Cargo: {}/{} │ ₿{} │ [?]Help [Esc]Close ",
             state.cargo_total(), state.cargo_capacity, state.credits
         ),
         "missions" => format!(
-            " MISSIONS \u{2502} Active: {} \u{2502} [Tab]Tabs [\u{2191}\u{2193}]Browse [Enter]Accept [Esc]Close ",
+            " MISSIONS │ Active: {} │ [?]Help [Esc]Close ",
             state.active_missions.len()
         ),
         "crew" => format!(
-            " CREW │ {}/{} │ \u{20bf}{} │ [\u{2191}\u{2193}]Navigate [Tab]Tabs [Enter]Assign [D]Dismiss [Esc]Close ",
+            " CREW │ {}/{} │ ₿{} │ [?]Help [Esc]Close ",
             state.crew_roster.len(), state.crew_capacity, state.credits
         ),
         "inventory" => format!(
-            " INVENTORY │ {}/{} items │ ◇{} │ [↑↓]Navigate [←→/Tab]Tabs [Enter]Equip [D]Salvage [Esc]Close ",
+            " INVENTORY │ {}/{} │ ◇{} │ [?]Help [Esc]Close ",
             state.inventory.len(), state.inventory_capacity, state.scrap
         ),
         "bridge" => format!(
-            " BRIDGE │ Pip Lv.{} │ ◇{} │ ₿{} │ [F]eed [P]et [G]ifts [Esc]Close ",
-            state.pip_level, state.scrap, state.credits
+            " BRIDGE │ Pip Lv.{} │ [?]Help [Esc]Close ",
+            state.pip_level
         ),
         "upgrades" => format!(
-            " UPGRADES │ ◇{} │ ₿{} │ [↑↓]Navigate [←→/Tab]Tabs [Enter]Buy [Esc]Close ",
+            " UPGRADES │ ◇{} │ ₿{} │ [?]Help [Esc]Close ",
             state.scrap, state.credits
         ),
-        "diplomacy" => " FACTIONS │ [↑↓]Browse [Esc]Close ".to_string(),
+        "diplomacy" => " FACTIONS │ [?]Help [Esc]Close ".to_string(),
         "stats" => " STATS │ [Esc/Tab]Close ".to_string(),
-        "map" => " SECTOR MAP │ [A/B/C]Choose Route [Esc]Close ".to_string(),
-        "log" => " SHIP LOG │ [↑↓]Scroll [PgUp/PgDn]Page [Esc]Close ".to_string(),
+        "map" => " SECTOR MAP │ [?]Help [Esc]Close ".to_string(),
+        "log" => " SHIP LOG │ [?]Help [Esc]Close ".to_string(),
         "event" => " EVENT │ [↑↓]Select [Enter]Choose ".to_string(),
+        "help" => " HELP │ [↑↓]Scroll [Esc]Close ".to_string(),
         _ => {
             let voyage_target = crate::engine::voyage::voyage_target_sector(state.voyage);
-            let hud = format!(
-                " V{} {} │ Sec:{}/{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pg [I]nv [C]rew [F]act [T]rade [J]ournal [L]og [B]ridge [M]ap [Tab]Stats [Space]Skip [Q]uit ",
+            format!(
+                " V{} {} │ Sec:{}/{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [?]Help ",
                 state.voyage, phase_name, state.sector, voyage_target,
                 state.level, state.scrap, state.credits, state.fleet.len()
-            );
-            hud
+            )
         }
     };
 
@@ -643,6 +653,7 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
         "stats" => ("STATS", Color::Cyan),
         "map" => ("SECTOR MAP", Color::Yellow),
         "log" => ("SHIP LOG", Color::White),
+        "help" => ("HELP", Color::White),
         "event" => ("EVENT", Color::Yellow),
         _ => (phase_name, phase_color),
     };
