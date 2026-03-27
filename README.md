@@ -5,8 +5,7 @@
 
 A space conquest idle TUI game built in Rust. Watch your fleet travel through space, battle enemies, raid planets, and grow stronger — all rendered as animated ASCII art in your terminal.
 
-<!-- ![Void Fleet Demo](screenshots/demo.gif) -->
-<!-- Uncomment above after recording with: vhs demo.tape -->
+![Void Fleet Demo](screenshots/demo.gif)
 
 ## Features
 

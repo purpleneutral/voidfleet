@@ -1,60 +1,53 @@
 # VHS demo recording for README
 # Run: vhs demo.tape
-# Requires: vhs (https://github.com/charmbracelet/vhs)
 
 Output screenshots/demo.gif
-Set Width 120
-Set Height 35
-Set FontSize 14
+Set Width 1400
+Set Height 600
+Set FontSize 16
 Set Theme "Dracula"
-Set TypingSpeed 50ms
-Set Padding 10
+Set Padding 20
+Set Framerate 15
 
-# Start the game
-Type "cargo run --release"
+# Launch game and immediately start (hide shell)
+Hide
+Type "./target/release/voidfleet"
 Enter
 Sleep 2s
-
-# Title screen — press Enter to start
 Enter
 Sleep 1s
+Show
 
-# Watch travel scene
-Sleep 8s
+# Watch travel — stars, fleet, collectibles
+Sleep 6s
 
-# Open upgrades
+# Quick look at upgrades
 Type "u"
-Sleep 3s
+Sleep 2s
 Escape
 
-# Visit Pip on the bridge
+# Visit Pip
 Type "b"
-Sleep 3s
-# Pet Pip
+Sleep 2s
 Type "p"
-Sleep 2s
+Sleep 1s
 Escape
 
-# Open sector map
-Type "m"
-Sleep 2s
-Escape
-
-# Watch battle play out (skip travel to get there faster)
+# Skip to battle/raid
 Type " "
-Sleep 15s
-
-# Watch raid
 Sleep 10s
 
-# Open stats
+# Skip to next phase
+Type " "
+Sleep 8s
+
+# Stats
 Tab
-Sleep 3s
+Sleep 2s
 Escape
 
-# Watch more travel
-Sleep 5s
+# Watch a bit more
+Sleep 3s
 
 # Quit
 Type "q"
-Sleep 1s
