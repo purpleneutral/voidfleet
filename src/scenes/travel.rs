@@ -1379,6 +1379,11 @@ fn apply_event_outcome(outcome: EventOutcome, state: &mut GameState, _label: &st
                 remaining -= take;
             }
             state.fleet.retain(|s| s.current_hp > 0);
+            // Ensure fleet is never empty — respawn a scout if all ships destroyed
+            if state.fleet.is_empty() {
+                use crate::engine::ship::{Ship, ShipType};
+                state.fleet.push(Ship::new(ShipType::Scout));
+            }
             format!("Your fleet took {} damage!", dmg)
         }
         EventOutcome::SkipSectors(n) => {

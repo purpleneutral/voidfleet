@@ -3,7 +3,7 @@ use ratatui::style::Color;
 use ratatui::Frame;
 
 use crate::engine::abilities::{AbilityContext, AbilityEffect};
-use crate::engine::combat::{effective_damage, effective_hp, fire_rate};
+use crate::engine::combat::{effective_damage_with_voyage, effective_hp_with_voyage, fire_rate};
 use crate::engine::crew::CrewClass;
 use crate::engine::equipment::{generate_equipment, Equipment, Rarity};
 use crate::engine::procedural::{generate_enemy_fleet_for_voyage, difficulty_modifier, post_death_modifier};
@@ -543,6 +543,10 @@ pub struct BattleScene {
     is_voyage_boss_battle: bool,
     /// Pending voyage boss event to emit on first tick (voyage, boss_name).
     pending_voyage_boss: Option<(u32, String)>,
+    /// Voyage permanent damage bonus (cached from state on enter).
+    voyage_dmg_bonus: f32,
+    /// Voyage permanent HP bonus (cached from state on enter).
+    voyage_hp_bonus: f32,
 }
 
 /// Floating ability trigger text that drifts upward and fades.
@@ -585,6 +589,8 @@ impl BattleScene {
             coord_lines: Vec::new(),
             desperate_flash: 0,
             is_voyage_boss_battle: false,
+            voyage_dmg_bonus: 0.0,
+            voyage_hp_bonus: 0.0,
             pending_voyage_boss: None,
         }
     }
@@ -1694,6 +1700,8 @@ impl Scene for BattleScene {
         self.active_beams.clear();
         self.pending_drops.clear();
         self.crit_texts.clear();
+        self.voyage_dmg_bonus = state.voyage_permanent_dmg;
+        self.voyage_hp_bonus = state.voyage_permanent_hp;
         self.has_scan = state.fleet.iter().any(|s| {
             s.is_alive() && s.ship_type.ability() == Some(ShipAbility::Scan)
         });
@@ -2261,7 +2269,7 @@ impl Scene for BattleScene {
                             }
                             let ey = enemy.y;
                             if (ey - py).abs() < 1.5 && enemy.x > px {
-                                let beam_dmg = ((effective_damage(ship, ability_tech_lasers) as f32 * ability_pip_bonus) as u32 / 3).max(1);
+                                let beam_dmg = ((effective_damage_with_voyage(ship, ability_tech_lasers, self.voyage_dmg_bonus) as f32 * ability_pip_bonus) as u32 / 3).max(1);
                                 let actual = beam_dmg.min(enemy.hp);
                                 enemy.hp -= actual;
                                 if !enemy.is_alive() {
@@ -2325,7 +2333,7 @@ impl Scene for BattleScene {
                 match ability {
                     ShipAbility::HeavyPayload => {
                         // Fire a slow, large AOE projectile
-                        let payload_dmg = (effective_damage(ship, ability_tech_lasers) as f32 * ability_pip_bonus) as u32 * 2;
+                        let payload_dmg = (effective_damage_with_voyage(ship, ability_tech_lasers, self.voyage_dmg_bonus) as f32 * ability_pip_bonus) as u32 * 2;
                         new_projectiles.push(Projectile {
                             x: muzzle_x,
                             y: py,
@@ -2348,7 +2356,7 @@ impl Scene for BattleScene {
                     }
                     ShipAbility::Broadside => {
                         // Fire 5 projectiles in a vertical spread
-                        let broadside_dmg = (effective_damage(ship, ability_tech_lasers) as f32 * ability_pip_bonus) as u32;
+                        let broadside_dmg = (effective_damage_with_voyage(ship, ability_tech_lasers, self.voyage_dmg_bonus) as f32 * ability_pip_bonus) as u32;
                         let offsets: [f32; 5] = [-2.0, -1.0, 0.0, 1.0, 2.0];
                         for &y_off in &offsets {
                             new_projectiles.push(Projectile {
@@ -2520,7 +2528,7 @@ impl Scene for BattleScene {
                 } else {
                     1.0
                 };
-                let dmg = (effective_damage(ship, tech_lasers) as f32
+                let dmg = (effective_damage_with_voyage(ship, tech_lasers, self.voyage_dmg_bonus) as f32
                     * pip_bonus * crew_mod * rally_mult * formation_dmg
                     * screening_bonus * player_momentum) as u32;
 
@@ -3688,7 +3696,7 @@ impl Scene for BattleScene {
 
         // Player fleet HP
         let player_hp: u32 = state.fleet.iter().map(|s| s.current_hp).sum();
-        let player_max: u32 = state.fleet.iter().map(|s| effective_hp(s, state.tech_shields)).sum();
+        let player_max: u32 = state.fleet.iter().map(|s| effective_hp_with_voyage(s, state.tech_shields, self.voyage_hp_bonus)).sum();
         let player_ratio = if player_max > 0 {
             player_hp as f32 / player_max as f32
         } else {

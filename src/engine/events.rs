@@ -561,6 +561,24 @@ pub fn process_events(
                         *popup_timer = 50;
                     }
                 }
+
+                // Update crew bonds from shared combat experience
+                use crate::engine::crew::update_crew_bonds;
+                let bond_changes = update_crew_bonds(&state.crew_roster, &mut state.crew_bonds);
+                for (crew_a, crew_b, bond_type) in bond_changes {
+                    if popup_text.is_none() {
+                        *popup_text = Some(format!("{} & {} — {}!", crew_a, crew_b, bond_type.description()));
+                        *popup_timer = 50;
+                    }
+                }
+
+                // Tick grief/vengeance for assigned crew
+                use crate::engine::crew::tick_grief_vengeance;
+                for crew in &mut state.crew_roster {
+                    if crew.assigned_ship.is_some() {
+                        tick_grief_vengeance(crew);
+                    }
+                }
             }
             GameEvent::BattleLost { sector, penalty_description } => {
                 state.total_battles += 1;
