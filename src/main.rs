@@ -264,7 +264,21 @@ fn main() -> io::Result<()> {
                     }
 
                     // HUD bar
-                    render_hud(frame, &state, phase);
+                    // Determine active overlay for context-aware HUD
+                    let active_overlay = if bridge.open {
+                        "bridge"
+                    } else if upgrades.open {
+                        "upgrades"
+                    } else if stats.open {
+                        "stats"
+                    } else if map_screen.open {
+                        "map"
+                    } else if travel.has_active_event() {
+                        "event"
+                    } else {
+                        "game"
+                    };
+                    render_hud(frame, &state, phase, active_overlay);
 
                     // Achievement popup banner
                     if let Some(ref text) = popup_text {
@@ -320,7 +334,7 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase) {
+fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &str) {
     let area = frame.area();
     let hud_y = area.height.saturating_sub(1);
     let buf = frame.buffer_mut();
@@ -337,24 +351,57 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase) {
         GamePhase::Raid => Color::Green,
         GamePhase::Loot => Color::Yellow,
     };
-    let hud = format!(
-        " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [B]ridge [M]ap [Tab]Stats [Space]Skip [Q]uit ",
-        phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
-    );
-    for (i, ch) in hud.chars().enumerate() {
+
+    let controls = match overlay {
+        "bridge" => format!(
+            " BRIDGE │ Pip Lv.{} │ ◇{} │ ₿{} │ [F]eed [P]et [G]ifts [Esc]Close ",
+            state.pip_level, state.scrap, state.credits
+        ),
+        "upgrades" => format!(
+            " UPGRADES │ ◇{} │ ₿{} │ [↑↓]Navigate [←→/Tab]Tabs [Enter]Buy [Esc]Close ",
+            state.scrap, state.credits
+        ),
+        "stats" => " STATS │ [Esc/Tab]Close ".to_string(),
+        "map" => " SECTOR MAP │ [A/B/C]Choose Route [Esc]Close ".to_string(),
+        "event" => " EVENT │ [↑↓]Select [Enter]Choose ".to_string(),
+        _ => {
+            let mut hud = format!(
+                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [B]ridge [M]ap [Tab]Stats [Space]Skip ",
+                phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
+            );
+            if state.sector >= 30 {
+                hud.push_str("[P]restige ");
+            }
+            hud.push_str("[Q]uit ");
+            hud
+        }
+    };
+
+    // Determine label color based on context
+    let (label, label_color) = match overlay {
+        "bridge" => ("BRIDGE", Color::Magenta),
+        "upgrades" => ("UPGRADES", Color::Green),
+        "stats" => ("STATS", Color::Cyan),
+        "map" => ("SECTOR MAP", Color::Yellow),
+        "event" => ("EVENT", Color::Yellow),
+        _ => (phase_name, phase_color),
+    };
+    let label_len = label.len() + 1; // +1 for leading space
+
+    for (i, ch) in controls.chars().enumerate() {
         let x = i as u16;
         if x < area.width {
             let cell = &mut buf[(area.x + x, area.y + hud_y)];
             cell.set_char(ch);
-            if i < phase_name.len() + 1 {
-                cell.set_fg(phase_color);
+            if i < label_len {
+                cell.set_fg(label_color);
             } else {
                 cell.set_fg(Color::DarkGray);
             }
             cell.set_bg(Color::Rgb(20, 20, 30));
         }
     }
-    for x in hud.len() as u16..area.width {
+    for x in controls.len() as u16..area.width {
         let cell = &mut buf[(area.x + x, area.y + hud_y)];
         cell.set_char(' ');
         cell.set_bg(Color::Rgb(20, 20, 30));
