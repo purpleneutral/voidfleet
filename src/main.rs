@@ -27,6 +27,8 @@ use scenes::bridge::BridgeScene;
 use scenes::inventory::InventoryScreen;
 use scenes::crew::CrewScreen;
 use scenes::diplomacy::DiplomacyScreen;
+use scenes::trade::TradeScreen;
+use scenes::missions::MissionScreen;
 use scenes::upgrades::UpgradeScreen;
 use scenes::map::MapScreen;
 use state::{GamePhase, GameState};
@@ -77,6 +79,8 @@ fn main() -> io::Result<()> {
     let mut map_screen = MapScreen::new();
     let mut crew_screen = CrewScreen::new();
     let mut diplomacy = DiplomacyScreen::new();
+    let mut trade_screen = TradeScreen::new();
+    let mut mission_screen = MissionScreen::new();
 
     // Achievement popup display
     let mut popup_text: Option<String> = None;
@@ -133,7 +137,17 @@ fn main() -> io::Result<()> {
                             }
                         }
                         AppMode::Playing => {
-                            if upgrades.open {
+                            if trade_screen.open {
+                                match key.code {
+                                    KeyCode::Esc => { trade_screen.open = false; }
+                                    other => trade_screen.handle_input(other, &mut state),
+                                }
+                            } else if mission_screen.open {
+                                match key.code {
+                                    KeyCode::Esc => { mission_screen.open = false; }
+                                    other => mission_screen.handle_input(other, &mut state),
+                                }
+                            } else if upgrades.open {
                                 match key.code {
                                     KeyCode::Esc => upgrades.toggle(),
                                     other => upgrades.handle_input(other, &mut state),
@@ -169,6 +183,8 @@ fn main() -> io::Result<()> {
                                     KeyCode::Char('c') | KeyCode::Char('C') => crew_screen.toggle(&state),
                                     KeyCode::Char('f') | KeyCode::Char('F') => diplomacy.toggle(),
                                     KeyCode::Char('m') | KeyCode::Char('M') => map_screen.toggle(&state),
+                                    KeyCode::Char('t') | KeyCode::Char('T') => trade_screen.toggle(&state),
+                                    KeyCode::Char('j') | KeyCode::Char('J') => mission_screen.toggle(&mut state),
                                     KeyCode::Char('p') | KeyCode::Char('P') => {
                                         if state.prestige() {
                                             // Prestige resets state, re-enter travel scene
@@ -297,7 +313,11 @@ fn main() -> io::Result<()> {
 
                     // HUD bar
                     // Determine active overlay for context-aware HUD
-                    let active_overlay = if inventory.open {
+                    let active_overlay = if trade_screen.open {
+                        "trade"
+                    } else if mission_screen.open {
+                        "missions"
+                    } else if inventory.open {
                         "inventory"
                     } else if crew_screen.open {
                         "crew"
@@ -325,6 +345,12 @@ fn main() -> io::Result<()> {
                         }
 
                     // Overlays
+                    if trade_screen.open {
+                        trade_screen.render(frame, &state);
+                    }
+                    if mission_screen.open {
+                        mission_screen.render(frame, &state);
+                    }
                     if inventory.open {
                         inventory.render(frame, &state);
                     }
@@ -399,6 +425,14 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
     };
 
     let controls = match overlay {
+        "trade" => format!(
+            " MARKET \u{2502} Cargo: {}/{} \u{2502} \u{20bf}{} \u{2502} [\u{2191}\u{2193}]Select [\u{2190}\u{2192}]Qty [Enter]Buy [S]Sell [Esc]Close ",
+            state.cargo_total(), state.cargo_capacity, state.credits
+        ),
+        "missions" => format!(
+            " MISSIONS \u{2502} Active: {} \u{2502} [Tab]Tabs [\u{2191}\u{2193}]Browse [Enter]Accept [Esc]Close ",
+            state.active_missions.len()
+        ),
         "crew" => format!(
             " CREW │ {}/{} │ \u{20bf}{} │ [\u{2191}\u{2193}]Navigate [Tab]Tabs [Enter]Assign [D]Dismiss [Esc]Close ",
             state.crew_roster.len(), state.crew_capacity, state.credits
@@ -421,7 +455,7 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
         "event" => " EVENT │ [↑↓]Select [Enter]Choose ".to_string(),
         _ => {
             let mut hud = format!(
-                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [I]nventory [C]rew [F]actions [B]ridge [M]ap [Tab]Stats [Space]Skip ",
+                " {} │ Sec:{} │ Lv.{} │ ◇{} │ ₿{} │ Ships:{} │ [U]pgrade [I]nventory [C]rew [F]actions [T]rade [J]ournal [B]ridge [M]ap [Tab]Stats [Space]Skip ",
                 phase_name, state.sector, state.level, state.scrap, state.credits, state.fleet.len()
             );
             if state.sector >= 30 {
@@ -434,6 +468,8 @@ fn render_hud(frame: &mut Frame, state: &GameState, phase: GamePhase, overlay: &
 
     // Determine label color based on context
     let (label, label_color) = match overlay {
+        "trade" => ("MARKET", Color::Yellow),
+        "missions" => ("MISSIONS", Color::Cyan),
         "crew" => ("CREW", Color::Magenta),
         "diplomacy" => ("FACTIONS", Color::LightBlue),
         "inventory" => ("INVENTORY", Color::Yellow),

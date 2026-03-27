@@ -10,6 +10,8 @@ pub mod map;
 pub mod inventory;
 pub mod crew;
 pub mod diplomacy;
+pub mod trade;
+pub mod missions;
 
 use ratatui::Frame;
 use crate::engine::events::EventBus;

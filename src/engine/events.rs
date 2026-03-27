@@ -57,6 +57,16 @@ pub enum GameEvent {
     // Factions
     FactionRepChange { faction: String, amount: i32, reason: String },
     FactionEncounter { faction: String, hostile: bool },
+
+    // Trade
+    GoodsBought { good: String, quantity: u32, total_cost: u64 },
+    GoodsSold { good: String, quantity: u32, revenue: u64, profit: i64 },
+    ContrabandDetected { good: String, faction: String, fine: u64 },
+
+    // Missions
+    MissionAccepted { title: String, faction: String },
+    MissionCompleted { title: String, reward_credits: u64, reward_rep: i32 },
+    MissionFailed { title: String, reason: String },
 }
 
 // ── Event Bus ───────────────────────────────────────────────────────────────
@@ -267,6 +277,42 @@ pub fn process_events(
                     *popup_text = Some(format!("⚠ Hostile {} fleet detected!", faction));
                     *popup_timer = 40;
                 }
+            }
+            // Trade events
+            GameEvent::GoodsBought { good, quantity, total_cost } => {
+                let _ = (good, quantity, total_cost); // logged to history
+            }
+            GameEvent::GoodsSold { good, quantity, revenue, profit } => {
+                if *profit > 0 && *revenue >= 100 {
+                    *popup_text = Some(format!(
+                        "💰 Sold {} {} for {} cr (+{} profit/unit)",
+                        quantity, good, revenue, profit
+                    ));
+                    *popup_timer = 40;
+                }
+            }
+            GameEvent::ContrabandDetected { good, faction, fine } => {
+                *popup_text = Some(format!(
+                    "⚠ {} detected {} contraband! Fined {} credits!",
+                    faction, good, fine
+                ));
+                *popup_timer = 70;
+            }
+            // Mission events
+            GameEvent::MissionAccepted { title, faction } => {
+                *popup_text = Some(format!("📋 Mission accepted: {} ({})", title, faction));
+                *popup_timer = 50;
+            }
+            GameEvent::MissionCompleted { title, reward_credits, reward_rep } => {
+                *popup_text = Some(format!(
+                    "✅ Mission complete: {} (+{} cr, +{} rep)",
+                    title, reward_credits, reward_rep
+                ));
+                *popup_timer = 70;
+            }
+            GameEvent::MissionFailed { title, reason } => {
+                *popup_text = Some(format!("❌ Mission failed: {} — {}", title, reason));
+                *popup_timer = 60;
             }
             // Other events are logged to history but don't trigger cross-system effects yet.
             _ => {}

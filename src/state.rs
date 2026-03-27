@@ -2,10 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use std::collections::HashMap;
+
 use crate::engine::crew::{CrewBond, CrewMember};
 use crate::engine::equipment::{Equipment, SetBonus, SET_BONUSES};
 use crate::engine::factions::{FactionMission, FactionReputation};
+use crate::engine::missions::Mission;
 use crate::engine::ship::{Ship, ShipType};
+use crate::engine::trade::{TradeGood, TradeRecord};
 
 fn default_route_modifier() -> f32 {
     1.0
@@ -109,6 +113,26 @@ pub struct GameState {
     #[serde(default)]
     pub pending_faction_mission: Option<FactionMission>,
 
+    // Trade / Cargo
+    #[serde(default)]
+    pub cargo: HashMap<String, u32>,
+    #[serde(default = "default_cargo_capacity")]
+    pub cargo_capacity: u32,
+    #[serde(default)]
+    pub trade_history: Vec<TradeRecord>,
+
+    // Missions
+    #[serde(default)]
+    pub active_missions: Vec<Mission>,
+    #[serde(default)]
+    pub completed_missions: u64,
+    #[serde(default)]
+    pub failed_missions: u64,
+    #[serde(default)]
+    pub available_missions: Vec<Mission>,
+    #[serde(default = "default_next_mission_id")]
+    pub next_mission_id: u64,
+
     // Transient (not saved)
     #[serde(skip)]
     pub pending_popups: Vec<String>,
@@ -116,6 +140,8 @@ pub struct GameState {
     pub pending_loot: Vec<Equipment>,
 }
 
+fn default_cargo_capacity() -> u32 { 20 }
+fn default_next_mission_id() -> u64 { 1 }
 fn default_inventory_capacity() -> usize { 20 }
 fn default_next_item_id() -> u64 { 1 }
 fn default_crew_capacity() -> usize { 5 }
@@ -182,6 +208,14 @@ impl GameState {
             crew_bonds: Vec::new(),
             faction_reputation: FactionReputation::default(),
             pending_faction_mission: None,
+            cargo: HashMap::new(),
+            cargo_capacity: 20,
+            trade_history: Vec::new(),
+            active_missions: Vec::new(),
+            completed_missions: 0,
+            failed_missions: 0,
+            available_missions: Vec::new(),
+            next_mission_id: 1,
             pending_popups: Vec::new(),
             pending_loot: Vec::new(),
         }
@@ -411,6 +445,12 @@ impl GameState {
         self.next_crew_id = 1;
         self.faction_reputation = FactionReputation::default();
         self.pending_faction_mission = None;
+        self.active_missions.clear();
+        self.available_missions.clear();
+        self.next_mission_id = 1;
+        self.cargo.clear();
+        self.cargo_capacity = 20;
+        self.trade_history.clear();
         // Keep: achievements, deaths, highest_sector, prestige_level, totals, time_played, inventory_capacity, crew_capacity
         true
     }
@@ -534,5 +574,184 @@ impl GameState {
     /// 0.7 (allied) to 1.5 (hostile).
     pub fn price_modifier(&self, faction: crate::engine::factions::Faction) -> f32 {
         self.faction_reputation.price_modifier(faction)
+    }
+
+    // ── Mission methods ──────────────────────────────────────────
+
+    /// Accept a mission from the available list, moving it to active.
+    pub fn accept_mission(&mut self, mission_id: u64) -> bool {
+        crate::engine::missions::accept_mission(
+            &mut self.available_missions,
+            &mut self.active_missions,
+            mission_id,
+        )
+    }
+
+    /// Check mission progress after a sector transition.
+    pub fn check_mission_progress(
+        &mut self,
+        sector: u32,
+        battle_won: bool,
+        boss_killed: bool,
+        raid_completed: bool,
+        fleet_ship_lost: bool,
+    ) -> Vec<crate::engine::missions::MissionUpdate> {
+        let updates = crate::engine::missions::check_mission_progress(
+            &mut self.active_missions,
+            sector,
+            battle_won,
+            boss_killed,
+            raid_completed,
+            fleet_ship_lost,
+        );
+
+        // Update counters
+        for update in &updates {
+            match &update.update_type {
+                crate::engine::missions::MissionUpdateType::Completed { .. } => {
+                    self.completed_missions += 1;
+                }
+                crate::engine::missions::MissionUpdateType::Failed { .. } => {
+                    self.failed_missions += 1;
+                }
+                _ => {}
+            }
+        }
+
+        updates
+    }
+
+    /// Expire missions that are too far past their target.
+    pub fn fail_expired_missions(&mut self) {
+        let updates = crate::engine::missions::fail_expired_missions(
+            &mut self.active_missions,
+            self.sector,
+        );
+        self.failed_missions += updates.iter().filter(|u| {
+            matches!(u.update_type, crate::engine::missions::MissionUpdateType::Failed { .. })
+        }).count() as u64;
+    }
+
+    /// Refresh available missions for the current sector.
+    pub fn refresh_available_missions(&mut self, sector: u32) {
+        let faction = crate::engine::factions::sector_dominant_faction(sector);
+        let count = 3 + (sector as usize / 10).min(2); // 3-5 missions available
+        self.available_missions = crate::engine::missions::generate_missions(
+            sector,
+            &faction,
+            count,
+            &mut self.next_mission_id,
+        );
+    }
+
+    // ── Cargo / Trade methods ──────────────────────────────────────
+
+    /// Total number of items currently in cargo.
+    pub fn cargo_total(&self) -> u32 {
+        self.cargo.values().sum()
+    }
+
+    /// Remaining cargo space.
+    pub fn cargo_space_remaining(&self) -> u32 {
+        self.cargo_capacity.saturating_sub(self.cargo_total())
+    }
+
+    /// Buy goods from a market. Deducts credits and adds to cargo.
+    /// Returns `true` on success, `false` if insufficient credits or cargo space.
+    pub fn buy_goods(&mut self, good: TradeGood, quantity: u32, price_per_unit: u64) -> bool {
+        if quantity == 0 {
+            return false;
+        }
+        let total_cost = price_per_unit * quantity as u64;
+        if self.credits < total_cost {
+            return false;
+        }
+        if quantity > self.cargo_space_remaining() {
+            return false;
+        }
+
+        self.credits -= total_cost;
+        *self.cargo.entry(good.key().to_string()).or_insert(0) += quantity;
+
+        // Record trade history (keep last 20)
+        self.trade_history.push(TradeRecord {
+            good,
+            quantity,
+            price_per_unit,
+            was_buy: true,
+            sector: self.sector,
+        });
+        if self.trade_history.len() > 20 {
+            self.trade_history.remove(0);
+        }
+
+        true
+    }
+
+    /// Sell goods from cargo. Returns revenue earned, or 0 if insufficient goods.
+    pub fn sell_goods(&mut self, good: TradeGood, quantity: u32, price_per_unit: u64) -> u64 {
+        if quantity == 0 {
+            return 0;
+        }
+        let held = self.cargo.get(good.key()).copied().unwrap_or(0);
+        if held < quantity {
+            return 0;
+        }
+
+        let revenue = price_per_unit * quantity as u64;
+        let entry = self.cargo.get_mut(good.key()).expect("checked above");
+        *entry -= quantity;
+        if *entry == 0 {
+            self.cargo.remove(good.key());
+        }
+        self.credits += revenue;
+
+        // Record trade history (keep last 20)
+        self.trade_history.push(TradeRecord {
+            good,
+            quantity,
+            price_per_unit,
+            was_buy: false,
+            sector: self.sector,
+        });
+        if self.trade_history.len() > 20 {
+            self.trade_history.remove(0);
+        }
+
+        revenue
+    }
+
+    /// Calculate profit/loss for a good based on trade history.
+    /// Compares latest sell price per unit to the average buy price per unit.
+    pub fn trade_profit(&self, good: TradeGood) -> Option<i64> {
+        let buys: Vec<&TradeRecord> = self
+            .trade_history
+            .iter()
+            .filter(|r| r.good == good && r.was_buy)
+            .collect();
+        let sells: Vec<&TradeRecord> = self
+            .trade_history
+            .iter()
+            .filter(|r| r.good == good && !r.was_buy)
+            .collect();
+
+        if buys.is_empty() || sells.is_empty() {
+            return None;
+        }
+
+        let total_buy_cost: u64 = buys.iter().map(|r| r.total_cost()).sum();
+        let total_buy_qty: u64 = buys.iter().map(|r| r.quantity as u64).sum();
+        let avg_buy = total_buy_cost / total_buy_qty.max(1);
+
+        let last_sell = sells.last().expect("checked above");
+        Some(last_sell.price_per_unit as i64 - avg_buy as i64)
+    }
+
+    /// Apply a contraband fine: deduct credits and confiscate goods.
+    pub fn apply_contraband_fine(&mut self, good: TradeGood, fine: u64) {
+        // Confiscate all of the detected good
+        self.cargo.remove(good.key());
+        // Deduct fine (can't go below 0)
+        self.credits = self.credits.saturating_sub(fine);
     }
 }
