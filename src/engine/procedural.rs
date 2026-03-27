@@ -120,7 +120,7 @@ pub fn generate_enemy_fleet(sector: u32) -> Vec<EnemyTemplate> {
 /// Generate an enemy fleet with adaptive difficulty applied.
 /// `modifier` is the combined difficulty_modifier * post_death_modifier.
 pub fn generate_enemy_fleet_adaptive(sector: u32, modifier: f32) -> Vec<EnemyTemplate> {
-    let is_boss_sector = sector % 10 == 0 && sector > 0;
+    let is_boss_sector = sector.is_multiple_of(10) && sector > 0;
 
     let mut fleet = Vec::new();
 
@@ -129,7 +129,7 @@ pub fn generate_enemy_fleet_adaptive(sector: u32, modifier: f32) -> Vec<EnemyTem
         // Boss gets escort ships — composition varies
         let escort_count = (sector / 10).min(4) as usize;
         // Every other boss sector: add an extra mixed escort for variety
-        let extra = if sector % 20 == 0 { 1 } else { 0 };
+        let extra = if sector.is_multiple_of(20) { 1 } else { 0 };
         for i in 0..(escort_count + extra) {
             if i == escort_count {
                 // Extra escort is always a heavier type

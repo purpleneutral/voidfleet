@@ -2,7 +2,12 @@
 name = "voidfleet"
 version = "0.1.0"
 edition = "2024"
-description = "Space conquest idle TUI game"
+description = "Space conquest idle TUI game — animated ASCII battles, fleet management, and a tiny robot companion"
+license = "MIT"
+repository = "https://github.com/purpleneutral/voidfleet"
+readme = "README.md"
+keywords = ["game", "tui", "terminal", "idle", "space"]
+categories = ["games", "command-line-utilities"]
 
 [dependencies]
 ratatui = "0.29"

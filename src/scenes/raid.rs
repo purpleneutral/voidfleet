@@ -426,14 +426,12 @@ impl RaidScene {
                 let row = rng.gen_range(0..self.terrain.len());
                 let offset = rng.gen_range(0..3_usize);
                 let target_col = col.wrapping_add(offset).wrapping_sub(1);
-                if row < self.terrain.len() {
-                    if let Some(cell) = self.terrain[row].get_mut(target_col) {
-                        if *cell != ' ' {
+                if row < self.terrain.len()
+                    && let Some(cell) = self.terrain[row].get_mut(target_col)
+                        && *cell != ' ' {
                             *cell = ' ';
                             self.cells_degraded += 1;
                         }
-                    }
-                }
             }
         }
     }
@@ -683,7 +681,7 @@ impl Scene for RaidScene {
         self.emit_ambient_particles(particles);
 
         // ── Resource extraction (ticking up) ────────────────────────────
-        if self.tick_count % 10 == 0 {
+        if self.tick_count.is_multiple_of(10) {
             let per_beam = 1 + state.sector as u64 / 5;
             let active_beams = self.beams.iter().filter(|b| b.active).count() as u64;
             let scrap_tick = per_beam * active_beams;
@@ -696,7 +694,7 @@ impl Scene for RaidScene {
         }
 
         // ── Resource particles rising from beam contact points ──────────
-        if self.tick_count % 4 == 0 {
+        if self.tick_count.is_multiple_of(4) {
             for beam in &self.beams {
                 if !beam.active {
                     continue;
@@ -716,7 +714,7 @@ impl Scene for RaidScene {
         }
 
         // ── Sparkle at beam contact points ──────────────────────────────
-        if self.tick_count % 12 == 0 {
+        if self.tick_count.is_multiple_of(12) {
             for beam in &self.beams {
                 if beam.active {
                     particles.sparkle(beam.x as f32, beam.surface_y as f32, Color::LightYellow);
@@ -950,11 +948,9 @@ impl Scene for RaidScene {
                                 cell.set_char('▓');
                             } else {
                                 // Flickering windows
-                                let is_window = (bx as usize + h as usize) % 2 == 0;
+                                let is_window = (bx as usize + h as usize).is_multiple_of(2);
                                 let window_on = is_window
-                                    && ((self.tick_count as usize / 6 + bx as usize + h as usize)
-                                        % 7
-                                        != 0);
+                                    && !(self.tick_count as usize / 6 + bx as usize + h as usize).is_multiple_of(7);
                                 if window_on {
                                     cell.set_char('▪');
                                     cell.set_fg(Color::LightYellow);
@@ -1078,7 +1074,7 @@ impl Scene for RaidScene {
             let hover = &self.ships[i];
             let draw_y = hover.current_y;
 
-            let is_flashing = hover.flash_frames > 0 && hover.flash_frames % 2 == 0;
+            let is_flashing = hover.flash_frames > 0 && hover.flash_frames.is_multiple_of(2);
             let ship_color = if is_flashing {
                 Color::LightRed
             } else {

@@ -115,7 +115,7 @@ impl MapScreen {
         for i in 0..12 {
             let sec = current + i;
             // Every 5 sectors (relative to sector 1) is a branch point
-            if sec > current && (sec % 5) == 0 {
+            if sec > current && sec.is_multiple_of(5) {
                 let num_choices = rng.gen_range(2..=3_usize);
                 let mut choices: Vec<RouteBranch> = Vec::new();
                 let mut used: Vec<usize> = Vec::new();
@@ -161,27 +161,23 @@ impl MapScreen {
                 true
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(idx) = self.active_branch {
-                    if let SectorNode::Branch { choices, .. } = &self.path[idx] {
-                        if self.cursor + 1 < choices.len() {
+                if let Some(idx) = self.active_branch
+                    && let SectorNode::Branch { choices, .. } = &self.path[idx]
+                        && self.cursor + 1 < choices.len() {
                             self.cursor += 1;
                         }
-                    }
-                }
                 true
             }
             KeyCode::Enter => {
                 // Apply chosen route
-                if let Some(idx) = self.active_branch {
-                    if let SectorNode::Branch { choices, .. } = &self.path[idx] {
-                        if self.cursor < choices.len() {
+                if let Some(idx) = self.active_branch
+                    && let SectorNode::Branch { choices, .. } = &self.path[idx]
+                        && self.cursor < choices.len() {
                             let chosen = &choices[self.cursor];
                             // Store the average of difficulty and loot as route modifier
                             // Higher difficulty + higher loot = higher modifier
                             state.current_route_modifier = chosen.difficulty * chosen.loot;
                         }
-                    }
-                }
                 self.open = false;
                 true
             }
@@ -202,15 +198,13 @@ impl MapScreen {
     }
 
     fn select_branch(&mut self, index: usize, state: &mut GameState) {
-        if let Some(idx) = self.active_branch {
-            if let SectorNode::Branch { choices, .. } = &self.path[idx] {
-                if index < choices.len() {
+        if let Some(idx) = self.active_branch
+            && let SectorNode::Branch { choices, .. } = &self.path[idx]
+                && index < choices.len() {
                     let chosen = &choices[index];
                     state.current_route_modifier = chosen.difficulty * chosen.loot;
                     self.open = false;
                 }
-            }
-        }
     }
 
     pub fn render(&self, frame: &mut Frame, state: &GameState) {
@@ -281,7 +275,7 @@ impl MapScreen {
                     }
                 }
                 SectorNode::Branch { sector, choices } => {
-                    let is_active = self.active_branch.map_or(false, |a| a == i);
+                    let is_active = self.active_branch == Some(i);
                     let marker = if is_active { "»" } else { " " };
                     path_spans.push(Span::styled(
                         format!("{}[{:>2}]", marker, sector),

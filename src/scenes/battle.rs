@@ -1528,7 +1528,7 @@ impl Scene for BattleScene {
                 tf.lifetime -= 1;
 
                 // Pick target (nearest alive enemy)
-                if tf.target_idx < 0 || self.tick_count % 30 == 0 {
+                if tf.target_idx < 0 || self.tick_count.is_multiple_of(30) {
                     let mut best = -1i32;
                     let mut best_dist = f32::INFINITY;
                     for (ei, enemy) in self.enemies.iter().enumerate() {
@@ -1757,7 +1757,7 @@ impl Scene for BattleScene {
             }
 
             // Capital beam trail particles
-            if p.kind == ProjectileKind::CapitalBeam && self.tick_count % 2 == 0 {
+            if p.kind == ProjectileKind::CapitalBeam && self.tick_count.is_multiple_of(2) {
                 Self::emit_beam_trail(particles, p.x - 2.0, p.y);
             }
         }
@@ -1776,7 +1776,7 @@ impl Scene for BattleScene {
             if !proj.friendly {
                 continue;
             }
-            for (_ei, enemy) in self.enemies.iter_mut().enumerate() {
+            for enemy in self.enemies.iter_mut() {
                 if !enemy.is_alive() {
                     continue;
                 }
@@ -2052,7 +2052,7 @@ impl Scene for BattleScene {
         }
 
         // ── Enemy ships (right side) ──────────────────────────────────
-        for (_i, enemy) in self.enemies.iter().enumerate() {
+        for enemy in self.enemies.iter() {
             // Death animation rendering
             if !enemy.is_alive() {
                 if enemy.death_frame > 0 && enemy.death_frame <= 3 {
@@ -2188,7 +2188,7 @@ impl Scene for BattleScene {
                 continue;
             }
             // Beam flickers between white and cyan
-            let beam_color = if self.tick_count % 3 == 0 {
+            let beam_color = if self.tick_count.is_multiple_of(3) {
                 Color::White
             } else {
                 Color::Rgb(100, 220, 255)

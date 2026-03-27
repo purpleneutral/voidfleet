@@ -162,7 +162,11 @@ impl GameState {
         let path = Self::save_path();
         if path.exists() {
             if let Ok(data) = fs::read_to_string(&path) {
-                if let Ok(state) = serde_json::from_str(&data) {
+                // Reject suspiciously large save files (> 1MB)
+                if data.len() > 1_000_000 {
+                    return Self::new();
+                }
+                if let Ok(state) = serde_json::from_str::<Self>(&data) {
                     return state;
                 }
             }

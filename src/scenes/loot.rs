@@ -272,10 +272,10 @@ impl Scene for LootScene {
 
         // Spawn sparkles for rare drops when they appear (win only)
         if !self.loot.battle_lost {
-            if self.loot.blueprint_drop && self.lines_revealed >= 3 && self.tick_count % 4 == 0 {
+            if self.loot.blueprint_drop && self.lines_revealed >= 3 && self.tick_count.is_multiple_of(4) {
                 self.spawn_sparkles(Color::Cyan);
             }
-            if self.loot.artifact_drop && self.lines_revealed >= 4 && self.tick_count % 4 == 0 {
+            if self.loot.artifact_drop && self.lines_revealed >= 4 && self.tick_count.is_multiple_of(4) {
                 self.spawn_sparkles(Color::Magenta);
             }
         }

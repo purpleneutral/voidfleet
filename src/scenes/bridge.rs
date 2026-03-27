@@ -290,7 +290,7 @@ impl BridgeScene {
         if !self.open {
             self.idle_ticks += 1;
             // Pip's needs still decay even when not viewing
-            if self.tick_count % 200 == 0 {
+            if self.tick_count.is_multiple_of(200) {
                 state.pip_hunger = state.pip_hunger.saturating_sub(1);
                 state.pip_energy = state.pip_energy.saturating_sub(1);
             }
@@ -301,24 +301,23 @@ impl BridgeScene {
         self.tick_count += 1;
 
         // Passive XP: 1 XP per 100 ticks when happy
-        if self.tick_count % 100 == 0 && state.pip_happiness > 50 {
+        if self.tick_count.is_multiple_of(100) && state.pip_happiness > 50 {
             state.add_pip_xp(1);
         }
 
         // Stat decay
-        if self.tick_count % 100 == 0 {
+        if self.tick_count.is_multiple_of(100) {
             state.pip_hunger = state.pip_hunger.saturating_sub(1);
         }
-        if self.tick_count % 150 == 0 {
+        if self.tick_count.is_multiple_of(150) {
             state.pip_energy = state.pip_energy.saturating_sub(1);
         }
 
         // Energy recovery when sleeping
-        if self.pip_mood == Mood::Sleeping {
-            if self.tick_count % 20 == 0 {
+        if self.pip_mood == Mood::Sleeping
+            && self.tick_count.is_multiple_of(20) {
                 state.pip_energy = state.pip_energy.saturating_add(2).min(100);
             }
-        }
 
         // Auto-mood based on stats
         if self.pip_mood_timer > 0 {
@@ -338,7 +337,7 @@ impl BridgeScene {
         // Blink every ~80 ticks
         if self.blink_timer > 0 {
             self.blink_timer -= 1;
-        } else if self.tick_count % 80 == 0 && self.pip_mood != Mood::Sleeping {
+        } else if self.tick_count.is_multiple_of(80) && self.pip_mood != Mood::Sleeping {
             self.blink_timer = 3;
         }
 

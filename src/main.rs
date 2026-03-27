@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Game systems defined for future wiring — intentional
+
 mod engine;
 mod rendering;
 mod scenes;
@@ -88,9 +90,9 @@ fn main() -> io::Result<()> {
         }
 
         // Handle input (non-blocking)
-        if event::poll(Duration::ZERO)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+        if event::poll(Duration::ZERO)?
+            && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press {
                     match mode {
                         AppMode::Title => {
                             match key.code {
@@ -178,8 +180,6 @@ fn main() -> io::Result<()> {
                         }
                     }
                 }
-            }
-        }
 
         match mode {
             AppMode::Title => {
@@ -239,7 +239,7 @@ fn main() -> io::Result<()> {
                 bridge.tick(&mut state);
 
                 // Check achievements (throttled to every 20 ticks)
-                if tick_count % 20 == 0 {
+                if tick_count.is_multiple_of(20) {
                     let new_achievements = check_achievements(&state);
                     for ach in new_achievements {
                         state.achievements_unlocked.push(ach.id.to_string());
@@ -290,11 +290,10 @@ fn main() -> io::Result<()> {
                     render_hud(frame, &state, phase, active_overlay);
 
                     // Achievement popup banner
-                    if let Some(ref text) = popup_text {
-                        if popup_timer > 0 {
+                    if let Some(ref text) = popup_text
+                        && popup_timer > 0 {
                             render_popup(frame, text, popup_timer);
                         }
-                    }
 
                     // Overlays
                     if bridge.open {

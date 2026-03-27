@@ -746,7 +746,7 @@ impl TravelScene {
 
     /// Whether a travel event is currently active (blocking input).
     pub fn has_active_event(&self) -> bool {
-        self.event.as_ref().map_or(false, |e| e.active || e.showing_result())
+        self.event.as_ref().is_some_and(|e| e.active || e.showing_result())
     }
 
     /// Handle input during an active event. Returns true if input was consumed.
@@ -937,8 +937,8 @@ impl Scene for TravelScene {
         // ── Normal travel logic ──────────────────────────────
 
         // ── Event result timer countdown ─────────────────────
-        if let Some(ref mut event) = self.event {
-            if event.showing_result() {
+        if let Some(ref mut event) = self.event
+            && event.showing_result() {
                 event.result_timer -= 1;
                 if event.result_timer == 0 {
                     // Check if this was a battle trigger
@@ -951,7 +951,6 @@ impl Scene for TravelScene {
                     }
                 }
             }
-        }
 
         // ── Event pauses fleet movement ──────────────────────
         if self.has_active_event() {
@@ -986,7 +985,7 @@ impl Scene for TravelScene {
             s.x -= s.speed;
         }
         self.colored_stars.retain(|s| s.x > -2.0);
-        if self.tick_count % 60 == 0 {
+        if self.tick_count.is_multiple_of(60) {
             let mut rng = rand::thread_rng();
             if rng.gen_bool(0.4) {
                 self.spawn_colored_star();
@@ -998,7 +997,7 @@ impl Scene for TravelScene {
             n.tick();
         }
         self.nebulae.retain(|n| n.alive());
-        if self.tick_count % 200 == 0 {
+        if self.tick_count.is_multiple_of(200) {
             self.spawn_nebula();
         }
 
@@ -1007,7 +1006,7 @@ impl Scene for TravelScene {
             f.tick();
         }
         self.asteroid_fields.retain(|f| f.alive());
-        if self.tick_count % 300 == 0 {
+        if self.tick_count.is_multiple_of(300) {
             let mut rng = rand::thread_rng();
             if rng.gen_bool(0.5) {
                 self.spawn_asteroid_field();
@@ -1018,7 +1017,7 @@ impl Scene for TravelScene {
         self.calculate_fleet_positions(&state.fleet);
 
         // Spawn collectibles
-        if self.tick_count % 40 == 0 {
+        if self.tick_count.is_multiple_of(40) {
             self.spawn_collectible();
         }
 
@@ -1053,7 +1052,7 @@ impl Scene for TravelScene {
         }
 
         // Engine exhaust — scaled by ship size
-        if self.tick_count % 3 == 0 {
+        if self.tick_count.is_multiple_of(3) {
             self.emit_scaled_exhaust(particles, &state.fleet);
         }
 
@@ -1271,8 +1270,8 @@ impl Scene for TravelScene {
         }
 
         // ── UI: Travel event overlay ─────────────────────────
-        if let Some(ref event) = self.event {
-            if event.active {
+        if let Some(ref event) = self.event
+            && event.active {
                 // Box dimensions
                 let box_w: u16 = 46;
                 let desc_lines: Vec<&str> = event.description.lines().collect();
@@ -1381,8 +1380,8 @@ impl Scene for TravelScene {
 
                 if event.showing_result() {
                     // Show result text
-                    if let Some(ref text) = event.result_text {
-                        if row < area.height {
+                    if let Some(ref text) = event.result_text
+                        && row < area.height {
                             for (i, ch) in text.chars().enumerate() {
                                 let x = text_x + i as u16;
                                 if x < bx + box_w - 1 && x < area.width {
@@ -1393,7 +1392,6 @@ impl Scene for TravelScene {
                                 }
                             }
                         }
-                    }
                 } else {
                     // Show options
                     for (i, (label, _)) in event.options.iter().enumerate() {
@@ -1420,7 +1418,6 @@ impl Scene for TravelScene {
                     }
                 }
             }
-        }
 
         // ── UI: Status bar at bottom ─────────────────────────
         let status_y = area.height.saturating_sub(1);
